@@ -1,0 +1,47 @@
+# Secrets
+*.env
+.env
+*.key
+*.pem
+
+# Work-domain data
+samples/
+*.db
+*.sqlite3
+
+# Identifier denylist (never committed)
+.identifiers-denylist.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# uv lock (initially — regenerate)
+uv.lock

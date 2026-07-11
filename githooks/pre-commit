@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# switchboard local identifier gate (project-initiation scaffold).
+#
+# Mirrors the CI `identifier-gate` job so a forbidden work-domain (redacted)
+# identifier is caught BEFORE it lands in a commit. The CI gate only runs after
+# push, so by the time it flags a token it is already in history; this hook
+# closes that window.
+#
+# Activate (once per clone):   scripts/install-git-hooks.sh
+#
+# The denylist is never committed. It is resolved, in order, from:
+#   1. $SWITCHBOARD_FORBIDDEN_IDENTIFIERS                              (already exported, e.g. CI)
+#   2. <repo>/.identifiers-denylist.local            (gitignored, per-repo)
+#   3. ~/.config/agent-suite/forbidden-identifiers   (shared canonical redacted set)
+#
+# The shared canonical denylist holds the work-domain (redacted) identifiers only;
+# homelab/lab identifiers (hraedon, mvm*, ad.hraedon.com) are deliberately NOT in
+# it — lab stuff is allowed in public repos. Fail-open if no denylist is found so
+# a fresh clone is not bricked; CI remains the hard gate.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+if [ -z "${SWITCHBOARD_FORBIDDEN_IDENTIFIERS:-}" ]; then
+  for candidate in \
+    "$repo_root/.identifiers-denylist.local" \
+    "$HOME/.config/agent-suite/forbidden-identifiers"; do
+    if [ -f "$candidate" ]; then
+      SWITCHBOARD_FORBIDDEN_IDENTIFIERS="$(cat "$candidate")"
+      export SWITCHBOARD_FORBIDDEN_IDENTIFIERS
+      break
+    fi
+  done
+fi
+
+if [ -z "${SWITCHBOARD_FORBIDDEN_IDENTIFIERS:-}" ]; then
+  echo "switchboard pre-commit: identifier gate INACTIVE — no denylist found." >&2
+  echo "  Set \$SWITCHBOARD_FORBIDDEN_IDENTIFIERS, or create .identifiers-denylist.local (gitignored)" >&2
+  echo "  or ~/.config/agent-suite/forbidden-identifiers to enable it. Allowing commit." >&2
+  exit 0
+fi
+
+python_bin="$repo_root/.venv/bin/python"
+[ -x "$python_bin" ] || python_bin="$(command -v python3 || command -v python)"
+
+exec "$python_bin" "$repo_root/scripts/check_committed_identifiers.py" --staged

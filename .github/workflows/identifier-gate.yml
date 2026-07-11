@@ -1,0 +1,15 @@
+name: identifier-gate
+on: [push, pull_request]
+jobs:
+  identifier-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check for committed work-domain identifiers
+        env:
+          SWITCHBOARD_FORBIDDEN_IDENTIFIERS: ${{ secrets.SWITCHBOARD_FORBIDDEN_IDENTIFIERS }}
+        run: python3 scripts/check_committed_identifiers.py
