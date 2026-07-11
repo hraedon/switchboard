@@ -41,8 +41,8 @@ from typing import Any
 
 import httpx
 from sluice.admin import (
-    _cors_extra_headers,
     check_admin_auth,
+    cors_extra_headers,
     is_admin_auth_value,
     send_json,
     send_text,
@@ -71,6 +71,7 @@ from switchboard.admin import (
 )
 from switchboard.control import (
     AdmissionPlan,
+    RouteAffinity,
     RoutingConfig,
     hash_route_key,
     route_decision,
@@ -89,6 +90,7 @@ _DRAIN_POLL_INTERVAL = 0.1
 _QUEUE_TIMEOUT_DEFAULT = 30.0
 _DRAIN_TIMEOUT_DEFAULT = 25.0
 _RECENT_DECISIONS_MAX = 128
+_AFFINITY_MAX = 1024
 
 
 async def _cancel_task(task: asyncio.Future[Any]) -> None:
@@ -261,6 +263,7 @@ class ProxyApp:
         self._login_throttle = LoginThrottle()
         self._metrics = RoutingMetrics()
         self._draining = False
+        self._affinity: dict[str, RouteAffinity] = {}
 
     @property
     def metrics(self) -> RoutingMetrics:
@@ -297,7 +300,7 @@ class ProxyApp:
         ):
             await send_text(
                 send, 204, "",
-                extra_headers=_cors_extra_headers(
+                extra_headers=cors_extra_headers(
                     self._cors_allow_origin, None
                 ),
             )
@@ -335,7 +338,7 @@ class ProxyApp:
             if not authed and path != "/":
                 await send_json(
                     send, 401, {"error": "unauthorized"},
-                    extra_headers=_cors_extra_headers(
+                    extra_headers=cors_extra_headers(
                         self._cors_allow_origin, None
                     ),
                 )
@@ -366,7 +369,7 @@ class ProxyApp:
                 if not authed and self._admin_token:
                     await send_json(
                         send, 401, {"error": "unauthorized"},
-                        extra_headers=_cors_extra_headers(
+                        extra_headers=cors_extra_headers(
                             self._cors_allow_origin, None
                         ),
                     )
@@ -398,7 +401,7 @@ class ProxyApp:
             if not authed and self._admin_token:
                 await send_json(
                     send, 401, {"error": "unauthorized"},
-                    extra_headers=_cors_extra_headers(
+                    extra_headers=cors_extra_headers(
                         self._cors_allow_origin, None
                     ),
                 )
@@ -488,23 +491,25 @@ class ProxyApp:
 
         now_mono = time.monotonic()
         states: dict[str, Any] = {}
-        for rank, name in enumerate(candidates):
+        for name in candidates:
             ctx = self._providers.get(name)
             if ctx is not None:
                 states[name] = snapshot_provider_state(
-                    name, ctx, now=now_mono, preference_rank=rank
+                    name, ctx, now=now_mono,
                 )
 
         table = self._route_table.get_route_table()
+        affinity = self._affinity.get(hashed_key)
         plan = route_decision(
             states, table, hashed_key, self._routing_config,
             now=now_mono,
+            affinity=affinity,
         )
         primary = candidates[0]
 
         acquired_provider: str | None = None
         try:
-            acquired_provider = await self._admit(plan, candidates)
+            acquired_provider = await self._admit(plan)
         except Exception:
             log.exception("admission failed")
             await send_json(
@@ -520,18 +525,24 @@ class ProxyApp:
 
         if acquired_provider is None:
             retry_after = RETRY_AFTER_SHORT
+            reason = "no_capacity"
             ctx = self._providers.get(plan.terminal_fallback)
             if ctx is not None:
-                reason = ctx.reconcile.gate_closed_reason()
-                if reason in ("boxed", "breaker"):
+                gate_reason = ctx.reconcile.gate_closed_reason()
+                if gate_reason == "boxed":
+                    reason = "provider_boxed"
                     retry_after = ctx.reconcile.retry_after_seconds()
-                else:
+                elif gate_reason == "breaker":
+                    reason = "breaker_open"
+                    retry_after = ctx.reconcile.retry_after_seconds()
+                elif gate_reason == "saturated":
+                    reason = "saturated"
                     retry_after = ctx.reconcile.saturation_retry_after()
             await send_json(
                 send, 503,
                 {
                     "error": "concurrency limit reached",
-                    "reason": "saturated",
+                    "reason": reason,
                     "retry_after": retry_after,
                 },
                 retry_after=retry_after,
@@ -554,6 +565,19 @@ class ProxyApp:
 
         self._metrics.record_decision(hashed_key, acquired_provider, primary)
 
+        if acquired_provider != primary:
+            select_time = time.monotonic()
+            self._affinity[hashed_key] = RouteAffinity(
+                provider=acquired_provider,
+                selected_at=select_time,
+                failover_reason=plan.reason,
+            )
+            if len(self._affinity) > _AFFINITY_MAX:
+                oldest = next(iter(self._affinity))
+                del self._affinity[oldest]
+        elif affinity is not None and affinity.provider != primary:
+            self._affinity.pop(hashed_key, None)
+
         ctx = self._providers[acquired_provider]
         ctx.reconcile.record_request_forwarded()
 
@@ -574,33 +598,27 @@ class ProxyApp:
     async def _admit(
         self,
         plan: AdmissionPlan,
-        candidates: tuple[str, ...],
     ) -> str | None:
         """Plan-driven admission (Plan 006 §4).
 
         1. Try each immediate candidate with a non-blocking gate acquire.
-        2. If all immediate attempts fail, perform one final non-blocking
-           pass over the remaining eligible candidates (FRESH or
-           DEGRADED-primary only; UNKNOWN is excluded).
+        2. If all immediate attempts lose the snapshot race, perform one
+           final non-blocking retry pass over the same candidates.
         3. If still none, wait on queue_candidate for the remaining queue
            budget (not the full timeout).
         4. Return the acquired provider name, or None.
         """
-        tried: set[str] = set()
         admit_start = time.monotonic()
 
         for name in plan.immediate_candidates:
             ctx = self._providers.get(name)
             if ctx is None:
                 continue
-            tried.add(name)
             acquired = await ctx.gate.acquire(timeout=0.0)
             if acquired:
                 return name
 
-        for name in candidates:
-            if name in tried:
-                continue
+        for name in plan.immediate_candidates:
             ctx = self._providers.get(name)
             if ctx is None:
                 continue
@@ -609,7 +627,6 @@ class ProxyApp:
                 continue
             if not ctx.reconcile.ready:
                 continue
-            tried.add(name)
             acquired = await ctx.gate.acquire(timeout=0.0)
             if acquired:
                 return name
@@ -620,7 +637,13 @@ class ProxyApp:
             if remaining > 0:
                 ctx = self._providers.get(plan.queue_candidate)
                 if ctx is not None:
-                    acquired = await ctx.gate.acquire(timeout=remaining)
+                    acquired = False
+                    try:
+                        acquired = await ctx.gate.acquire(timeout=remaining)
+                    except BaseException:
+                        if acquired:
+                            await ctx.gate.release()
+                        raise
                     if acquired:
                         return plan.queue_candidate
 
@@ -839,6 +862,15 @@ class ProxyApp:
                 )
                 with contextlib.suppress(Exception):
                     await send_json(send, 502, {"error": "upstream error"})
+            elif response_started and not disconnect.is_set():
+                with contextlib.suppress(Exception):
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": b"",
+                            "more_body": False,
+                        }
+                    )
         finally:
             if not watcher_task.done():
                 watcher_task.cancel()
@@ -913,13 +945,3 @@ class ProxyApp:
             )
         ]
 
-    @staticmethod
-    def _declared_content_length(scope: Scope) -> int | None:
-        """Return the Content-Length declared by the client, or None."""
-        for k, v in scope.get("headers", []):
-            if k == b"content-length":
-                try:
-                    return int(v.decode("latin-1").strip())
-                except (ValueError, UnicodeDecodeError):
-                    return None
-        return None

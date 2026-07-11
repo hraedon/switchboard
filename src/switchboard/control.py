@@ -46,6 +46,55 @@ class SignalFreshness(Enum):
     UNKNOWN = "unknown"
 
 
+class ReplayBoundary(Enum):
+    """Points after which automatic retry/replay is forbidden (Plan 008 §6).
+
+    The streaming substrate returns enough typed state to enforce this table.
+    The proxy consumes these values to decide whether an alternate provider
+    may be tried after a failure.
+    """
+
+    BEFORE_PERMIT = "before_permit"  # alternate provider allowed
+    PERMIT_ACQUIRED = "permit_acquired"  # allowed after release
+    CONNECT_FAILED = "connect_failed"  # only if zero bytes sent
+    UPLOAD_STARTED = "upload_started"  # NO replay
+    HEADERS_RECEIVED = "headers_received"  # NO replay
+    STREAMING = "streaming"  # NO replay
+
+
+@dataclass(frozen=True)
+class ProviderCapabilities:
+    """Declarative provider capability metadata (Plan 008 §4).
+
+    Routes declare required capability surfaces; the router filters
+    incompatible candidates before pressure/admission ranking.  No request
+    body inspection is performed.
+    """
+
+    surfaces: frozenset[str]  # e.g. {"chat-completions", "messages"}
+    api_family: str  # exact wire contract identifier
+    streaming: bool = True
+    tool_calling_profile: str | None = None
+    context_class: str | None = None
+    credential_domain: str = ""
+    cache_domain: str = ""
+
+
+@dataclass(frozen=True)
+class RouteAffinity:
+    """Bounded route affinity state for stickiness/failback (Plan 008 §5).
+
+    Supplied explicitly to the pure core by the proxy.  The pure function
+    uses this as input only — it does not update affinity state.  The caller
+    (proxy) updates affinity after failover or failback.
+    """
+
+    provider: str
+    selected_at: float
+    failover_reason: str = ""
+    healthy_observations: int = 0
+
+
 @dataclass(frozen=True)
 class ProviderState:
     """Snapshot of one provider's state at a point in time.
@@ -60,7 +109,7 @@ class ProviderState:
     queue_depth: int
     retry_after_seconds: int | None
     signal_freshness: SignalFreshness
-    preference_rank: int  # position in the route's ordered candidate list
+    capabilities: ProviderCapabilities | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +118,7 @@ class RouteEntry:
 
     key: str  # SHA-256 hash of the raw API key
     providers: tuple[str, ...]  # ordered: [primary, fallback_1, ...]
+    required_capabilities: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -87,10 +137,14 @@ class RoutingConfig:
     display and potential future tie-breaking but are no longer the primary
     decision mechanism (Plan 006 replaced scalar pressure comparison with
     categorical eligibility).
+
+    ``dwell_interval`` (Plan 008 §5) is the minimum time in seconds to stay
+    on a fallback before failing back to the primary.
     """
 
     failover_threshold_seconds: int = 10
     failover_margin: int = 5
+    dwell_interval: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -121,6 +175,24 @@ def hash_route_key(raw_key: str) -> str:
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
+def _satisfies_capabilities(
+    state: ProviderState,
+    required: frozenset[str],
+) -> bool:
+    """Check whether a provider satisfies required capability surfaces.
+
+    Providers without capabilities metadata are NOT filtered (backward
+    compat).  A provider satisfies requirements if all required surfaces are
+    in the provider's capabilities surfaces.
+    """
+    if not required:
+        return True
+    caps = state.capabilities
+    if caps is None:
+        return True
+    return required <= caps.surfaces
+
+
 def route_decision(
     states: dict[str, ProviderState],
     table: RouteTable,
@@ -128,18 +200,22 @@ def route_decision(
     config: RoutingConfig,
     *,
     now: float,
+    affinity: RouteAffinity | None = None,
 ) -> AdmissionPlan:
     """Pure routing decision. Returns an :class:`AdmissionPlan`.
 
-    The decision proceeds in this order (Plan 006 §3.1):
+    The decision proceeds in this order (Plans 006, 008):
 
     1. Resolve the route key to an ordered candidate list.
-    2. Reject missing and closed candidates.
-    3. Separate fresh candidates from unknown/stale candidates.
-    4. Place candidates with immediate permits first.
-    5. Preserve primary preference among equally admissible candidates.
-    6. Select at most one explicit queue candidate.
-    7. Preserve the configured primary as the terminal safe-failure target
+    2. Filter out candidates whose capabilities don't satisfy the route's
+       required capabilities (Plan 008 §4).
+    3. Reject missing and closed candidates.
+    4. Separate fresh candidates from unknown/stale candidates.
+    5. Place candidates with immediate permits first.
+    6. Apply affinity stickiness / dwell / failback logic (Plan 008 §5).
+    7. Preserve primary preference among equally admissible candidates.
+    8. Select at most one explicit queue candidate.
+    9. Preserve the configured primary as the terminal safe-failure target
        so its gate can provide the canonical rejection when nothing is usable.
 
     Guarantees:
@@ -149,6 +225,11 @@ def route_decision(
       its gate return 503.  Never silently drop a request.
     * **Stale data never improves preference** — unknown/stale providers are
       excluded from failover by default (``fresh-only-for-failover`` policy).
+    * **Capability filtering** — providers whose declared surfaces don't
+      include all required surfaces are excluded before admission ranking.
+    * **Bounded stickiness** — after failover, the routing core prefers the
+      affinity provider for at least ``dwell_interval`` seconds before
+      considering failback to the primary.
     * **Pure** — ``now`` and all states are arguments.  No I/O, no clock.
     * **Deterministic** — same inputs produce the same plan.
     """
@@ -159,6 +240,27 @@ def route_decision(
         raise ValueError("no providers configured")
 
     primary = candidates[0]
+
+    # --- Capability filtering (Plan 008 §4) ---
+    required_caps = entry.required_capabilities if entry is not None else frozenset()
+    if required_caps:
+        filtered: list[str] = []
+        for name in candidates:
+            state = states.get(name)
+            if state is None:
+                filtered.append(name)
+                continue
+            if _satisfies_capabilities(state, required_caps):
+                filtered.append(name)
+        if not filtered:
+            return AdmissionPlan(
+                immediate_candidates=(),
+                queue_candidate=None,
+                terminal_fallback=primary,
+                reason="capability_filtered",
+            )
+        candidates = tuple(filtered)
+        primary = candidates[0]
 
     immediate: list[str] = []
     queue_eligible: list[str] = []
@@ -185,10 +287,35 @@ def route_decision(
                 queue_eligible.append(name)
         # UNKNOWN: excluded from failover preference (fresh-only-for-failover)
 
-    # Preserve primary preference in immediate candidates.
-    if primary in immediate:
-        immediate.remove(primary)
-        immediate.insert(0, primary)
+    # --- Affinity stickiness / dwell / failback (Plan 008 §5) ---
+    affinity_reason = ""
+    affinity_state = (
+        states.get(affinity.provider) if affinity is not None else None
+    )
+    affinity_fresh = (
+        affinity_state is not None
+        and affinity_state.signal_freshness == SignalFreshness.FRESH
+    )
+    if (
+        affinity is not None
+        and affinity.provider != primary
+        and affinity.provider in immediate
+        and affinity_fresh
+    ):
+        if (now - affinity.selected_at) < config.dwell_interval:
+            immediate.remove(affinity.provider)
+            immediate.insert(0, affinity.provider)
+            affinity_reason = "affinity_dwell"
+        elif primary in immediate:
+            immediate.remove(primary)
+            immediate.insert(0, primary)
+        else:
+            immediate.remove(affinity.provider)
+            immediate.insert(0, affinity.provider)
+    else:
+        if primary in immediate:
+            immediate.remove(primary)
+            immediate.insert(0, primary)
 
     # Select at most one queue candidate: prefer primary if eligible.
     queue_candidate: str | None = None
@@ -206,7 +333,12 @@ def route_decision(
         )
 
     if immediate:
-        reason = "primary_available" if immediate[0] == primary else "failover"
+        if affinity_reason:
+            reason = affinity_reason
+        elif immediate[0] == primary:
+            reason = "primary_available"
+        else:
+            reason = "failover"
     else:
         reason = "queue_only"
 

@@ -93,6 +93,11 @@ class RouteTableManager:
         """Return all route entries."""
         return list(self._entries.values())
 
+    @property
+    def default_providers(self) -> tuple[str, ...]:
+        """The default provider list for unregistered route keys."""
+        return self._default_providers
+
     def get_route_table(self) -> RouteTable:
         """Return a frozen RouteTable snapshot for the pure routing function."""
         return RouteTable(

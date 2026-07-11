@@ -1,9 +1,18 @@
-"""Import boundary test: control.py imports stdlib only, shell imports control one-way."""
+"""Import boundary tests.
+
+Enforces:
+- control.py imports stdlib only (no I/O, no clock, no network)
+- shell modules import control one-way (control never imports shell)
+- no switchboard module imports underscore-prefixed symbols from sluice
+  (Plan 007 §5: eliminate all cross-package underscore imports)
+"""
 
 from __future__ import annotations
 
+import ast
 import importlib
 import sys
+from pathlib import Path
 
 
 def test_control_imports_stdlib_only() -> None:
@@ -60,3 +69,39 @@ def test_admin_does_not_import_proxy() -> None:
     import switchboard.admin
     assert not hasattr(switchboard.admin, "ProxyApp"), \
         "admin must not import ProxyApp from proxy"
+
+
+def _collect_sluice_imports(src_dir: Path) -> list[tuple[str, str, int]]:
+    """Walk all .py files under src_dir, return (file, name, line) for every
+    name imported from a sluice.* module."""
+    results: list[tuple[str, str, int]] = []
+    for py_file in sorted(src_dir.rglob("*.py")):
+        rel = str(py_file.relative_to(src_dir.parent))
+        tree = ast.parse(py_file.read_text(), filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.module and node.module.startswith("sluice"):
+                    for alias in node.names:
+                        results.append((rel, alias.name, node.lineno))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("sluice"):
+                        results.append((rel, alias.name, node.lineno))
+    return results
+
+
+def test_no_underscore_imports_from_sluice() -> None:
+    """Plan 007 §5: no switchboard module may import an underscore-prefixed
+    symbol from sluice.  Underscore-prefixed names are private API and could
+    change without notice."""
+    src = Path(__file__).resolve().parent.parent / "src" / "switchboard"
+    imports = _collect_sluice_imports(src)
+    offenders = [
+        f"{rel}:{line} imports '{name}' from sluice"
+        for rel, name, line in imports
+        if name.startswith("_")
+    ]
+    assert not offenders, (
+        "switchboard imports underscore-prefixed (private) symbols from sluice:\n"
+        + "\n".join(offenders)
+    )

@@ -20,11 +20,11 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs
 
 from sluice.admin import (
-    _build_set_cookie,
-    _cors_extra_headers,
-    _read_body,
+    build_set_cookie,
     check_admin_auth,
     check_csrf,
+    cors_extra_headers,
+    read_body,
     send_json,
     send_text,
 )
@@ -121,7 +121,7 @@ def _build_status_payload(
     routes: dict[str, list[str]] = {}
     for entry in route_table.list_entries():
         routes[entry.key] = list(entry.providers)
-    routes["default"] = list(route_table._default_providers)
+    routes["default"] = list(route_table.default_providers)
 
     return {
         "providers": provider_states,
@@ -153,7 +153,7 @@ async def send_status_json(
     await send_json(
         send, 200, payload,
         extra_headers=[
-            *_cors_extra_headers(cors_allow_origin, None),
+            *cors_extra_headers(cors_allow_origin, None),
             (b"cache-control", b"no-store"),
         ],
     )
@@ -179,6 +179,15 @@ async def send_prometheus(
     )
     lines.append("# TYPE switchboard_failovers counter")
     lines.append(f"switchboard_failovers {routing_metrics.failovers}")
+
+    lines.append(
+        "# HELP switchboard_evicted_decisions "
+        "Total routing decisions evicted from the bounded recent_decisions ring"
+    )
+    lines.append("# TYPE switchboard_evicted_decisions counter")
+    lines.append(
+        f"switchboard_evicted_decisions {routing_metrics.evicted_decisions}"
+    )
 
     lines.append(
         "# HELP switchboard_forwarded_per_provider "
@@ -225,7 +234,7 @@ async def send_prometheus(
         send, 200, text,
         content_type="text/plain; version=0.0.4; charset=utf-8",
         extra_headers=[
-            *_cors_extra_headers(cors_allow_origin, None),
+            *cors_extra_headers(cors_allow_origin, None),
             (b"cache-control", b"no-store"),
         ],
     )
@@ -245,12 +254,12 @@ async def handle_route_list(
         })
     body = {
         "entries": entries,
-        "default": list(route_table._default_providers),
+        "default": list(route_table.default_providers),
     }
     await send_json(
         send, 200, body,
         extra_headers=[
-            *_cors_extra_headers(cors_allow_origin, None),
+            *cors_extra_headers(cors_allow_origin, None),
             (b"cache-control", b"no-store"),
         ],
     )
@@ -270,7 +279,7 @@ async def handle_route_add(
     Body: ``{"key": "<raw API key>", "providers": ["umans", "ollama"]}``
     The server hashes the key before storing. The raw key is never persisted.
     """
-    cors = _cors_extra_headers(cors_allow_origin, None)
+    cors = cors_extra_headers(cors_allow_origin, None)
     if not admin_token:
         await send_json(
             send, 405,
@@ -305,7 +314,7 @@ async def handle_route_add(
         return
 
     try:
-        body = await _read_body(receive)
+        body = await read_body(receive)
     except ValueError:
         await send_json(
             send, 413, {"error": "request body too large"},
@@ -385,7 +394,7 @@ async def handle_route_delete(
     cors_allow_origin: str | None = None,
 ) -> None:
     """DELETE /admin/routes/<key> — remove a route entry."""
-    cors = _cors_extra_headers(cors_allow_origin, None)
+    cors = cors_extra_headers(cors_allow_origin, None)
     if not admin_token:
         await send_json(
             send, 405,
@@ -421,10 +430,11 @@ async def handle_config_get(
     body = {
         "failover_threshold_seconds": routing_config.failover_threshold_seconds,
         "failover_margin": routing_config.failover_margin,
+        "dwell_interval": routing_config.dwell_interval,
     }
     await send_json(
         send, 200, body,
-        extra_headers=_cors_extra_headers(cors_allow_origin, None),
+        extra_headers=cors_extra_headers(cors_allow_origin, None),
     )
 
 
@@ -460,7 +470,7 @@ async def send_dashboard(
     await send_text(
         send, 200, _DASHBOARD_HTML,
         content_type="text/html; charset=utf-8",
-        extra_headers=_cors_extra_headers(cors_allow_origin, None),
+        extra_headers=cors_extra_headers(cors_allow_origin, None),
     )
 
 
@@ -472,7 +482,7 @@ async def send_login_page(
     await send_text(
         send, 200, _LOGIN_HTML,
         content_type="text/html; charset=utf-8",
-        extra_headers=_cors_extra_headers(cors_allow_origin, None),
+        extra_headers=cors_extra_headers(cors_allow_origin, None),
     )
 
 
@@ -516,7 +526,7 @@ async def handle_login_post(
         return
 
     try:
-        body = await _read_body(receive)
+        body = await read_body(receive)
     except ValueError:
         await send_text(send, 413, "request body too large")
         return
@@ -540,7 +550,7 @@ async def handle_login_post(
 
     throttle.record_success(now)
     cookie_value = mint_session(admin_token, now, _SESSION_TTL)
-    set_cookie = _build_set_cookie(
+    set_cookie = build_set_cookie(
         cookie_value, _SESSION_TTL, scope, trusted_proxies
     )
     await send_text(
@@ -564,7 +574,7 @@ async def handle_logout(
     if not check_csrf(scope, admin_token):
         await send_text(send, 403, "cross-site request blocked")
         return
-    set_cookie = _build_set_cookie("", 0, scope, trusted_proxies)
+    set_cookie = build_set_cookie("", 0, scope, trusted_proxies)
     await send_text(
         send, 303, "",
         extra_headers=[(b"location", b"/login"), (b"set-cookie", set_cookie)],

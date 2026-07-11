@@ -195,6 +195,12 @@ def _validate_config(
                 errors.append("routing.failover_margin must be an integer")
             elif margin < 0:
                 errors.append("routing.failover_margin must be >= 0")
+        dwell = routing_section.get("dwell_interval")
+        if dwell is not None:
+            if not isinstance(dwell, (int, float)) or isinstance(dwell, bool):
+                errors.append("routing.dwell_interval must be a number")
+            elif dwell < 0:
+                errors.append("routing.dwell_interval must be >= 0")
 
     if errors:
         raise _ConfigError("; ".join(errors))
@@ -346,12 +352,21 @@ def _build_serve_app(
             routing_config = RoutingConfig(
                 failover_threshold_seconds=threshold,
                 failover_margin=routing_config.failover_margin,
+                dwell_interval=routing_config.dwell_interval,
             )
         margin = routing_section.get("failover_margin")
         if isinstance(margin, int) and not isinstance(margin, bool):
             routing_config = RoutingConfig(
                 failover_threshold_seconds=routing_config.failover_threshold_seconds,
                 failover_margin=margin,
+                dwell_interval=routing_config.dwell_interval,
+            )
+        dwell = routing_section.get("dwell_interval")
+        if isinstance(dwell, (int, float)) and not isinstance(dwell, bool):
+            routing_config = RoutingConfig(
+                failover_threshold_seconds=routing_config.failover_threshold_seconds,
+                failover_margin=routing_config.failover_margin,
+                dwell_interval=float(dwell),
             )
 
     admin_token = _resolve("admin_token", args)

@@ -222,32 +222,3 @@ async def test_snapshot_provider_state_null_truth_is_fresh() -> None:
     state = snapshot_provider_state("generic", ctx, now=0.0)
     assert state.signal_freshness == SignalFreshness.FRESH
     await ctx.http_client.aclose()
-
-
-@pytest.mark.asyncio
-async def test_snapshot_provider_state_with_preference_rank() -> None:
-    gate = PermitGate(initial_capacity=3)
-    truth = NullTruthSource(provider="generic")
-    reconcile = ReconciliationLoop(
-        truth_source=truth,
-        gate=gate,
-        controller_config=ControllerConfig(target=3),
-        breaker_config=BreakerConfig(),
-    )
-    reconcile._first_poll_ok = True
-    reconcile._last_reading_cached = CachedReading(
-        reading=LimitState(provider="generic", age_seconds=0.0),
-        fetched_at_monotonic=0.0,
-        ok=True,
-    )
-    ctx = ProviderContext(
-        name="test",
-        upstream_url="https://upstream.example.com",
-        gate=gate,
-        reconcile=reconcile,
-        truth_source=truth,
-        http_client=httpx.AsyncClient(),
-    )
-    state = snapshot_provider_state("test", ctx, now=0.0, preference_rank=2)
-    assert state.preference_rank == 2
-    await ctx.http_client.aclose()

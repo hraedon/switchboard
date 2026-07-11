@@ -302,7 +302,7 @@ async def test_admit_immediate_failover_to_idle_fallback() -> None:
         terminal_fallback="primary",
         reason="failover",
     )
-    result = await app._admit(plan, ("primary", "fallback"))
+    result = await app._admit(plan)
     assert result == "fallback"
 
     await primary_ctx.gate.release()
@@ -331,7 +331,7 @@ async def test_admit_race_fills_primary_tries_next() -> None:
     held = await ctx1.gate.acquire(timeout=0.0)
     assert held
 
-    result = await app._admit(plan, ("p1", "p2"))
+    result = await app._admit(plan)
     assert result == "p2"
 
     await ctx1.gate.release()
@@ -362,7 +362,7 @@ async def test_admit_all_fail_returns_none() -> None:
     )
     # Use a very short queue timeout so the test doesn't hang.
     app._queue_timeout = 0.1
-    result = await app._admit(plan, ("p1", "p2"))
+    result = await app._admit(plan)
     assert result is None
 
     await ctx1.gate.release()
@@ -393,7 +393,7 @@ async def test_admit_queue_wait_uses_remaining_budget() -> None:
     app._queue_timeout = 0.3
     import time as _time
     start = _time.monotonic()
-    result = await app._admit(plan, ("p1",))
+    result = await app._admit(plan)
     elapsed = _time.monotonic() - start
     assert result is None
     # Should have waited roughly the queue_timeout, not significantly more.
@@ -436,7 +436,7 @@ async def test_admit_permit_released_during_queue_wait() -> None:
     )
     app._queue_timeout = 1.0
     # The queue wait on p1 should succeed after the permit is released.
-    result = await app._admit(plan, ("p1", "p2"))
+    result = await app._admit(plan)
     assert result == "p1"
 
     await release_task

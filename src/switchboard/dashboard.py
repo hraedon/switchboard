@@ -154,6 +154,8 @@ class DashboardTruthSource:
 
             stale = True
             if ts_epoch is not None:
+                # ts_epoch is a wall-clock epoch timestamp from the dashboard
+                # API response, so time.time() (not monotonic) is correct here.
                 stale = (time.time() - ts_epoch) > self._stale_ttl
 
             cached = CachedReading(

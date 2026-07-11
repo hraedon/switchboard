@@ -185,7 +185,6 @@ def snapshot_provider_state(
     ctx: ProviderContext,
     *,
     now: float,
-    preference_rank: int = 0,
 ) -> ProviderState:
     """Read live state from a provider's reconcile loop and gate.
 
@@ -244,7 +243,6 @@ def snapshot_provider_state(
         queue_depth=ctx.gate.queue_depth,
         retry_after_seconds=retry_after,
         signal_freshness=freshness,
-        preference_rank=preference_rank,
     )
 
 
