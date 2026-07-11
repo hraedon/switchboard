@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>switchboard</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --card: #1a1d27;
+  --border: #2a2e3a;
+  --text: #e0e0e0;
+  --muted: #888;
+  --accent: #5b8def;
+  --green: #4caf50;
+  --amber: #ff9800;
+  --red: #f44336;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  padding: 1.5rem;
+}
+h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+h2 { font-size: 1.1rem; margin: 1.5rem 0 0.5rem; color: var(--muted); }
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1rem;
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+}
+.card h3 { margin: 0 0 0.5rem; font-size: 1rem; }
+.stat { display: flex; justify-content: space-between; padding: 0.2rem 0; }
+.stat .k { color: var(--muted); }
+.stat .v { font-variant-numeric: tabular-nums; }
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.badge.open { background: var(--green); color: #fff; }
+.badge.saturated { background: var(--amber); color: #fff; }
+.badge.boxed, .badge.breaker { background: var(--red); color: #fff; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 600; font-size: 0.85rem; }
+a { color: var(--accent); }
+.form-row { margin: 0.5rem 0; }
+.form-row label { display: block; color: var(--muted); font-size: 0.85rem; margin-bottom: 0.2rem; }
+.form-row input, .form-row select {
+  width: 100%;
+  padding: 0.4rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+}
+button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 0.5rem 1rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+</style>
+</head>
+<body>
+<h1>switchboard</h1>
+<div id="app">Loading...</div>
+<script>
+async function load() {
+  const resp = await fetch('/status.json');
+  if (!resp.ok) {
+    window.location.href = '/login';
+    return;
+  }
+  const data = await resp.json();
+  const el = document.getElementById('app');
+
+  let html = '<h2>Providers</h2><div class="grid">';
+  for (const [name, p] of Object.entries(data.providers || {})) {
+    const reason = p.gate_closed_reason || 'open';
+    html += `<div class="card">
+      <h3>${name} <span class="badge ${reason}">${reason}</span></h3>
+      <div class="stat"><span class="k">effective_permits</span><span class="v">${p.effective_permits}</span></div>
+      <div class="stat"><span class="k">in_flight</span><span class="v">${p.in_flight}</span></div>
+      <div class="stat"><span class="k">queue_depth</span><span class="v">${p.queue_depth}</span></div>
+      <div class="stat"><span class="k">ready</span><span class="v">${p.ready}</span></div>
+      <div class="stat"><span class="k">total_429s</span><span class="v">${p.total_429s}</span></div>
+      <div class="stat"><span class="k">total_requests_forwarded</span><span class="v">${p.total_requests_forwarded}</span></div>
+    </div>`;
+  }
+  html += '</div>';
+
+  html += '<h2>Route Table</h2><table><thead><tr><th>Key (truncated)</th><th>Providers</th></tr></thead><tbody>';
+  for (const [key, providers] of Object.entries(data.route_table || {})) {
+    html += `<tr><td><code>${key.substring(0, 16)}...</code></td><td>${providers.join(' &rarr; ')}</td></tr>`;
+  }
+  html += '</tbody></table>';
+
+  const m = data.routing_metrics || {};
+  html += '<h2>Routing Metrics</h2><div class="grid">';
+  html += `<div class="card"><h3>Decisions</h3>
+    <div class="stat"><span class="k">routing_decisions</span><span class="v">${m.routing_decisions || 0}</span></div>
+    <div class="stat"><span class="k">failovers</span><span class="v">${m.failovers || 0}</span></div>
+  </div>`;
+  const fpp = m.forwarded_per_provider || {};
+  html += `<div class="card"><h3>Forwarded per Provider</h3>`;
+  for (const [name, count] of Object.entries(fpp)) {
+    html += `<div class="stat"><span class="k">${name}</span><span class="v">${count}</span></div>`;
+  }
+  html += '</div></div>';
+
+  el.innerHTML = html;
+}
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

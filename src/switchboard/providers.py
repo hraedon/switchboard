@@ -1,0 +1,272 @@
+"""Provider context: gate + reconcile + truth source per upstream.
+
+Each :class:`ProviderContext` bundles the sluice building blocks
+(:class:`~sluice.gate.PermitGate`, :class:`~sluice.reconcile.ReconciliationLoop`,
+:class:`~sluice.providers.TruthSource`) for one upstream provider, plus an
+:class:`httpx.AsyncClient` for forwarding.  The factory functions construct
+these from a provider type and optional TOML config;
+:func:`snapshot_provider_state` bridges the live shell state into the pure
+:class:`~switchboard.control.ProviderState` used by the routing core.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import cast
+
+import httpx
+from sluice.control import (
+    AdaptiveConfig,
+    BreakerConfig,
+    ControllerConfig,
+)
+from sluice.gate import PermitGate
+from sluice.providers import (
+    Provider,
+    TruthSource,
+    get_provider,
+    make_truth_source,
+)
+from sluice.reconcile import ReconciliationLoop
+
+from switchboard.control import Availability, ProviderState, SignalFreshness
+from switchboard.dashboard import DashboardTruthSource
+
+
+@dataclass
+class ProviderContext:
+    """One upstream provider: gate + reconcile + truth source + HTTP client."""
+
+    name: str
+    upstream_url: str
+    gate: PermitGate
+    reconcile: ReconciliationLoop
+    truth_source: TruthSource
+    http_client: httpx.AsyncClient
+
+
+_UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+
+
+def build_provider_context(
+    name: str,
+    upstream_url: str,
+    provider_type: str,
+    target: int,
+    *,
+    usage_key: str = "",
+    auth_header: str | None = None,
+    fresh_ttl: float = 15.0,
+    poll_interval: float = 5.0,
+    dashboard_url: str | None = None,
+    dashboard_token: str | None = None,
+    dashboard_poll_interval: float = 30.0,
+    dashboard_stale_ttl: float = 900.0,
+) -> ProviderContext:
+    """Construct a :class:`ProviderContext` using sluice's building blocks.
+
+    Resolves the provider type via :func:`sluice.providers.get_provider`,
+    constructs the appropriate :class:`~sluice.providers.TruthSource` via
+    :func:`sluice.providers.make_truth_source`, creates a
+    :class:`~sluice.gate.PermitGate` (initial capacity 0 — the reconcile
+    loop resizes it), and wires a :class:`~sluice.reconcile.ReconciliationLoop`
+    with the controller strategy matching the provider type.
+    """
+    provider: Provider = get_provider(provider_type)
+
+    if dashboard_url is not None and dashboard_token is not None:
+        truth_source: TruthSource = DashboardTruthSource(
+            dashboard_url=dashboard_url,
+            bearer_token=dashboard_token,
+            provider_name=name,
+            stale_ttl=dashboard_stale_ttl,
+        )
+        poll_interval = dashboard_poll_interval
+    else:
+        truth_source = make_truth_source(
+            provider,
+            base_url=upstream_url,
+            api_key=usage_key,
+            auth_header=auth_header,
+            fresh_ttl=fresh_ttl,
+        )
+
+    gate = PermitGate(initial_capacity=0)
+
+    controller_config = ControllerConfig(target=target)
+    breaker_config = BreakerConfig()
+
+    adaptive_config: AdaptiveConfig | None = None
+    if provider.controller == "adaptive":
+        adaptive_config = AdaptiveConfig(target=target)
+
+    reconcile = ReconciliationLoop(
+        truth_source=truth_source,
+        gate=gate,
+        controller_config=controller_config,
+        breaker_config=breaker_config,
+        poll_interval=poll_interval,
+        controller=provider.controller,
+        adaptive_config=adaptive_config,
+    )
+
+    http_client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
+
+    return ProviderContext(
+        name=name,
+        upstream_url=upstream_url,
+        gate=gate,
+        reconcile=reconcile,
+        truth_source=truth_source,
+        http_client=http_client,
+    )
+
+
+def build_provider_contexts_from_config(
+    config: dict[str, object],
+) -> dict[str, ProviderContext]:
+    """Build a ``dict`` of :class:`ProviderContext` instances from a parsed TOML config.
+
+    Iterates over the ``[provider.*]`` sections, resolves environment
+    variables (``usage_key_env``, ``dashboard_token_env``), and calls
+    :func:`build_provider_context` for each provider.
+    """
+    raw_providers = config.get("provider")
+    if not isinstance(raw_providers, dict):
+        return {}
+
+    contexts: dict[str, ProviderContext] = {}
+    for name, raw in raw_providers.items():
+        if not isinstance(raw, dict):
+            continue
+        provider_cfg = cast(dict[str, object], raw)
+
+        upstream = _str_or(provider_cfg, "upstream", "")
+        provider_type = _str_or(provider_cfg, "type", "generic")
+        target = _int_or(provider_cfg, "target", 3)
+
+        usage_key = ""
+        usage_key_env = _optional_str(provider_cfg, "usage_key_env")
+        if usage_key_env is not None:
+            usage_key = os.environ.get(usage_key_env, "")
+
+        dashboard_url = _optional_str(provider_cfg, "dashboard_url")
+
+        dashboard_token: str | None = None
+        dashboard_token_env = _optional_str(provider_cfg, "dashboard_token_env")
+        if dashboard_token_env is not None:
+            dashboard_token = os.environ.get(dashboard_token_env)
+
+        dashboard_stale_ttl = _float_or(
+            provider_cfg, "dashboard_stale_ttl", 900.0
+        )
+        dashboard_poll_interval = _float_or(
+            provider_cfg, "dashboard_poll_interval", 30.0
+        )
+
+        contexts[name] = build_provider_context(
+            name=name,
+            upstream_url=upstream,
+            provider_type=provider_type,
+            target=target,
+            usage_key=usage_key,
+            dashboard_url=dashboard_url,
+            dashboard_token=dashboard_token,
+            dashboard_stale_ttl=dashboard_stale_ttl,
+            dashboard_poll_interval=dashboard_poll_interval,
+        )
+
+    return contexts
+
+
+def snapshot_provider_state(
+    name: str,
+    ctx: ProviderContext,
+    *,
+    now: float,
+    preference_rank: int = 0,
+) -> ProviderState:
+    """Read live state from a provider's reconcile loop and gate.
+
+    Pure: takes the context as argument, reads its current state, and returns
+    a frozen :class:`~switchboard.control.ProviderState`. No I/O.
+
+    Derives :class:`~switchboard.control.Availability` and
+    :class:`~switchboard.control.SignalFreshness` from the reconcile loop's
+    live state (Plan 006 §3):
+
+    * **Availability**:
+      - ``CLOSED`` if gate_closed_reason is boxed or breaker.
+      - ``UNKNOWN`` if not ready (first poll not complete).
+      - ``BUSY`` if gate_closed_reason is saturated, or available_permits == 0,
+        or queue_depth > 0 (WI-006.1: live saturation from held permits).
+      - ``AVAILABLE`` otherwise.
+    * **SignalFreshness**:
+      - ``UNKNOWN`` if not ready.
+      - ``DEGRADED`` if ready but last fetch failed (stale last-known-good).
+      - ``FRESH`` if ready and last fetch succeeded.
+    """
+    gate_reason = ctx.reconcile.gate_closed_reason()
+    ready = ctx.reconcile.ready
+    last_fetch_ok = ctx.reconcile.last_fetch_ok
+
+    if not ready:
+        availability = Availability.UNKNOWN
+    elif gate_reason in ("boxed", "breaker"):
+        availability = Availability.CLOSED
+    elif (
+        gate_reason == "saturated"
+        or ctx.gate.available == 0
+        or ctx.gate.queue_depth > 0
+    ):
+        availability = Availability.BUSY
+    else:
+        availability = Availability.AVAILABLE
+
+    if not ready:
+        freshness = SignalFreshness.UNKNOWN
+    elif last_fetch_ok:
+        freshness = SignalFreshness.FRESH
+    else:
+        freshness = SignalFreshness.DEGRADED
+
+    retry_after: int | None = None
+    if availability == Availability.CLOSED:
+        retry_after = ctx.reconcile.retry_after_seconds()
+    elif availability == Availability.BUSY:
+        retry_after = ctx.reconcile.saturation_retry_after()
+
+    return ProviderState(
+        name=name,
+        availability=availability,
+        available_permits=ctx.gate.available,
+        queue_depth=ctx.gate.queue_depth,
+        retry_after_seconds=retry_after,
+        signal_freshness=freshness,
+        preference_rank=preference_rank,
+    )
+
+
+def _str_or(d: dict[str, object], key: str, default: str) -> str:
+    v = d.get(key)
+    return v if isinstance(v, str) else default
+
+
+def _int_or(d: dict[str, object], key: str, default: int) -> int:
+    v = d.get(key)
+    if isinstance(v, int) and not isinstance(v, bool):
+        return v
+    return default
+
+
+def _float_or(d: dict[str, object], key: str, default: float) -> float:
+    v = d.get(key)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    return default
+
+
+def _optional_str(d: dict[str, object], key: str) -> str | None:
+    v = d.get(key)
+    return v if isinstance(v, str) else None

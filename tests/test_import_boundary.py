@@ -44,3 +44,19 @@ def test_control_no_asyncio() -> None:
     """control must not import asyncio."""
     mod = importlib.import_module("switchboard.control")
     assert not hasattr(mod, "asyncio"), "control must not import asyncio"
+
+
+def test_proxy_imports_control() -> None:
+    """switchboard.proxy must import switchboard.control (one-way dependency)."""
+    proxy = importlib.import_module("switchboard.proxy")
+    assert hasattr(proxy, "route_decision"), "proxy must import route_decision from control"
+    assert hasattr(proxy, "RoutingConfig"), "proxy must import RoutingConfig from control"
+    assert hasattr(proxy, "hash_route_key"), "proxy must import hash_route_key from control"
+
+
+def test_admin_does_not_import_proxy() -> None:
+    """switchboard.admin must not import switchboard.proxy (avoid circular)."""
+    importlib.import_module("switchboard.admin")
+    import switchboard.admin
+    assert not hasattr(switchboard.admin, "ProxyApp"), \
+        "admin must not import ProxyApp from proxy"

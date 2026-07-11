@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>switchboard login</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --card: #1a1d27;
+  --border: #2a2e3a;
+  --text: #e0e0e0;
+  --muted: #888;
+  --accent: #5b8def;
+  --red: #f44336;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2rem;
+  width: 100%;
+  max-width: 360px;
+}
+h1 { font-size: 1.3rem; margin: 0 0 1.5rem; }
+label { display: block; color: var(--muted); font-size: 0.85rem; margin-bottom: 0.3rem; }
+input {
+  width: 100%;
+  padding: 0.5rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  margin-bottom: 1rem;
+}
+button {
+  width: 100%;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.error { color: var(--red); font-size: 0.85rem; margin-bottom: 1rem; }
+</style>
+</head>
+<body>
+<div class="card">
+<h1>switchboard</h1>
+<form method="POST" action="/login">
+  <label for="token">Admin token</label>
+  <input type="password" name="token" id="token" autocomplete="current-password" autofocus>
+  <button type="submit">Login</button>
+</form>
+</div>
+</body>
+</html>

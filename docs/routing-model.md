@@ -16,70 +16,108 @@ capacity.
 ## 2. Providers and their states
 
 Each provider has an independent gate + reconcile loop + truth source. At any
-moment, a provider is in one of these routing states:
+moment, a provider's availability is categorized (Plan 006):
 
-| state | meaning | signal source |
+| Availability | Meaning | Derived from |
 |---|---|---|
-| **available** | gate open, permits available, not boxed/breaker | `gate_closed_reason() == "open"` and `available > 0` |
-| **saturated** | permits > 0 but all held; requests are queuing | `gate_closed_reason() == "saturated"` or `queue_depth > 0` |
-| **closed** | gate closed (boxed / breaker / not-ready) | `gate_closed_reason() in ("boxed", "breaker")` |
-| **unknown** | truth source never reported / stale beyond TTL | `not ready` or `usage_age > stale_ttl` |
+| **AVAILABLE** | Eligible and permits available now | `ready` and `gate_closed_reason == "open"` and `available_permits > 0` |
+| **BUSY** | Eligible but no permit available now | `ready` and (`gate_closed_reason == "saturated"` or `available_permits == 0` or `queue_depth > 0`) |
+| **CLOSED** | Structurally closed (boxed / breaker) | `gate_closed_reason in ("boxed", "breaker")` |
+| **UNKNOWN** | Not ready — first poll not complete | `not ready` |
 
-A provider's **pressure score** is a derived quantity:
+A provider's **signal freshness** is:
 
-```
-pressure = saturation_retry_after_seconds   # 0 when available, >0 when saturated
-```
+| Freshness | Meaning |
+|---|---|
+| **FRESH** | Ready and last fetch succeeded — may be selected or preferred normally |
+| **DEGRADED** | Ready but last fetch failed — last-known-good; primary may keep serving, not a new failover target |
+| **UNKNOWN** | Not ready — excluded from failover preference; unknown data never maps to zero pressure |
 
-For providers with no `/v1/usage` (ollama via dashboard), pressure is derived
-from usage percentage and local in-flight count:
+### 2.1 Live saturation (WI-006.1)
 
-```
-pressure = session_percent if session_percent is not None else 0
-```
+A provider is **BUSY** when `available_permits == 0` or `queue_depth > 0`,
+even when its configured capacity is positive. This catches the case where all
+permits are held by in-flight requests but the gate hasn't been resized to
+zero. Structural closure (boxed/breaker) is kept separate from transient
+saturation.
+
+### 2.2 Staleness semantics (WI-006.2)
+
+Stale or unknown data can never make a fallback more attractive. The default
+policy is **fresh-only-for-failover**: only FRESH candidates are eligible for
+failover. DEGRADED data may keep an already-primary route serving within a
+bounded TTL, but it is not a new failover target. UNKNOWN is excluded from
+failover entirely. Unknown data never maps to zero pressure.
 
 ## 3. The routing decision (the pure function)
 
-`route_decision(providers, route_key, now) -> ProviderId` — which provider to
-forward to:
+`route_decision(states, table, route_key, config, now=now) -> AdmissionPlan`
 
+The decision proceeds in this order (Plan 006 §3.1):
+
+1. **Resolve** the route key to an ordered candidate list.
+2. **Reject** missing and closed candidates.
+3. **Separate** fresh candidates from unknown/stale candidates.
+4. **Place** candidates with immediate permits (AVAILABLE) first.
+5. **Preserve** primary preference among equally admissible candidates.
+6. **Select** at most one explicit queue candidate.
+7. **Preserve** the configured primary as the terminal safe-failure target so
+   its gate can provide the canonical rejection when nothing is usable.
+
+The function returns an `AdmissionPlan`:
+
+```python
+@dataclass(frozen=True)
+class AdmissionPlan:
+    immediate_candidates: tuple[str, ...]   # try these first (non-blocking)
+    queue_candidate: str | None             # wait on this if immediate fails
+    terminal_fallback: str                  # safe-failure target (always primary)
+    reason: str                             # bounded reason code
 ```
-# 1. Resolve the route key to a candidate set
-candidates = route_table.lookup(route_key)
-# candidates is an ordered list: [primary, fallback_1, fallback_2, ...]
 
-# 2. Filter out closed providers
-open_candidates = [p for p in candidates if p.state in (available, saturated)]
+### Reason codes
 
-# 3. If no open candidates, route to the primary (let its gate reject)
-if not open_candidates:
-    return candidates[0]
-
-# 4. Among open candidates, pick the one with lowest pressure
-best = min(open_candidates, key=lambda p: p.pressure)
-
-# 5. If the best is the primary and its pressure is below the failover threshold,
-#    route to primary (avoid unnecessary failover)
-if best == primary and best.pressure < failover_threshold_seconds:
-    return primary
-
-# 6. If a non-primary has lower pressure than primary by a margin, failover
-if best != primary and primary.pressure - best.pressure >= failover_margin:
-    return best
-
-return primary
-```
+| Reason | Meaning |
+|---|---|
+| `primary_available` | Primary is in immediate candidates |
+| `failover` | A non-primary is in immediate candidates |
+| `queue_only` | No immediate candidates; queue on a candidate |
+| `no_eligible_candidates` | All candidates are closed or unknown |
 
 Properties this guarantees:
 
-- **Fail safe.** When all providers are closed, route to the primary and let
-  its gate return 503. Never silently drop a request.
-- **Sticky to primary.** Failover only happens when the primary is pressured
-  *and* a fallback is meaningfully less pressured. Prevents flapping.
+- **Fail safe.** When all providers are closed, the plan's `terminal_fallback`
+  is the primary; the proxy forwards to it and lets its gate return 503. Never
+  silently drop a request.
+- **Stale data never improves preference.** Unknown/stale providers are
+  excluded from failover by default.
 - **Pure.** `now` and all provider states are arguments. No I/O, no clock.
-- **Deterministic.** Same inputs → same output. Testable without a network.
+- **Deterministic.** Same inputs → same plan. Testable without a network.
 
-## 4. Route table
+## 4. Admission algorithm (the async shell)
+
+The proxy consumes the `AdmissionPlan` as follows (Plan 006 §4):
+
+1. For each `immediate_candidate`, call `gate.acquire(timeout=0)` (non-blocking).
+2. Forward through the first successful acquisition.
+3. If all immediate attempts lose the snapshot race, perform one final
+   non-blocking pass over the remaining eligible candidates.
+4. If configured, wait only on `queue_candidate` for the remaining queue budget.
+5. After queue timeout, return an honest 503 derived from the best available
+   structural signal.
+
+The default queue policy is:
+
+```
+try every fresh eligible provider now
+then queue on configured primary for at most queue_timeout
+then return 503
+```
+
+Failover occurs only **before** upstream forwarding begins. Once a request
+starts uploading, it is never replayed to an alternate provider.
+
+## 5. Route table
 
 The route table maps routing keys to ordered provider lists:
 
@@ -88,7 +126,6 @@ The route table maps routing keys to ordered provider lists:
 class RouteEntry:
     key: str                    # API key hash or routing header value
     providers: tuple[str, ...]  # ordered: [primary, fallback_1, ...]
-    created_at: float
 
 @dataclass(frozen=True)
 class RouteTable:
@@ -100,7 +137,14 @@ The routing key is derived from the request's `Authorization` header (or
 `x-api-key`). The key is **hashed** (SHA-256) before lookup — switchboard never
 stores or logs the raw API key. The hash is the route table key.
 
-## 5. Provider contexts
+### Persistence (WI-006.7)
+
+Route entries can optionally persist to SQLite (`--route-table-store`). Startup
+precedence: persisted runtime entries override file seeds; file entries seed
+only absent keys. Without a store, the route table is in-memory and re-seeded
+from config on startup.
+
+## 6. Provider contexts
 
 Each provider is a self-contained sluice instance:
 
@@ -118,39 +162,23 @@ class ProviderContext:
 The proxy holds `dict[str, ProviderContext]` and routes to the selected
 provider's context. Each context runs its own reconcile loop independently.
 
-## 6. Dashboard truth source
+## 7. Dashboard truth source
 
 For providers without a native usage endpoint (ollama), switchboard polls the
-usage-dashboard's `/readings` API:
+usage-dashboard's `/readings` API. The reconcile loop owns the poll cadence
+(WI-006.6); the truth source is a passive fetcher.
 
-```
-GET http://usage-dashboard-server.usage-dashboard.svc.cluster.local:8080/readings
-Authorization: Bearer <token>
-```
+## 8. Bounded observability (WI-006.4)
 
-The dashboard returns normalized `Reading` objects with `session_percent` and
-`weekly_percent`. switchboard normalizes these into a `LimitState`:
+Routing metrics use a bounded ring buffer for recent decisions (max 128
+entries). Evicted decisions are counted. No Prometheus labels are created from
+arbitrary client-provided values — route key hashes are truncated in display
+output. Provider names in metrics come from config, not from clients.
 
-```python
-LimitState(
-    concurrent_sessions=local_in_flight,  # from the gate
-    limit=1,   # ollama is typically single-stream
-    hard_cap=2,
-    requests_remaining=round(100 - session_percent),
-    requests_limit=100,
-    provider="ollama",
-)
-```
-
-The dashboard's 5-30 min cadence means the ollama reading is **coarse**. The
-routing decision treats stale dashboard data fail-safe: when the reading is
-older than `dashboard_stale_ttl`, pressure is unknown → the provider is treated
-as "available but uncertain" (not closed, not preferred for failover).
-
-## 7. What switchboard deliberately does not model
+## 9. What switchboard deliberately does not model
 
 - **Request content, tokens-per-request, or cost.** switchboard routes on
-  provider pressure, not request semantics.
+  provider availability, not request semantics.
 - **Per-model routing.** Routing is per-provider. If a client requests a model
   that provider A doesn't serve, that's a client misconfiguration, not a
   routing concern.
