@@ -29,6 +29,7 @@ def _state(
     retry_after_seconds: int | None = None,
     signal_freshness: SignalFreshness = SignalFreshness.FRESH,
     capabilities: ProviderCapabilities | None = None,
+    usage_headroom: float | None = None,
 ) -> ProviderState:
     return ProviderState(
         name=name,
@@ -38,6 +39,7 @@ def _state(
         retry_after_seconds=retry_after_seconds,
         signal_freshness=signal_freshness,
         capabilities=capabilities,
+        usage_headroom=usage_headroom,
     )
 
 
@@ -677,3 +679,75 @@ def test_servable_empty_is_model_unservable() -> None:
     assert plan.reason == "model_unservable"
     assert plan.immediate_candidates == ()
     assert plan.terminal_fallback == "umans"
+
+
+# --- Plan 011: headroom filtering tests ---
+
+_HEADROOM_CONFIG = RoutingConfig(headroom_threshold=0.15)
+
+
+def test_headroom_demotes_non_primary_with_low_headroom() -> None:
+    table = RouteTable(entries={}, default_providers=("umans", "ollama-cloud"))
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state("ollama-cloud", usage_headroom=0.05),
+    }
+    plan = route_decision(states, table, "k", _HEADROOM_CONFIG, now=0.0)
+    assert "umans" in plan.immediate_candidates
+    assert "ollama-cloud" not in plan.immediate_candidates
+    assert plan.queue_candidate == "ollama-cloud"
+
+
+def test_headroom_does_not_demote_when_equal_to_threshold() -> None:
+    table = RouteTable(entries={}, default_providers=("umans", "ollama-cloud"))
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state("ollama-cloud", usage_headroom=0.15),
+    }
+    plan = route_decision(states, table, "k", _HEADROOM_CONFIG, now=0.0)
+    assert "umans" in plan.immediate_candidates
+    assert "ollama-cloud" in plan.immediate_candidates
+
+
+def test_headroom_does_not_demote_when_headroom_above_threshold() -> None:
+    table = RouteTable(entries={}, default_providers=("umans", "ollama-cloud"))
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state("ollama-cloud", usage_headroom=0.50),
+    }
+    plan = route_decision(states, table, "k", _HEADROOM_CONFIG, now=0.0)
+    assert "umans" in plan.immediate_candidates
+    assert "ollama-cloud" in plan.immediate_candidates
+
+
+def test_headroom_none_not_filtered() -> None:
+    table = RouteTable(entries={}, default_providers=("umans", "ollama-cloud"))
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state("ollama-cloud", usage_headroom=None),
+    }
+    plan = route_decision(states, table, "k", _HEADROOM_CONFIG, now=0.0)
+    assert "umans" in plan.immediate_candidates
+    assert "ollama-cloud" in plan.immediate_candidates
+
+
+def test_headroom_primary_never_demoted() -> None:
+    table = RouteTable(entries={}, default_providers=("umans", "ollama-cloud"))
+    states = {
+        "umans": _state("umans", usage_headroom=0.05),
+        "ollama-cloud": _state("ollama-cloud", usage_headroom=0.50),
+    }
+    plan = route_decision(states, table, "k", _HEADROOM_CONFIG, now=0.0)
+    assert "umans" in plan.immediate_candidates
+    assert plan.immediate_candidates[0] == "umans"
+
+
+def test_headroom_threshold_zero_is_noop() -> None:
+    config = RoutingConfig(headroom_threshold=0.0)
+    table = RouteTable(entries={}, default_providers=("umans", "ollama-cloud"))
+    states = {
+        "umans": _state("umans", availability=Availability.CLOSED),
+        "ollama-cloud": _state("ollama-cloud", usage_headroom=0.01),
+    }
+    plan = route_decision(states, table, "k", config, now=0.0)
+    assert "ollama-cloud" in plan.immediate_candidates

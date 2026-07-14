@@ -94,6 +94,11 @@ class RouteTableManager:
         return list(self._entries.values())
 
     @property
+    def db(self) -> sqlite3.Connection | None:
+        """The SQLite connection, if persistence is configured."""
+        return self._db
+
+    @property
     def default_providers(self) -> tuple[str, ...]:
         """The default provider list for unregistered route keys."""
         return self._default_providers

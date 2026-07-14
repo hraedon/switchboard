@@ -39,8 +39,12 @@ top.
   only — no cross-format routing.
 - **No response caching, prompt logging, or model routing** beyond
   provider-level failover. Those are out of scope.
-- **No re-serialization of request bodies.** Cache-transparency applies within
-  each upstream path — bytes are forwarded as-is.
+- **No re-serialization of request bodies** on the primary path.
+  Cache-transparency applies to the primary/umans path — bytes are forwarded
+  as-is. *(Exception: when a `[model]` map is configured, the fallback path
+  MAY rewrite the `model` field and re-serialize the request JSON for a
+  provider that expects a different model name. With no `[model]` map,
+  switchboard is fully byte-transparent everywhere.)*
 
 ## Design principles
 
@@ -58,7 +62,10 @@ top.
   regression.
 - **Cache-transparency per-provider.** The request sluice egresses to each
   upstream must be byte-for-byte what the client sent. Routing selects *which*
-  upstream; it does not reshape the request.
+  upstream; it does not reshape the request. *(Exception: when a `[model]` map
+  is configured, the fallback path MAY rewrite the `model` field for a provider
+  that expects a different name — that path is explicitly not byte-transparent.
+  The primary path stays byte-identical.)*
 
 ## Scope: in / out / non-goals
 
@@ -66,6 +73,8 @@ top.
 - Multi-provider route table (API-key-based routing)
 - Per-provider gates, reconcile loops, and truth sources
 - Pressure-based failover routing (pure function)
+- Overloaded-response breaker (503/529 → cooldown → failover)
+- Model-aware failover with per-provider model rewriting (`[model]` map)
 - usage-dashboard integration as an ollama truth source
 - Admin dashboard for route table CRUD
 - Metrics per-provider and per-client
@@ -73,7 +82,6 @@ top.
 **Out (for now):**
 - Request/response format translation (Anthropic ↔ OpenAI)
 - Per-client weighting or fair queuing beyond FIFO per provider
-- Per-model routing (routing is per-provider, not per-model)
 
 **Non-goals:**
 - Replacing sluice for single-provider use cases

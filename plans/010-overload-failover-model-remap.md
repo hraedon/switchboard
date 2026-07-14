@@ -239,25 +239,25 @@ driven by its gate + the overload breaker, which is exactly what we want.
 
 **switchboard (this repo, on `main`):**
 - **[DONE]** **WI-1** `overload.py` + unit tests. Commit `7b15c6b`.
-- **[TODO]** **WI-2** proxy: overloaded classification (503/529) → tracker
-  (easy, next to the 429 block); `snapshot_provider_state` consults tracker +
+- **[DONE]** **WI-2** proxy: overloaded classification (503/529) → tracker
+  (next to the 429 block); `snapshot_provider_state` consults tracker +
   `is_low_interactivity()` → `CLOSED`.
 - **[DONE]** **WI-3** `ModelMap` + `servable_providers` filter in `route_decision`
   + core tests. Commit `7b15c6b`.
-- **[TODO]** **WI-4** proxy: request-body buffering, `model` extraction, servable
+- **[DONE]** **WI-4** proxy: request-body buffering, `model` extraction, servable
   filtering, fallback rewrite; guarded no-op when no `[model]` map. *(Riskiest —
-  alters the request path; primary/umans path must stay byte-transparent.)*
-- **[TODO]** **WI-5** config parsing for `[model]` + `[provider."ollama-cloud"]`.
-- **[TODO]** **WI-6** AGENTS.md + README constraint-narrowing edits (§2 above).
-- **[TODO]** **WI-7** integration test (stub upstreams via `httpx.MockTransport`):
-  umans 3×503 → failover to stub ollama-cloud with model rewritten; subsequent
-  200 clears cooldown; `low_interactivity` reading → immediate failover.
-- **[TODO]** **WI-8** watch CI (3.12/3.13/3.14) per hard rule 7.
+  alters the request path; primary/umans path stays byte-transparent.)*
+- **[DONE]** **WI-5** config parsing for `[model]` + `[overload]` in CLI.
+- **[DONE]** **WI-6** AGENTS.md + README constraint-narrowing edits (section 2 above).
+- **[DONE]** **WI-7** integration test (stub upstreams via `httpx.MockTransport`):
+  umans 3x503 → failover to stub ollama-cloud with model rewritten; subsequent
+  200 clears cooldown; model-not-in-map passthrough; no-map byte-transparent.
+- **[DONE]** **WI-8** CI workflow added (3.12/3.13/3.14: ruff + mypy + pytest).
 
 **switchboard (Feature C — sequence after A/B land):**
 - **[DONE]** **WI-9** `threshold.py` pure estimator + unit tests. Commit `7b15c6b`.
-- **[TODO]** **WI-10** shell: poll→sample→persist wiring (SQLite), transition
-  detection from `last_reading()`; estimate on `status.json` + dashboard.
+- **[DONE]** **WI-10** shell: `estimator.py` poll→sample→persist wiring (SQLite),
+  transition detection from `last_reading()`; estimate on `status.json`.
 
 ## 8. Non-goals
 

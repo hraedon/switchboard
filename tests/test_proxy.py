@@ -9,13 +9,16 @@ from sluice.gate import PermitGate
 from sluice.providers import NullTruthSource
 from sluice.reconcile import ReconciliationLoop
 
-from switchboard.control import RoutingConfig
+from switchboard.control import ModelMap, RoutingConfig
 from switchboard.providers import ProviderContext
 from switchboard.proxy import (
     ProxyApp,
     RoutingMetrics,
     _classify_429,
+    _extract_model,
     _extract_route_key,
+    _parse_retry_after_seconds,
+    _rewrite_model_field,
 )
 from switchboard.route_table import RouteTableManager
 
@@ -103,6 +106,7 @@ def _make_app(
     providers: dict[str, ProviderContext] | None = None,
     admin_token: str | None = None,
     default_providers: tuple[str, ...] = ("test",),
+    model_map: ModelMap | None = None,
 ) -> ProxyApp:
     if providers is None:
         providers = {"test": _make_provider_context()}
@@ -112,6 +116,7 @@ def _make_app(
         route_table=route_table,
         routing_config=RoutingConfig(),
         admin_token=admin_token,
+        model_map=model_map,
     )
 
 
@@ -220,6 +225,34 @@ def test_classify_429_rate_limit_with_http_date() -> None:
 
 def test_classify_429_concurrency_with_invalid_retry_after() -> None:
     assert _classify_429("not-a-number", {}) == "concurrency"
+
+
+def test_parse_retry_after_none_returns_none() -> None:
+    assert _parse_retry_after_seconds(None) is None
+
+
+def test_parse_retry_after_integer_seconds() -> None:
+    assert _parse_retry_after_seconds("30") == 30.0
+
+
+def test_parse_retry_after_zero_returns_zero() -> None:
+    assert _parse_retry_after_seconds("0") == 0.0
+
+
+def test_parse_retry_after_garbage_returns_none() -> None:
+    assert _parse_retry_after_seconds("not-a-date-or-number") is None
+
+
+def test_parse_retry_after_http_date_returns_positive() -> None:
+    import datetime
+
+    future = datetime.datetime.now(
+        datetime.UTC
+    ) + datetime.timedelta(seconds=60)
+    http_date = future.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    result = _parse_retry_after_seconds(http_date)
+    assert result is not None
+    assert 50 < result < 70
 
 
 def test_proxy_imports_control() -> None:
@@ -552,3 +585,99 @@ def test_proxy_filter_request_headers_strips_connection_listed_headers() -> None
     assert "connection" not in names
     assert "x-custom-hop" not in names
     assert "content-type" in names
+
+
+# --- Plan 010 Feature B: model extraction + rewrite ---
+
+
+def test_extract_model_from_json() -> None:
+    body = b'{"model": "umans-kimi-k2.7", "messages": []}'
+    assert _extract_model(body) == "umans-kimi-k2.7"
+
+
+def test_extract_model_missing_returns_none() -> None:
+    body = b'{"messages": []}'
+    assert _extract_model(body) is None
+
+
+def test_extract_model_non_json_returns_none() -> None:
+    assert _extract_model(b"not json") is None
+    assert _extract_model(b"") is None
+
+
+def test_extract_model_non_string_returns_none() -> None:
+    body = b'{"model": 123}'
+    assert _extract_model(body) is None
+
+
+def test_rewrite_model_field_changes_model() -> None:
+    body = b'{"model": "umans-kimi-k2.7", "messages": [{"role": "user", "content": "hi"}]}'
+    rewritten = _rewrite_model_field(body, "kimi-k2.7-code")
+    import json
+    data = json.loads(rewritten)
+    assert data["model"] == "kimi-k2.7-code"
+    assert data["messages"][0]["content"] == "hi"
+
+
+def test_rewrite_model_preserves_other_fields() -> None:
+    body = b'{"model": "old", "temperature": 0.7, "stream": true}'
+    rewritten = _rewrite_model_field(body, "new")
+    import json
+    data = json.loads(rewritten)
+    assert data["model"] == "new"
+    assert data["temperature"] == 0.7
+    assert data["stream"] is True
+
+
+def test_model_map_no_config_is_noop() -> None:
+    app = _make_app()
+    assert app._model_map is None
+
+
+@pytest.mark.asyncio
+async def test_buffer_request_body_collects_chunks() -> None:
+    app = _make_app()
+
+    class MultiChunkReceive:
+        def __init__(self) -> None:
+            self._chunks = [b'{"model": "', b'test"}']
+            self._idx = 0
+
+        async def __call__(self) -> dict[str, Any]:
+            if self._idx < len(self._chunks):
+                chunk = self._chunks[self._idx]
+                self._idx += 1
+                return {
+                    "type": "http.request",
+                    "body": chunk,
+                    "more_body": self._idx < len(self._chunks),
+                }
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+    body, overflow = await app._buffer_request_body(MultiChunkReceive())
+    assert overflow is False
+    assert body == b'{"model": "test"}'
+
+
+@pytest.mark.asyncio
+async def test_buffer_request_body_detects_overflow() -> None:
+    app = _make_app()
+    app._max_request_body_bytes = 10
+
+    receive = _MockReceive(body=b'{"model": "very-long-model-name"}')
+    body, overflow = await app._buffer_request_body(receive)
+    assert overflow is True
+    assert body is None
+
+
+@pytest.mark.asyncio
+async def test_buffer_request_body_detects_disconnect() -> None:
+    app = _make_app()
+
+    class DisconnectReceive:
+        async def __call__(self) -> dict[str, Any]:
+            return {"type": "http.disconnect"}
+
+    body, overflow = await app._buffer_request_body(DisconnectReceive())
+    assert overflow is False
+    assert body is None

@@ -19,12 +19,21 @@ gates and decides which upstream provider receives each request.
 - **Inert in-path — per provider.** switchboard forwards live traffic to the
   selected upstream. It **never reads, logs, stores, or rewrites request/response
   bodies.** It routes and streams bytes through untouched. Same guarantee as
-  sluice, applied per-upstream-path.
+  sluice, applied per-upstream-path. *(Exception: when a `[model]` map is
+  configured, switchboard MAY read the request body's top-level `model` field
+  and MAY rewrite only that field for the fallback path — Plan 010. No other
+  field is read or altered. Response bodies are always fully inert. With no
+  `[model]` map, this exception does not apply.)*
 - **Cache-transparency — indistinguishable from a direct client per upstream.**
   The request switchboard egresses to each upstream must be byte-for-byte what
   the client sent. Routing selects *which* upstream; it does not reshape the
   request. Any switchboard control header and the admin credential are consumed
-  and stripped before forwarding, never sent upstream.
+  and stripped before forwarding, never sent upstream. *(Exception: when
+  switchboard rewrites `model` for a fallback provider, it re-serialises the
+  request JSON; that provider's path is explicitly not byte-transparent.
+  Byte-identical egress is guaranteed when no model rewrite occurs — the
+  primary/umans path, which is the caching-sensitive one. With no `[model]`
+  map, this exception does not apply.)*
 - **Fail safe.** Any uncertainty — stale usage data, unreachable truth source,
   breaker open on all providers — must route to the configured default provider
   and let its gate handle the rejection (503 + Retry-After), never silently
@@ -70,6 +79,8 @@ src/switchboard/
   providers.py     # provider context: gate + reconcile + truth_source per upstream
   dashboard.py     # usage-dashboard /readings client → TruthSource for ollama
   route_table.py   # route table: API-key → provider mapping, CRUD, persistence
+  overload.py      # per-provider overloaded-response breaker (Plan 010 Feature A)
+  threshold.py     # pure low-interactivity threshold estimator (Plan 010 Feature C)
   admin.py         # admin route handlers: health, status, metrics, route table CRUD, dashboard
   cli.py           # `switchboard serve ...` entry point
   static/          # dashboard assets

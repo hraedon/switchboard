@@ -110,6 +110,7 @@ class ProviderState:
     retry_after_seconds: int | None
     signal_freshness: SignalFreshness
     capabilities: ProviderCapabilities | None = None
+    usage_headroom: float | None = None
 
 
 @dataclass(frozen=True)
@@ -182,6 +183,7 @@ class RoutingConfig:
     failover_threshold_seconds: int = 10
     failover_margin: int = 5
     dwell_interval: float = 30.0
+    headroom_threshold: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -337,7 +339,15 @@ def route_decision(
                 and is_primary
             )
         ):
-            if state.availability == Availability.AVAILABLE:
+            low_headroom = (
+                not is_primary
+                and config.headroom_threshold > 0
+                and state.usage_headroom is not None
+                and state.usage_headroom < config.headroom_threshold
+            )
+            if low_headroom:
+                queue_eligible.append(name)
+            elif state.availability == Availability.AVAILABLE:
                 immediate.append(name)
             elif state.availability == Availability.BUSY:
                 queue_eligible.append(name)

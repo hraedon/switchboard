@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
+import json
 import logging
 import os
 import time
@@ -71,11 +72,14 @@ from switchboard.admin import (
 )
 from switchboard.control import (
     AdmissionPlan,
+    ModelMap,
     RouteAffinity,
     RoutingConfig,
     hash_route_key,
     route_decision,
 )
+from switchboard.estimator import ThresholdEstimator
+from switchboard.overload import OverloadConfig, OverloadTracker
 from switchboard.providers import ProviderContext, snapshot_provider_state
 from switchboard.route_table import RouteTableManager
 
@@ -91,6 +95,44 @@ _QUEUE_TIMEOUT_DEFAULT = 30.0
 _DRAIN_TIMEOUT_DEFAULT = 25.0
 _RECENT_DECISIONS_MAX = 128
 _AFFINITY_MAX = 1024
+_OVERLOAD_STATUSES_DEFAULT = frozenset({503, 529})
+
+
+def _parse_retry_after_seconds(raw: str | None) -> float | None:
+    """Parse a Retry-After header into seconds, or None if unparseable."""
+    if raw is None:
+        return None
+    raw = raw.strip()
+    try:
+        return float(int(raw))
+    except (ValueError, TypeError):
+        pass
+    try:
+        dt = parsedate_to_datetime(raw)
+        remaining = dt.timestamp() - time.time()
+        return max(0.0, remaining)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _extract_model(body: bytes) -> str | None:
+    """Extract the top-level ``model`` field from a JSON request body."""
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, dict):
+        model = data.get("model")
+        if isinstance(model, str):
+            return model
+    return None
+
+
+def _rewrite_model_field(body: bytes, new_model: str) -> bytes:
+    """Rewrite the ``model`` field in a JSON request body and re-serialize."""
+    data = json.loads(body)
+    data["model"] = new_model
+    return json.dumps(data).encode("utf-8")
 
 
 async def _cancel_task(task: asyncio.Future[Any]) -> None:
@@ -248,6 +290,10 @@ class ProxyApp:
         max_request_body_bytes: int | None = None,
         upstream_idle_timeout: float | None = None,
         cors_allow_origin: str | None = None,
+        overload_config: OverloadConfig | None = None,
+        overload_statuses: frozenset[int] | None = None,
+        model_map: ModelMap | None = None,
+        estimator: ThresholdEstimator | None = None,
     ) -> None:
         self._providers = providers
         self._route_table = route_table
@@ -259,6 +305,14 @@ class ProxyApp:
         self._max_request_body_bytes = max_request_body_bytes
         self._upstream_idle_timeout = upstream_idle_timeout
         self._cors_allow_origin = cors_allow_origin
+        self._overload_tracker = OverloadTracker(overload_config)
+        self._overload_statuses = (
+            overload_statuses
+            if overload_statuses is not None
+            else _OVERLOAD_STATUSES_DEFAULT
+        )
+        self._model_map = model_map
+        self._estimator = estimator
         self._build_sha = os.environ.get("SWITCHBOARD_BUILD_SHA") or None
         self._login_throttle = LoginThrottle()
         self._metrics = RoutingMetrics()
@@ -354,6 +408,7 @@ class ProxyApp:
                     send, self._providers, self._route_table,
                     self._metrics, self._build_sha,
                     self._cors_allow_origin,
+                    estimator=self._estimator,
                 )
                 return
             if path == "/metrics":
@@ -489,13 +544,43 @@ class ProxyApp:
             )
             return
 
+        buffered_body: bytes | None = None
+        request_model: str | None = None
+        servable_providers: frozenset[str] | None = None
+
+        if self._model_map is not None and self._model_map.routes:
+            buffered_body, overflow = await self._buffer_request_body(receive)
+            if overflow:
+                await send_json(
+                    send, 413, {"error": "request body too large"}
+                )
+                return
+            if buffered_body is None:
+                return
+            request_model = _extract_model(buffered_body)
+            if (
+                request_model is not None
+                and request_model in self._model_map
+            ):
+                servable_providers = self._model_map.providers_for(
+                    request_model
+                )
+
         now_mono = time.monotonic()
+
+        if self._estimator is not None:
+            est_provider = self._estimator.provider_name
+            est_ctx = self._providers.get(est_provider)
+            if est_ctx is not None:
+                self._estimator.maybe_sample(est_ctx)
+
         states: dict[str, Any] = {}
         for name in candidates:
             ctx = self._providers.get(name)
             if ctx is not None:
                 states[name] = snapshot_provider_state(
                     name, ctx, now=now_mono,
+                    overload_tracker=self._overload_tracker,
                 )
 
         table = self._route_table.get_route_table()
@@ -504,6 +589,7 @@ class ProxyApp:
             states, table, hashed_key, self._routing_config,
             now=now_mono,
             affinity=affinity,
+            servable_providers=servable_providers,
         )
         primary = candidates[0]
 
@@ -528,16 +614,34 @@ class ProxyApp:
             reason = "no_capacity"
             ctx = self._providers.get(plan.terminal_fallback)
             if ctx is not None:
-                gate_reason = ctx.reconcile.gate_closed_reason()
-                if gate_reason == "boxed":
-                    reason = "provider_boxed"
-                    retry_after = ctx.reconcile.retry_after_seconds()
-                elif gate_reason == "breaker":
-                    reason = "breaker_open"
-                    retry_after = ctx.reconcile.retry_after_seconds()
-                elif gate_reason == "saturated":
-                    reason = "saturated"
-                    retry_after = ctx.reconcile.saturation_retry_after()
+                if ctx.reconcile.is_low_interactivity():
+                    reason = "low_interactivity"
+                    cached = ctx.reconcile.last_reading
+                    if cached is not None:
+                        resets_at = (
+                            cached.reading.service_mode_resets_at_epoch
+                        )
+                        if resets_at is not None and resets_at > 0:
+                            remaining = int(resets_at - time.time())
+                            retry_after = max(1, remaining)
+                elif self._overload_tracker.is_cooling(
+                    plan.terminal_fallback, now=time.monotonic()
+                ):
+                    reason = "overloaded"
+                    retry_after = self._overload_tracker.cooldown_remaining(
+                        plan.terminal_fallback, now=time.monotonic()
+                    )
+                else:
+                    gate_reason = ctx.reconcile.gate_closed_reason()
+                    if gate_reason == "boxed":
+                        reason = "provider_boxed"
+                        retry_after = ctx.reconcile.retry_after_seconds()
+                    elif gate_reason == "breaker":
+                        reason = "breaker_open"
+                        retry_after = ctx.reconcile.retry_after_seconds()
+                    elif gate_reason == "saturated":
+                        reason = "saturated"
+                        retry_after = ctx.reconcile.saturation_retry_after()
             await send_json(
                 send, 503,
                 {
@@ -584,7 +688,11 @@ class ProxyApp:
         acquire_mono = time.monotonic()
         forward_failed = False
         try:
-            await self._forward(ctx, scope, receive, send)
+            await self._forward(
+                ctx, scope, receive, send,
+                buffered_body=buffered_body,
+                request_model=request_model,
+            )
             self._metrics.record_forwarded(acquired_provider)
         except Exception:
             forward_failed = True
@@ -649,17 +757,51 @@ class ProxyApp:
 
         return None
 
+    async def _buffer_request_body(
+        self, receive: Receive,
+    ) -> tuple[bytes | None, bool]:
+        """Buffer the request body from ASGI receive.
+
+        Returns ``(body, overflow)``.  ``body`` is ``None`` on client
+        disconnect; ``overflow`` is ``True`` when the body exceeds
+        ``max_request_body_bytes``.
+        """
+        body = bytearray()
+        limit = self._max_request_body_bytes
+        while True:
+            event = await receive()
+            etype = event["type"]
+            if etype == "http.disconnect":
+                return None, False
+            if etype == "http.request":
+                data = event.get("body", b"")
+                if data:
+                    if limit is not None and len(body) + len(data) > limit:
+                        return None, True
+                    body.extend(data)
+                if not event.get("more_body", False):
+                    return bytes(body), False
+            # ignore other event types
+
     async def _forward(
         self,
         ctx: ProviderContext,
         scope: Scope,
         receive: Receive,
         send: Send,
+        *,
+        buffered_body: bytes | None = None,
+        request_model: str | None = None,
     ) -> None:
         """Stream a request to the selected provider's upstream.
 
         Adapted from sluice's ``_forward()``: true streaming, disconnect
         detection, phantom prevention, hop-by-hop header stripping.
+
+        When ``buffered_body`` is provided (model-map configured), the
+        request body has already been consumed from ``receive``.  The
+        ``model`` field may be rewritten for the fallback path (Plan 010
+        Feature B); the primary path stays byte-transparent.
         """
         url = self._build_url(ctx, scope)
         headers = self._filter_request_headers(scope["headers"])
@@ -709,8 +851,29 @@ class ProxyApp:
         response_started = False
 
         try:
+            if buffered_body is not None:
+                content: Any = buffered_body
+                if (
+                    request_model is not None
+                    and self._model_map is not None
+                ):
+                    alias = self._model_map.alias_for(
+                        request_model, ctx.name
+                    )
+                    if alias is not None and alias != request_model:
+                        content = _rewrite_model_field(
+                            buffered_body, alias
+                        )
+                        headers = [
+                            (k, v) for k, v in headers
+                            if k.lower() != "content-length"
+                        ]
+                body_done.set()
+            else:
+                content = body_stream()
+
             stream_cm = ctx.http_client.stream(
-                method, url, headers=headers, content=body_stream()
+                method, url, headers=headers, content=content
             )
 
             entry_task = asyncio.ensure_future(stream_cm.__aenter__())
@@ -766,6 +929,18 @@ class ProxyApp:
                         ctx.reconcile.record_gateway_429()
                     else:
                         ctx.reconcile.record_429()
+
+                if response.status_code in self._overload_statuses:
+                    retry_after_val = _parse_retry_after_seconds(
+                        response.headers.get("retry-after")
+                    )
+                    self._overload_tracker.record_overloaded(
+                        ctx.name,
+                        now=time.monotonic(),
+                        retry_after=retry_after_val,
+                    )
+                else:
+                    self._overload_tracker.record_ok(ctx.name)
 
                 ctx.reconcile.record_response_headers(
                     dict(response.headers), response.status_code

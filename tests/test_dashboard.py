@@ -121,7 +121,8 @@ async def test_fetch_no_lkg_serves_fail_safe_reading() -> None:
     cached = await ts.fetch(now_monotonic=0.0)
     assert cached.ok is False
     assert cached.reading.concurrent_sessions == 2
-    assert cached.reading.requests_remaining == 0
+    assert cached.reading.requests_remaining is None
+    assert cached.reading.requests_limit is None
     await ts.close()
 
 

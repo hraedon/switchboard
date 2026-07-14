@@ -37,6 +37,7 @@ from sluice.session import (
 from switchboard import __version__
 
 if TYPE_CHECKING:
+    from switchboard.estimator import ThresholdEstimator
     from switchboard.providers import ProviderContext
     from switchboard.proxy import RoutingMetrics
     from switchboard.route_table import RouteTableManager
@@ -112,6 +113,7 @@ def _build_status_payload(
     route_table: RouteTableManager,
     routing_metrics: RoutingMetrics,
     build_sha: str | None = None,
+    estimator: ThresholdEstimator | None = None,
 ) -> dict[str, Any]:
     """Build the full status payload for /status.json."""
     provider_states: dict[str, Any] = {}
@@ -123,7 +125,7 @@ def _build_status_payload(
         routes[entry.key] = list(entry.providers)
     routes["default"] = list(route_table.default_providers)
 
-    return {
+    payload: dict[str, Any] = {
         "providers": provider_states,
         "route_table": routes,
         "routing_metrics": {
@@ -137,6 +139,29 @@ def _build_status_payload(
         "build": build_sha,
     }
 
+    if estimator is not None:
+        est = estimator.state().estimate
+        payload["estimator"] = {
+            "edges": est.edges,
+            "requests": {
+                "lower": est.requests.lower,
+                "upper": est.requests.upper,
+                "best_guess": est.requests.best_guess,
+                "edges": est.requests.edges,
+                "contradicted": est.requests.contradicted,
+            },
+            "tokens": {
+                "lower": est.tokens.lower,
+                "upper": est.tokens.upper,
+                "best_guess": est.tokens.best_guess,
+                "edges": est.tokens.edges,
+                "contradicted": est.tokens.contradicted,
+            },
+            "last_edge_concurrent_sessions": est.last_edge_concurrent_sessions,
+        }
+
+    return payload
+
 
 async def send_status_json(
     send: Send,
@@ -145,10 +170,12 @@ async def send_status_json(
     routing_metrics: RoutingMetrics,
     build_sha: str | None = None,
     cors_allow_origin: str | None = None,
+    estimator: ThresholdEstimator | None = None,
 ) -> None:
     """GET /status.json — per-provider state + route table + routing metrics."""
     payload = _build_status_payload(
-        providers, route_table, routing_metrics, build_sha
+        providers, route_table, routing_metrics, build_sha,
+        estimator=estimator,
     )
     await send_json(
         send, 200, payload,
@@ -431,6 +458,7 @@ async def handle_config_get(
         "failover_threshold_seconds": routing_config.failover_threshold_seconds,
         "failover_margin": routing_config.failover_margin,
         "dwell_interval": routing_config.dwell_interval,
+        "headroom_threshold": routing_config.headroom_threshold,
     }
     await send_json(
         send, 200, body,

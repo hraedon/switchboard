@@ -33,6 +33,15 @@ def _parse_timestamp(ts: str | None) -> float | None:
         return None
 
 
+def _coerce_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
 def _reading_to_limit_state(
     reading: dict[str, Any],
     provider_name: str,
@@ -45,14 +54,26 @@ def _reading_to_limit_state(
         except (ValueError, TypeError):
             session_pct = None
 
-    requests_remaining = round(100 - session_pct) if session_pct is not None else None
+    requests_remaining = _coerce_int(reading.get("requests_remaining"))
+    requests_limit = _coerce_int(reading.get("requests_limit"))
+
+    if requests_remaining is None and session_pct is not None:
+        requests_remaining = round(100 - session_pct)
+    if requests_limit is None and requests_remaining is not None:
+        requests_limit = 100
+
+    tokens_remaining = _coerce_int(reading.get("tokens_remaining"))
+    tokens_limit = _coerce_int(reading.get("tokens_limit"))
+    concurrent_sessions = _coerce_int(reading.get("concurrent_sessions")) or 0
 
     return LimitState(
-        concurrent_sessions=0,
+        concurrent_sessions=concurrent_sessions,
         limit=1,
         hard_cap=2,
         requests_remaining=requests_remaining,
-        requests_limit=100 if requests_remaining is not None else None,
+        requests_limit=requests_limit,
+        tokens_remaining=tokens_remaining,
+        tokens_limit=tokens_limit,
         provider=provider_name,
         age_seconds=0.0,
     )
@@ -63,8 +84,8 @@ def _fail_safe_reading(provider_name: str) -> LimitState:
         concurrent_sessions=2,
         limit=1,
         hard_cap=2,
-        requests_remaining=0,
-        requests_limit=100,
+        requests_remaining=None,
+        requests_limit=None,
         provider=provider_name,
         age_seconds=0.0,
     )

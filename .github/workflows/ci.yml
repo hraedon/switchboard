@@ -1,0 +1,45 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  identifier-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check for committed work-domain identifiers
+        env:
+          SWITCHBOARD_FORBIDDEN_IDENTIFIERS: ${{ secrets.SWITCHBOARD_FORBIDDEN_IDENTIFIERS }}
+        run: python scripts/check_committed_identifiers.py
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv venv
+      - name: Install switchboard + dev deps
+        run: uv pip install -e ".[dev]"
+      - name: Install sluice from source
+        run: uv pip install "sluice @ git+https://github.com/hraedon/sluice.git"
+      - name: ruff
+        run: .venv/bin/ruff check .
+      - name: mypy
+        run: .venv/bin/mypy src
+      - name: pytest
+        run: .venv/bin/pytest -q

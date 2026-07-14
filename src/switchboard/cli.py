@@ -201,6 +201,67 @@ def _validate_config(
                 errors.append("routing.dwell_interval must be a number")
             elif dwell < 0:
                 errors.append("routing.dwell_interval must be >= 0")
+        headroom = routing_section.get("headroom_threshold")
+        if headroom is not None:
+            if not isinstance(headroom, (int, float)) or isinstance(headroom, bool):
+                errors.append("routing.headroom_threshold must be a number")
+            elif headroom < 0.0 or headroom > 1.0:
+                errors.append(
+                    "routing.headroom_threshold must be between 0.0 and 1.0"
+                )
+
+    model_section = config_data.get("model", {})
+    if isinstance(model_section, dict):
+        for model_name, provider_map in model_section.items():
+            if not isinstance(provider_map, dict):
+                errors.append(
+                    f"model '{model_name}': must be a table of provider → alias"
+                )
+                continue
+            for provider_name, alias in provider_map.items():
+                if not isinstance(alias, str):
+                    errors.append(
+                        f"model '{model_name}': alias for '{provider_name}' must be a string"
+                    )
+                if provider_name not in providers:
+                    errors.append(
+                        f"model '{model_name}': references unknown provider '{provider_name}'"
+                    )
+
+    overload_section = config_data.get("overload", {})
+    if isinstance(overload_section, dict):
+        threshold = overload_section.get("threshold")
+        if threshold is not None:
+            if not isinstance(threshold, int) or isinstance(threshold, bool):
+                errors.append("overload.threshold must be an integer")
+            elif threshold < 1:
+                errors.append("overload.threshold must be >= 1")
+        for key in ("cooldown_default", "cooldown_min", "cooldown_max"):
+            val = overload_section.get(key)
+            if val is not None and (
+                not isinstance(val, (int, float)) or isinstance(val, bool)
+            ):
+                errors.append(f"overload.{key} must be a number")
+        statuses = overload_section.get("statuses")
+        if statuses is not None:
+            if not isinstance(statuses, list):
+                errors.append("overload.statuses must be a list of integers")
+            else:
+                for s in statuses:
+                    if not isinstance(s, int) or isinstance(s, bool):
+                        errors.append("overload.statuses must be a list of integers")
+                        break
+
+    threshold_section = config_data.get("threshold", {})
+    if isinstance(threshold_section, dict):
+        tp = threshold_section.get("provider")
+        if tp is not None:
+            if not isinstance(tp, str):
+                errors.append("threshold.provider must be a string")
+            elif tp not in providers:
+                errors.append(
+                    f"threshold.provider references unknown provider: '{tp}'"
+                )
 
     if errors:
         raise _ConfigError("; ".join(errors))
@@ -287,7 +348,9 @@ def _build_serve_app(
     args: argparse.Namespace,
 ) -> tuple[Any, str, int, str, float]:
     """Build the ProxyApp + bind params from CLI args, env, and config file."""
-    from switchboard.control import RoutingConfig
+    from switchboard.control import ModelMap, RoutingConfig
+    from switchboard.estimator import ThresholdEstimator
+    from switchboard.overload import OverloadConfig
     from switchboard.providers import build_provider_contexts_from_config
     from switchboard.proxy import ProxyApp
     from switchboard.route_table import RouteTableManager
@@ -347,27 +410,58 @@ def _build_serve_app(
     routing_config = RoutingConfig()
     routing_section = config_data.get("routing", {})
     if isinstance(routing_section, dict):
+        rc_kwargs: dict[str, Any] = {}
         threshold = routing_section.get("failover_threshold_seconds")
         if isinstance(threshold, int) and not isinstance(threshold, bool):
-            routing_config = RoutingConfig(
-                failover_threshold_seconds=threshold,
-                failover_margin=routing_config.failover_margin,
-                dwell_interval=routing_config.dwell_interval,
-            )
+            rc_kwargs["failover_threshold_seconds"] = threshold
         margin = routing_section.get("failover_margin")
         if isinstance(margin, int) and not isinstance(margin, bool):
-            routing_config = RoutingConfig(
-                failover_threshold_seconds=routing_config.failover_threshold_seconds,
-                failover_margin=margin,
-                dwell_interval=routing_config.dwell_interval,
-            )
+            rc_kwargs["failover_margin"] = margin
         dwell = routing_section.get("dwell_interval")
         if isinstance(dwell, (int, float)) and not isinstance(dwell, bool):
-            routing_config = RoutingConfig(
-                failover_threshold_seconds=routing_config.failover_threshold_seconds,
-                failover_margin=routing_config.failover_margin,
-                dwell_interval=float(dwell),
-            )
+            rc_kwargs["dwell_interval"] = float(dwell)
+        headroom = routing_section.get("headroom_threshold")
+        if isinstance(headroom, (int, float)) and not isinstance(headroom, bool):
+            rc_kwargs["headroom_threshold"] = float(headroom)
+        if rc_kwargs:
+            routing_config = RoutingConfig(**rc_kwargs)
+
+    model_map: ModelMap | None = None
+    model_section = config_data.get("model", {})
+    if isinstance(model_section, dict) and model_section:
+        routes: dict[str, dict[str, str]] = {}
+        for model_name, provider_map in model_section.items():
+            if not isinstance(provider_map, dict):
+                continue
+            entry: dict[str, str] = {}
+            for pn, alias in provider_map.items():
+                if isinstance(alias, str) and pn in providers:
+                    entry[pn] = alias
+            if entry:
+                routes[model_name] = entry
+        if routes:
+            model_map = ModelMap(routes=routes)
+
+    overload_config: OverloadConfig | None = None
+    overload_statuses: frozenset[int] | None = None
+    overload_section = config_data.get("overload", {})
+    if isinstance(overload_section, dict):
+        oc_kwargs: dict[str, Any] = {}
+        threshold = overload_section.get("threshold")
+        if isinstance(threshold, int) and not isinstance(threshold, bool):
+            oc_kwargs["threshold"] = threshold
+        for key in ("cooldown_default", "cooldown_min", "cooldown_max"):
+            val = overload_section.get(key)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                oc_kwargs[key] = float(val)
+        if oc_kwargs:
+            try:
+                overload_config = OverloadConfig(**oc_kwargs)
+            except ValueError as exc:
+                raise _ConfigError(f"invalid overload config: {exc}") from exc
+        statuses_raw = overload_section.get("statuses")
+        if isinstance(statuses_raw, list):
+            overload_statuses = frozenset(int(s) for s in statuses_raw)
 
     admin_token = _resolve("admin_token", args)
 
@@ -379,6 +473,18 @@ def _build_serve_app(
 
     log_level = _resolve("log_level", args)
 
+    estimator: ThresholdEstimator | None = None
+    threshold_section = config_data.get("threshold", {})
+    if isinstance(threshold_section, dict):
+        est_provider = threshold_section.get("provider")
+        if isinstance(est_provider, str) and est_provider in providers:
+            est_db = route_table.db
+            estimator = ThresholdEstimator(
+                provider_name=est_provider,
+                db=est_db,
+            )
+            estimator.load()
+
     app = ProxyApp(
         providers=providers,
         route_table=route_table,
@@ -386,6 +492,10 @@ def _build_serve_app(
         admin_token=admin_token if isinstance(admin_token, str) else None,
         queue_timeout=queue_timeout,
         drain_timeout=drain_timeout,
+        overload_config=overload_config,
+        overload_statuses=overload_statuses,
+        model_map=model_map,
+        estimator=estimator,
     )
 
     log.info("switchboard %s starting", __version__)
@@ -402,6 +512,12 @@ def _build_serve_app(
         log.info("  admin_token:       set")
     else:
         log.info("  admin_token:       disabled")
+    if model_map is not None:
+        log.info("  model_map:         %d model(s)", len(model_map.routes))
+    if overload_config is not None:
+        log.info("  overload:          threshold=%d", overload_config.threshold)
+    if estimator is not None:
+        log.info("  threshold:         monitoring %s", estimator.provider_name)
 
     return app, host, port, str(log_level).lower(), drain_timeout
 

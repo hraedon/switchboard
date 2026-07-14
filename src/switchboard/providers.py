@@ -12,8 +12,9 @@ these from a provider type and optional TOML config;
 from __future__ import annotations
 
 import os
+import time as _time
 from dataclasses import dataclass
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import httpx
 from sluice.control import (
@@ -32,6 +33,9 @@ from sluice.reconcile import ReconciliationLoop
 
 from switchboard.control import Availability, ProviderState, SignalFreshness
 from switchboard.dashboard import DashboardTruthSource
+
+if TYPE_CHECKING:
+    from switchboard.overload import OverloadTracker
 
 
 @dataclass
@@ -185,6 +189,7 @@ def snapshot_provider_state(
     ctx: ProviderContext,
     *,
     now: float,
+    overload_tracker: OverloadTracker | None = None,
 ) -> ProviderState:
     """Read live state from a provider's reconcile loop and gate.
 
@@ -193,10 +198,12 @@ def snapshot_provider_state(
 
     Derives :class:`~switchboard.control.Availability` and
     :class:`~switchboard.control.SignalFreshness` from the reconcile loop's
-    live state (Plan 006 §3):
+    live state (Plan 006 §3, extended by Plan 010):
 
     * **Availability**:
-      - ``CLOSED`` if gate_closed_reason is boxed or breaker.
+      - ``CLOSED`` if sluice reports low-interactivity (Plan 010 Feature 0,
+        proactive), or the overload tracker is cooling (Plan 010 Feature A,
+        reactive), or gate_closed_reason is boxed or breaker.
       - ``UNKNOWN`` if not ready (first poll not complete).
       - ``BUSY`` if gate_closed_reason is saturated, or available_permits == 0,
         or queue_depth > 0 (WI-006.1: live saturation from held permits).
@@ -210,7 +217,15 @@ def snapshot_provider_state(
     ready = ctx.reconcile.ready
     last_fetch_ok = ctx.reconcile.last_fetch_ok
 
-    if not ready:
+    low_interactivity = ctx.reconcile.is_low_interactivity()
+    overload_cooling = (
+        overload_tracker is not None
+        and overload_tracker.is_cooling(name, now=now)
+    )
+
+    if low_interactivity or overload_cooling:
+        availability = Availability.CLOSED
+    elif not ready:
         availability = Availability.UNKNOWN
     elif gate_reason in ("boxed", "breaker"):
         availability = Availability.CLOSED
@@ -232,9 +247,34 @@ def snapshot_provider_state(
 
     retry_after: int | None = None
     if availability == Availability.CLOSED:
-        retry_after = ctx.reconcile.retry_after_seconds()
+        if low_interactivity:
+            cached = ctx.reconcile.last_reading
+            if cached is not None:
+                resets_at = cached.reading.service_mode_resets_at_epoch
+                if resets_at is not None and resets_at > 0:
+                    remaining = int(resets_at - _time.time())
+                    retry_after = max(1, remaining)
+            if retry_after is None:
+                retry_after = ctx.reconcile.retry_after_seconds()
+        elif overload_cooling and overload_tracker is not None:
+            retry_after = overload_tracker.cooldown_remaining(name, now=now)
+        else:
+            retry_after = ctx.reconcile.retry_after_seconds()
     elif availability == Availability.BUSY:
         retry_after = ctx.reconcile.saturation_retry_after()
+
+    usage_headroom: float | None = None
+    cached_reading = ctx.reconcile.last_reading
+    if cached_reading is not None and cached_reading.ok:
+        limit_state = cached_reading.reading
+        if (
+            limit_state.requests_remaining is not None
+            and limit_state.requests_limit is not None
+            and limit_state.requests_limit > 0
+        ):
+            usage_headroom = (
+                limit_state.requests_remaining / limit_state.requests_limit
+            )
 
     return ProviderState(
         name=name,
@@ -243,6 +283,7 @@ def snapshot_provider_state(
         queue_depth=ctx.gate.queue_depth,
         retry_after_seconds=retry_after,
         signal_freshness=freshness,
+        usage_headroom=usage_headroom,
     )
 
 

@@ -9,6 +9,7 @@ from sluice.reconcile import ReconciliationLoop
 from sluice.usage import CachedReading
 
 from switchboard.control import Availability, ProviderState, SignalFreshness
+from switchboard.overload import OverloadConfig, OverloadTracker
 from switchboard.providers import (
     ProviderContext,
     build_provider_context,
@@ -221,4 +222,163 @@ async def test_snapshot_provider_state_null_truth_is_fresh() -> None:
     )
     state = snapshot_provider_state("generic", ctx, now=0.0)
     assert state.signal_freshness == SignalFreshness.FRESH
+    await ctx.http_client.aclose()
+
+
+def _make_ready_ctx(
+    name: str = "test",
+    capacity: int = 3,
+    *,
+    requests_remaining: int | None = None,
+    requests_limit: int | None = None,
+) -> ProviderContext:
+    """Build a ProviderContext with a ready reconcile loop and positive gate."""
+    gate = PermitGate(initial_capacity=capacity)
+    truth = NullTruthSource(provider="generic")
+    reconcile = ReconciliationLoop(
+        truth_source=truth,
+        gate=gate,
+        controller_config=ControllerConfig(target=capacity),
+        breaker_config=BreakerConfig(),
+    )
+    reconcile._first_poll_ok = True
+    reconcile._last_reading_cached = CachedReading(
+        reading=LimitState(
+            provider="generic",
+            age_seconds=0.0,
+            requests_remaining=requests_remaining,
+            requests_limit=requests_limit,
+        ),
+        fetched_at_monotonic=0.0,
+        ok=True,
+    )
+    return ProviderContext(
+        name=name,
+        upstream_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+        truth_source=truth,
+        http_client=httpx.AsyncClient(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_overload_cooling_is_closed() -> None:
+    """Plan 010 Feature A: overload tracker cooling → CLOSED."""
+    ctx = _make_ready_ctx("umans")
+    tracker = OverloadTracker(OverloadConfig(threshold=1, cooldown_default=60.0))
+    tracker.record_overloaded("umans", now=100.0)
+    assert tracker.is_cooling("umans", now=100.0)
+
+    state = snapshot_provider_state(
+        "umans", ctx, now=100.0, overload_tracker=tracker,
+    )
+    assert state.availability == Availability.CLOSED
+    assert state.retry_after_seconds is not None
+    assert state.retry_after_seconds > 0
+    await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_overload_not_cooling_is_available() -> None:
+    """Tracker present but not cooling → normal AVAILABLE state."""
+    ctx = _make_ready_ctx("umans")
+    tracker = OverloadTracker(OverloadConfig(threshold=3))
+    # Not enough consecutive overloads to open cooldown.
+    tracker.record_overloaded("umans", now=0.0)
+
+    state = snapshot_provider_state(
+        "umans", ctx, now=0.0, overload_tracker=tracker,
+    )
+    assert state.availability == Availability.AVAILABLE
+    await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_overload_cooldown_lapsed_is_available() -> None:
+    """Cooldown has lapsed → provider is AVAILABLE again."""
+    ctx = _make_ready_ctx("umans")
+    tracker = OverloadTracker(OverloadConfig(threshold=1, cooldown_default=10.0))
+    tracker.record_overloaded("umans", now=0.0)
+    # Cooldown was [0, 10); now is 20 → lapsed.
+    state = snapshot_provider_state(
+        "umans", ctx, now=20.0, overload_tracker=tracker,
+    )
+    assert state.availability == Availability.AVAILABLE
+    await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_overload_takes_precedence_over_gate_state() -> None:
+    """Even with capacity available, overload cooling → CLOSED."""
+    ctx = _make_ready_ctx("umans", capacity=5)
+    tracker = OverloadTracker(OverloadConfig(threshold=1, cooldown_default=30.0))
+    tracker.record_overloaded("umans", now=0.0)
+
+    state = snapshot_provider_state(
+        "umans", ctx, now=0.0, overload_tracker=tracker,
+    )
+    assert state.availability == Availability.CLOSED
+    assert state.available_permits == 5  # gate still has capacity
+    await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_no_tracker_behaves_as_before() -> None:
+    """No overload_tracker → no overload check, backward-compatible."""
+    ctx = _make_ready_ctx("umans")
+    state = snapshot_provider_state("umans", ctx, now=0.0)
+    assert state.availability == Availability.AVAILABLE
+    await ctx.http_client.aclose()
+
+
+# --- Plan 011: usage_headroom derivation tests ---
+
+
+@pytest.mark.asyncio
+async def test_headroom_derived_from_requests() -> None:
+    ctx = _make_ready_ctx("umans", requests_remaining=5, requests_limit=100)
+    state = snapshot_provider_state("umans", ctx, now=0.0)
+    assert state.usage_headroom is not None
+    assert abs(state.usage_headroom - 0.05) < 1e-9
+    await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_headroom_none_when_no_reading() -> None:
+    ctx = _make_ready_ctx("umans")
+    ctx.reconcile._last_reading_cached = None
+    state = snapshot_provider_state("umans", ctx, now=0.0)
+    assert state.usage_headroom is None
+    await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_headroom_none_when_stale_reading() -> None:
+    ctx = _make_ready_ctx("umans", requests_remaining=5, requests_limit=100)
+    cached = ctx.reconcile._last_reading_cached
+    assert cached is not None
+    ctx.reconcile._last_reading_cached = CachedReading(
+        reading=cached.reading,
+        fetched_at_monotonic=cached.fetched_at_monotonic,
+        ok=False,
+    )
+    state = snapshot_provider_state("umans", ctx, now=0.0)
+    assert state.usage_headroom is None
+    await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_headroom_none_when_requests_remaining_none() -> None:
+    ctx = _make_ready_ctx("umans", requests_remaining=None, requests_limit=100)
+    state = snapshot_provider_state("umans", ctx, now=0.0)
+    assert state.usage_headroom is None
+    await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_headroom_none_when_requests_limit_zero() -> None:
+    ctx = _make_ready_ctx("umans", requests_remaining=5, requests_limit=0)
+    state = snapshot_provider_state("umans", ctx, now=0.0)
+    assert state.usage_headroom is None
     await ctx.http_client.aclose()
