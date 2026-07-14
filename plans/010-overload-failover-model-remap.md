@@ -225,37 +225,39 @@ driven by its gate + the overload breaker, which is exactly what we want.
 
 ## 7. Work items
 
-**sluice (Feature 0 — separate repo, its own release):**
-- **WI-0a** `usage.py`: parse the low-interactivity field(s) **and** `tokens_in/
-  out` (for Feature C) — *shape from a live capture, not guessed*. `control.py`:
-  `UsageReading` fields + `is_low_interactivity` predicate. Unit tests off the
-  captured payload.
-- **WI-0b** `reconcile.py::gate_closed_reason` returns `"low_interactivity"`;
-  `retry_after_seconds` derives from `interactive_at`; add `last_reading()`
-  accessor (raw counters for Feature C); status surfaces it. Tag + release so
-  switchboard can depend on the new sluice version.
+**sluice (Feature 0 — branch `feat/surface-low-interactivity`, its own release):**
+- **[DONE]** **WI-0a** `usage.py` parses `usage.service_mode` + `tokens_in/out`
+  (confirmed shape); `control.py` gains the fields + `is_low_interactivity`
+  predicate; unit tests off the captured payload. Commit `5b5670d`.
+- **[PARTIAL]** **WI-0b** `ReconciliationLoop.is_low_interactivity()` accessor +
+  status.json surfacing done (`5b5670d`). Deliberately did **NOT** touch
+  `gate_closed_reason` (low-interactivity still serves degraded — a direct sluice
+  user keeps getting service; switchboard does the routing). REMAINING: add
+  `low_interactivity_retry_after()` accessor (deadline from
+  `service_mode_resets_at_epoch`), then tag + release as **v1.4.0**; bump
+  switchboard's `sluice>=1.4.0` pin.
 
-**switchboard (this repo):**
-- **WI-1** `overload.py` + unit tests (pure, no network).
-- **WI-2** proxy: overloaded classification wired into `_forward`; tracker owned
-  by `ProxyApp`; `snapshot_provider_state` consults both the tracker and sluice's
-  surfaced `low_interactivity` reason (`CLOSED`).
-- **WI-3** `ModelMap` pure types + `providers_for`/`alias_for` + core tests.
-- **WI-4** proxy: request-body buffering, `model` extraction, candidate
-  filtering, fallback rewrite; guarded no-op when no `[model]` map.
-- **WI-5** config parsing for `[model]` + `[provider."ollama-cloud"]`.
-- **WI-6** AGENTS.md + README constraint-narrowing edits (§2 above).
-- **WI-7** integration test: umans returns 3×503 → request fails over to a
-  stub ollama-cloud with the model rewritten; a subsequent 200 clears cooldown.
-  Plus: sluice reporting `low_interactivity` → immediate failover (no 3× wait).
-- **WI-8** push branch, watch CI (3.12/3.13/3.14) per hard rule 7.
+**switchboard (this repo, on `main`):**
+- **[DONE]** **WI-1** `overload.py` + unit tests. Commit `7b15c6b`.
+- **[TODO]** **WI-2** proxy: overloaded classification (503/529) → tracker
+  (easy, next to the 429 block); `snapshot_provider_state` consults tracker +
+  `is_low_interactivity()` → `CLOSED`.
+- **[DONE]** **WI-3** `ModelMap` + `servable_providers` filter in `route_decision`
+  + core tests. Commit `7b15c6b`.
+- **[TODO]** **WI-4** proxy: request-body buffering, `model` extraction, servable
+  filtering, fallback rewrite; guarded no-op when no `[model]` map. *(Riskiest —
+  alters the request path; primary/umans path must stay byte-transparent.)*
+- **[TODO]** **WI-5** config parsing for `[model]` + `[provider."ollama-cloud"]`.
+- **[TODO]** **WI-6** AGENTS.md + README constraint-narrowing edits (§2 above).
+- **[TODO]** **WI-7** integration test (stub upstreams via `httpx.MockTransport`):
+  umans 3×503 → failover to stub ollama-cloud with model rewritten; subsequent
+  200 clears cooldown; `low_interactivity` reading → immediate failover.
+- **[TODO]** **WI-8** watch CI (3.12/3.13/3.14) per hard rule 7.
 
 **switchboard (Feature C — sequence after A/B land):**
-- **WI-9** `threshold.py` pure estimator (`update_estimate`, per-window
-  transition detection, requests+tokens brackets, contradiction detection) +
-  unit tests over synthetic sample streams.
-- **WI-10** shell: poll→sample→persist wiring (SQLite), transition detection
-  from `last_reading()`; estimate on `status.json` + dashboard.
+- **[DONE]** **WI-9** `threshold.py` pure estimator + unit tests. Commit `7b15c6b`.
+- **[TODO]** **WI-10** shell: poll→sample→persist wiring (SQLite), transition
+  detection from `last_reading()`; estimate on `status.json` + dashboard.
 
 ## 8. Non-goals
 
