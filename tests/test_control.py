@@ -595,3 +595,85 @@ def test_replay_boundary_values() -> None:
 def test_replay_boundary_member_count() -> None:
     """ReplayBoundary has exactly six members."""
     assert len(list(ReplayBoundary)) == 6
+
+
+# --- ModelMap + servable filtering (Plan 010 Feature B) --------------------
+
+from switchboard.control import ModelMap  # noqa: E402
+
+_MODELS = ModelMap(routes={
+    "umans-kimi-k2.7": {"umans": "umans-kimi-k2.7", "ollama-cloud": "kimi-k2.7-code"},
+    "umans-glm-4.7": {"umans": "umans-glm-4.7"},  # umans-only
+})
+
+
+def test_modelmap_providers_for() -> None:
+    assert _MODELS.providers_for("umans-kimi-k2.7") == frozenset({"umans", "ollama-cloud"})
+    assert _MODELS.providers_for("umans-glm-4.7") == frozenset({"umans"})
+    assert _MODELS.providers_for("unknown") == frozenset()
+
+
+def test_modelmap_alias_for() -> None:
+    assert _MODELS.alias_for("umans-kimi-k2.7", "ollama-cloud") == "kimi-k2.7-code"
+    assert _MODELS.alias_for("umans-kimi-k2.7", "umans") == "umans-kimi-k2.7"
+    assert _MODELS.alias_for("umans-kimi-k2.7", "nobody") is None
+    assert _MODELS.alias_for("unknown", "umans") is None
+
+
+def test_modelmap_contains() -> None:
+    assert "umans-kimi-k2.7" in _MODELS
+    assert "unknown" not in _MODELS
+
+
+def test_servable_none_does_not_filter() -> None:
+    table = RouteTable(entries={}, default_providers=("umans", "ollama-cloud"))
+    states = {
+        "umans": _state("umans", availability=Availability.CLOSED),
+        "ollama-cloud": _state("ollama-cloud"),
+    }
+    plan = route_decision(states, table, "k", CONFIG, now=0.0, servable_providers=None)
+    assert plan.immediate_candidates == ("ollama-cloud",)  # normal failover
+
+
+def test_servable_filters_to_capable_provider() -> None:
+    # umans is CLOSED (low-interactivity); a kimi request is servable by both, so
+    # it fails over to ollama-cloud.
+    table = RouteTable(entries={}, default_providers=("umans", "ollama-cloud"))
+    states = {
+        "umans": _state("umans", availability=Availability.CLOSED),
+        "ollama-cloud": _state("ollama-cloud"),
+    }
+    plan = route_decision(
+        states, table, "k", CONFIG, now=0.0,
+        servable_providers=frozenset({"umans", "ollama-cloud"}),
+    )
+    assert plan.immediate_candidates == ("ollama-cloud",)
+    assert plan.reason == "failover"
+
+
+def test_servable_excludes_provider_without_model() -> None:
+    # A glm request umans-only: ollama-cloud is not servable, so with umans
+    # CLOSED there is no failover target — terminal_fallback stays umans.
+    table = RouteTable(entries={}, default_providers=("umans", "ollama-cloud"))
+    states = {
+        "umans": _state("umans", availability=Availability.CLOSED),
+        "ollama-cloud": _state("ollama-cloud"),
+    }
+    plan = route_decision(
+        states, table, "k", CONFIG, now=0.0,
+        servable_providers=frozenset({"umans"}),
+    )
+    assert plan.immediate_candidates == ()
+    assert plan.terminal_fallback == "umans"
+
+
+def test_servable_empty_is_model_unservable() -> None:
+    table = RouteTable(entries={}, default_providers=("umans", "ollama-cloud"))
+    states = {"umans": _state("umans"), "ollama-cloud": _state("ollama-cloud")}
+    plan = route_decision(
+        states, table, "k", CONFIG, now=0.0,
+        servable_providers=frozenset({"some-other-provider"}),
+    )
+    assert plan.reason == "model_unservable"
+    assert plan.immediate_candidates == ()
+    assert plan.terminal_fallback == "umans"

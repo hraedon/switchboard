@@ -130,6 +130,43 @@ class RouteTable:
 
 
 @dataclass(frozen=True)
+class ModelMap:
+    """Per-provider model-name aliases (Plan 010 Feature B).
+
+    Providers label the same model differently (umans ``umans-kimi-k2.7`` vs
+    ollama-cloud ``kimi-k2.7-code``).  ``routes`` maps the **incoming** model
+    string (what the client sends) to ``{provider_name: that provider's model
+    string}``.  Used for two things:
+
+    * **Candidate filtering** — only providers with an alias for the requested
+      model can serve it, so failover never routes a model to a provider that
+      doesn't offer it.
+    * **Egress rewrite** — the ``model`` field is rewritten to the chosen
+      provider's alias (only when it differs, so the primary path stays
+      byte-identical).
+
+    A model absent from ``routes`` is not filtered or rewritten — switchboard
+    behaves exactly as today (forward original bytes).  Empty ``routes`` = the
+    whole feature is off.
+    """
+
+    routes: dict[str, dict[str, str]] = field(default_factory=dict)
+
+    def __contains__(self, model: str) -> bool:
+        return model in self.routes
+
+    def providers_for(self, model: str) -> frozenset[str]:
+        """Providers that declare an alias for ``model`` (empty if unmapped)."""
+        entry = self.routes.get(model)
+        return frozenset(entry.keys()) if entry else frozenset()
+
+    def alias_for(self, model: str, provider: str) -> str | None:
+        """The model string ``provider`` expects for ``model``, or None."""
+        entry = self.routes.get(model)
+        return entry.get(provider) if entry else None
+
+
+@dataclass(frozen=True)
 class RoutingConfig:
     """Routing engine parameters.
 
@@ -201,6 +238,7 @@ def route_decision(
     *,
     now: float,
     affinity: RouteAffinity | None = None,
+    servable_providers: frozenset[str] | None = None,
 ) -> AdmissionPlan:
     """Pure routing decision. Returns an :class:`AdmissionPlan`.
 
@@ -240,6 +278,24 @@ def route_decision(
         raise ValueError("no providers configured")
 
     primary = candidates[0]
+
+    # --- Model-servability filtering (Plan 010 Feature B) ---
+    # When the request's model is mapped, only providers that declare an alias
+    # for it are eligible — failover never routes a model to a provider that
+    # doesn't serve it.  ``None`` means unmapped/no-map: no filtering (today's
+    # behaviour).  The configured primary is preserved as terminal_fallback so a
+    # fully-unservable request still gets a canonical rejection from its gate.
+    if servable_providers is not None:
+        servable = tuple(n for n in candidates if n in servable_providers)
+        if not servable:
+            return AdmissionPlan(
+                immediate_candidates=(),
+                queue_candidate=None,
+                terminal_fallback=primary,
+                reason="model_unservable",
+            )
+        candidates = servable
+        primary = candidates[0]
 
     # --- Capability filtering (Plan 008 §4) ---
     required_caps = entry.required_capabilities if entry is not None else frozenset()

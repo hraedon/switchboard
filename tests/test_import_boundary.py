@@ -105,3 +105,24 @@ def test_no_underscore_imports_from_sluice() -> None:
         "switchboard imports underscore-prefixed (private) symbols from sluice:\n"
         + "\n".join(offenders)
     )
+
+
+def test_pure_modules_import_stdlib_only() -> None:
+    """overload.py and threshold.py are pure cores (Plan 010): stdlib only,
+    no httpx/asyncio/sluice — like control.py."""
+    for mod_name in ("switchboard.overload", "switchboard.threshold"):
+        mod = importlib.import_module(mod_name)
+        assert not hasattr(mod, "httpx"), f"{mod_name} must not import httpx"
+        assert not hasattr(mod, "asyncio"), f"{mod_name} must not import asyncio"
+        src = Path(mod.__file__).read_text()  # type: ignore[arg-type]
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                assert not node.module.startswith(("httpx", "sluice", "switchboard")), (
+                    f"{mod_name} imports non-stdlib/shell module: {node.module}"
+                )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert not alias.name.startswith(("httpx", "sluice", "switchboard")), (
+                        f"{mod_name} imports non-stdlib/shell module: {alias.name}"
+                    )
