@@ -35,7 +35,11 @@ from switchboard.control import Availability, ProviderState, SignalFreshness
 from switchboard.dashboard import DashboardTruthSource
 
 if TYPE_CHECKING:
+    from sluice.history import History
+    from sluice.history_store import HistoryStore
+
     from switchboard.overload import OverloadTracker
+    from switchboard.token_budget import TokenBudgetTracker
 
 
 @dataclass
@@ -67,6 +71,9 @@ def build_provider_context(
     dashboard_token: str | None = None,
     dashboard_poll_interval: float = 30.0,
     dashboard_stale_ttl: float = 900.0,
+    poll_interval_idle: float | None = None,
+    history_store: HistoryStore | None = None,
+    history: History | None = None,
 ) -> ProviderContext:
     """Construct a :class:`ProviderContext` using sluice's building blocks.
 
@@ -113,6 +120,9 @@ def build_provider_context(
         poll_interval=poll_interval,
         controller=provider.controller,
         adaptive_config=adaptive_config,
+        poll_interval_idle=poll_interval_idle,
+        history=history,
+        history_store=history_store,
     )
 
     http_client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
@@ -129,12 +139,20 @@ def build_provider_context(
 
 def build_provider_contexts_from_config(
     config: dict[str, object],
+    *,
+    history_store_path: str | None = None,
 ) -> dict[str, ProviderContext]:
     """Build a ``dict`` of :class:`ProviderContext` instances from a parsed TOML config.
 
     Iterates over the ``[provider.*]`` sections, resolves environment
     variables (``usage_key_env``, ``dashboard_token_env``), and calls
     :func:`build_provider_context` for each provider.
+
+    When ``history_store_path`` is provided, each provider gets a per-provider
+    :class:`~sluice.history_store.SQLiteHistoryStore` (separate file per
+    provider to avoid table-name conflicts) and a bounded in-memory
+    :class:`~sluice.history.History` ring — giving trend analysis that
+    survives restarts (Plan 012 WI-2).
     """
     raw_providers = config.get("provider")
     if not isinstance(raw_providers, dict):
@@ -169,6 +187,18 @@ def build_provider_contexts_from_config(
             provider_cfg, "dashboard_poll_interval", 30.0
         )
 
+        poll_interval_idle = _optional_float(provider_cfg, "poll_interval_idle")
+
+        history_store: HistoryStore | None = None
+        history: History | None = None
+        if history_store_path:
+            from sluice.history import History as HistoryRing
+            from sluice.history_store import SQLiteHistoryStore
+
+            store_file = f"{history_store_path}.{_safe_filename(name)}.history"
+            history_store = SQLiteHistoryStore(store_file)
+            history = HistoryRing(maxlen=2880)
+
         contexts[name] = build_provider_context(
             name=name,
             upstream_url=upstream,
@@ -179,6 +209,9 @@ def build_provider_contexts_from_config(
             dashboard_token=dashboard_token,
             dashboard_stale_ttl=dashboard_stale_ttl,
             dashboard_poll_interval=dashboard_poll_interval,
+            poll_interval_idle=poll_interval_idle,
+            history_store=history_store,
+            history=history,
         )
 
     return contexts
@@ -190,6 +223,7 @@ def snapshot_provider_state(
     *,
     now: float,
     overload_tracker: OverloadTracker | None = None,
+    budget_tracker: TokenBudgetTracker | None = None,
 ) -> ProviderState:
     """Read live state from a provider's reconcile loop and gate.
 
@@ -276,6 +310,11 @@ def snapshot_provider_state(
                 limit_state.requests_remaining / limit_state.requests_limit
             )
 
+    # Token-budget utilization (Plan 012 Feature B).
+    token_utilization: float | None = None
+    if budget_tracker is not None:
+        token_utilization = budget_tracker.utilization(name, now=now)
+
     return ProviderState(
         name=name,
         availability=availability,
@@ -284,6 +323,7 @@ def snapshot_provider_state(
         retry_after_seconds=retry_after,
         signal_freshness=freshness,
         usage_headroom=usage_headroom,
+        token_utilization=token_utilization,
     )
 
 
@@ -309,3 +349,17 @@ def _float_or(d: dict[str, object], key: str, default: float) -> float:
 def _optional_str(d: dict[str, object], key: str) -> str | None:
     v = d.get(key)
     return v if isinstance(v, str) else None
+
+
+def _optional_float(d: dict[str, object], key: str) -> float | None:
+    v = d.get(key)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    return None
+
+
+def _safe_filename(name: str) -> str:
+    """Sanitize a provider name for use in a filename."""
+    import re
+
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", name)

@@ -87,12 +87,23 @@ async def handle_readyz(
         await send_json(send, 503, {"status": "not ready"})
 
 
-def _provider_status(ctx: ProviderContext) -> dict[str, Any]:
-    """Build a status dict for one provider."""
+def _provider_status(
+    ctx: ProviderContext,
+    overload_tracker: Any | None = None,
+    budget_tracker: Any | None = None,
+) -> dict[str, Any]:
+    """Build a status dict for one provider (Plan 012 §3.1 — full parity surface).
+
+    Reads the full reconcile state that sluice already computes, plus
+    switchboard-specific signals (overload breaker, token budget).  Display
+    only — the data is already on the loop.
+    """
     r = ctx.reconcile
-    breaker = r.breaker_state
-    band = r.band
-    return {
+    now = time.monotonic()
+    reading = r.last_reading.reading if r.last_reading is not None else None
+
+    status: dict[str, Any] = {
+        # Gate / admission
         "gate_closed_reason": r.gate_closed_reason(),
         "effective_permits": r.effective_permits_count,
         "in_flight": ctx.gate.held,
@@ -100,12 +111,113 @@ def _provider_status(ctx: ProviderContext) -> dict[str, Any]:
         "available_permits": ctx.gate.available,
         "capacity": ctx.gate.capacity,
         "ready": r.ready,
-        "total_429s": r.total_429s,
-        "total_requests_forwarded": r.total_requests_forwarded,
-        "breaker": breaker.name if hasattr(breaker, "name") else str(breaker),
-        "band": band.name if hasattr(band, "name") else str(band),
         "upstream_url": ctx.upstream_url,
+        # Breaker
+        "breaker": r.breaker_state.value,
+        "breaker_half_open_age_seconds": r.breaker_half_open_age_seconds,
+        # Band / penalty
+        "band": r.band.value,
+        "penalty_started_at": r.penalty_started_at,
+        # Usage reading
+        "concurrent_sessions": r.observed_concurrent_sessions,
+        "limit": reading.limit if reading else None,
+        "hard_cap": reading.hard_cap if reading else None,
+        "priority_low": reading.priority_low if reading else False,
+        "priority_reason": reading.priority_reason if reading else None,
+        "boxed_until": reading.boxed_until_epoch if reading else None,
+        "resets_at": reading.resets_at_epoch if reading else None,
+        "service_mode": reading.service_mode if reading else None,
+        "service_mode_resets_at": (
+            reading.service_mode_resets_at_epoch if reading else None
+        ),
+        "low_interactivity": r.is_low_interactivity(),
+        "tokens_in": reading.tokens_in if reading else None,
+        "tokens_out": reading.tokens_out if reading else None,
+        "usage_age": round(r.last_age_seconds, 1),
+        "stale": not r.last_fetch_ok,
+        "phantom_estimate": r.phantom_estimate_value,
+        # Request-window budget
+        "requests_in_window": (
+            reading.requests_in_window if reading else None
+        ),
+        "requests_limit": reading.requests_limit if reading else None,
+        "requests_remaining": (
+            reading.requests_remaining if reading else None
+        ),
+        "requests_hard_cap": reading.requests_hard_cap if reading else None,
+        "requests_window_seconds": (
+            reading.requests_window_seconds if reading else None
+        ),
+        "local_requests_in_window": r.local_requests_in_window,
+        "request_window_delta": r.request_window_delta,
+        "total_requests_forwarded": r.total_requests_forwarded,
+        "throughput": r.last_throughput,
+        "idle": r.is_idle,
+        # Error counters
+        "recent_429s": r.recent_429_count,
+        "total_429s": r.total_429s,
+        "gateway_429s": r.gateway_429s,
+        "rate_limit_429s": r.rate_limit_429s,
+        "total_503s": r.total_503s,
+        "recent_503_count": r.recent_503_count,
+        # Queue / timing
+        "cooling_down": ctx.gate.cooling_down,
+        "avg_wait_seconds": round(r.avg_wait_seconds, 3),
+        "p95_wait_seconds": round(r.p95_wait_seconds, 3),
+        "avg_hold_seconds": round(r.avg_hold_seconds, 3),
+        "retry_after_hint": r.saturation_hint,
+        "queue_timeouts": r.queue_timeouts,
+        # Config
+        "target": r.target,
+        "min_floor": r.min_floor,
+        "poll_interval": r.poll_interval,
+        "poll_interval_idle": r.poll_interval_idle,
+        "usage_fresh_ttl": r.usage_fresh_ttl,
+        "phantom_window": r.phantom_window,
+        "breaker_threshold": r.breaker_threshold,
+        "breaker_window_seconds": r.breaker_window_seconds,
+        "breaker_cooldown_seconds": r.breaker_cooldown_seconds,
+        "controller": r.controller_name,
+        "provider_name": r.provider_name,
+        "overrides": r.overrides,
     }
+
+    # Switchboard-specific: overload breaker state.
+    if overload_tracker is not None:
+        status["overload_consecutive"] = overload_tracker.consecutive(ctx.name)
+        status["overload_cooling"] = overload_tracker.is_cooling(
+            ctx.name, now=now
+        )
+        status["overload_cooldown_remaining"] = (
+            overload_tracker.cooldown_remaining(ctx.name, now=now)
+        )
+
+    # Switchboard-specific: token budget utilization (Plan 012 Feature B).
+    if budget_tracker is not None:
+        util = budget_tracker.utilization(ctx.name, now=now)
+        status["token_utilization"] = util
+        status["token_budget"] = budget_tracker.budget_summary(ctx.name)
+
+    # History trend summary (Plan 012 WI-2).
+    hist = ctx.reconcile.history
+    if hist is not None and hist.length > 0:
+        recent = hist.entries()[-20:]
+        status["history"] = {
+            "count": hist.length,
+            "recent": [
+                {
+                    "ts": e.timestamp,
+                    "band": e.band,
+                    "ep": e.effective_permits,
+                    "stl": e.stale,
+                    "tp": e.throughput,
+                    "r429": e.recent_429s,
+                }
+                for e in recent
+            ],
+        }
+
+    return status
 
 
 def _build_status_payload(
@@ -114,11 +226,17 @@ def _build_status_payload(
     routing_metrics: RoutingMetrics,
     build_sha: str | None = None,
     estimator: ThresholdEstimator | None = None,
+    overload_tracker: Any | None = None,
+    budget_tracker: Any | None = None,
 ) -> dict[str, Any]:
     """Build the full status payload for /status.json."""
     provider_states: dict[str, Any] = {}
     for name, ctx in providers.items():
-        provider_states[name] = _provider_status(ctx)
+        provider_states[name] = _provider_status(
+            ctx,
+            overload_tracker=overload_tracker,
+            budget_tracker=budget_tracker,
+        )
 
     routes: dict[str, list[str]] = {}
     for entry in route_table.list_entries():
@@ -171,11 +289,15 @@ async def send_status_json(
     build_sha: str | None = None,
     cors_allow_origin: str | None = None,
     estimator: ThresholdEstimator | None = None,
+    overload_tracker: Any | None = None,
+    budget_tracker: Any | None = None,
 ) -> None:
     """GET /status.json — per-provider state + route table + routing metrics."""
     payload = _build_status_payload(
         providers, route_table, routing_metrics, build_sha,
         estimator=estimator,
+        overload_tracker=overload_tracker,
+        budget_tracker=budget_tracker,
     )
     await send_json(
         send, 200, payload,
@@ -191,9 +313,34 @@ async def send_prometheus(
     providers: dict[str, ProviderContext],
     routing_metrics: RoutingMetrics,
     cors_allow_origin: str | None = None,
+    overload_tracker: Any | None = None,
+    budget_tracker: Any | None = None,
 ) -> None:
-    """GET /metrics — Prometheus text exposition format."""
+    """GET /metrics — Prometheus text exposition format (Plan 012 §3.1)."""
+    now_mono = time.monotonic()
     lines: list[str] = []
+
+    def gauge(
+        name: str, help_text: str, labels: str,
+        value: float | int | None,
+    ) -> None:
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} gauge")
+        v = value if value is not None else float("nan")
+        lines.append(f"{name}{{{labels}}} {v}")
+
+    def emit_enum(
+        metric: str, help_text: str,
+        provider: str, current: str,
+        *states: str,
+    ) -> None:
+        lines.append(f"# HELP {metric} {help_text}")
+        lines.append(f"# TYPE {metric} gauge")
+        for st in states:
+            lines.append(
+                f'{metric}{{provider="{provider}",state="{st}"}} '
+                f"{1 if current == st else 0}"
+            )
 
     lines.append(
         "# HELP switchboard_routing_decisions Total routing decisions made"
@@ -226,35 +373,84 @@ async def send_prometheus(
             f'switchboard_forwarded_per_provider{{provider="{name}"}} {count}'
         )
 
-    lines.append("# HELP switchboard_in_flight Currently held permits")
-    lines.append("# TYPE switchboard_in_flight gauge")
-    lines.append(
-        "# HELP switchboard_effective_permits Current effective permit count"
-    )
-    lines.append("# TYPE switchboard_effective_permits gauge")
-    lines.append("# HELP switchboard_queue_depth Current queue depth")
-    lines.append("# TYPE switchboard_queue_depth gauge")
-    lines.append(
-        "# HELP switchboard_total_429s Total 429s received from upstream"
-    )
-    lines.append("# TYPE switchboard_total_429s counter")
-    lines.append(
-        "# HELP switchboard_total_forwarded Total requests forwarded upstream"
-    )
-    lines.append("# TYPE switchboard_total_forwarded counter")
-
     for name, ctx in sorted(providers.items()):
         r = ctx.reconcile
+        reading = r.last_reading.reading if r.last_reading is not None else None
         labels = f'provider="{name}"'
-        lines.append(f"switchboard_in_flight{{{labels}}} {ctx.gate.held}")
-        lines.append(
-            f"switchboard_effective_permits{{{labels}}} {r.effective_permits_count}"
-        )
-        lines.append(f"switchboard_queue_depth{{{labels}}} {ctx.gate.queue_depth}")
-        lines.append(f"switchboard_total_429s{{{labels}}} {r.total_429s}")
-        lines.append(
-            f"switchboard_total_forwarded{{{labels}}} {r.total_requests_forwarded}"
-        )
+
+        # Short aliases to keep the gauge table readable (Plan 012 §3.1).
+        gate = ctx.gate
+        riw = reading.requests_in_window if reading else None
+        rr = reading.requests_remaining if reading else None
+        lriw = r.local_requests_in_window
+        rwd = r.request_window_delta
+
+        # (metric_name, help_text, value) — data-driven so the metric set is
+        # auditable in one place.
+        _gauges: list[tuple[str, str, Any]] = [
+            ("switchboard_in_flight", "Currently held permits", gate.held),
+            ("switchboard_effective_permits", "Effective permit count", r.effective_permits_count),
+            ("switchboard_queue_depth", "Current queue depth", gate.queue_depth),
+            ("switchboard_total_429s", "Concurrency 429s from upstream", r.total_429s),
+            ("switchboard_total_forwarded", "Requests forwarded upstream",
+             r.total_requests_forwarded),
+            ("switchboard_rate_limit_429s", "Rate-limit 429s", r.rate_limit_429s),
+            ("switchboard_gateway_429s", "Gateway/CDN 429s", r.gateway_429s),
+            ("switchboard_total_503s", "Upstream 503s (overload)", r.total_503s),
+            ("switchboard_recent_429s", "Recent 429s in breaker window",
+             r.recent_429_count),
+            ("switchboard_phantom_estimate", "Windowed phantom estimate",
+             r.phantom_estimate_value),
+            ("switchboard_usage_stale", "1 if last fetch failed",
+             0 if r.last_fetch_ok else 1),
+            ("switchboard_usage_age_seconds", "Seconds since last poll",
+             round(r.last_age_seconds, 1)),
+            ("switchboard_observed_sessions", "Reported sessions",
+             r.observed_concurrent_sessions),
+            ("switchboard_cooling_down", "Permits in release cooldown", gate.cooling_down),
+            ("switchboard_queue_wait_avg_seconds", "Mean queue wait", round(r.avg_wait_seconds, 3)),
+            ("switchboard_queue_wait_p95_seconds", "P95 queue wait", round(r.p95_wait_seconds, 3)),
+            ("switchboard_hold_avg_seconds", "Mean hold duration", round(r.avg_hold_seconds, 3)),
+            ("switchboard_retry_after_hint_seconds", "Saturation Retry-After", r.saturation_hint),
+            ("switchboard_queue_timeouts_total", "Requests that gave up waiting", r.queue_timeouts),
+            ("switchboard_throughput", "Requests in last tick", r.last_throughput),
+            ("switchboard_idle", "1 when idle", 1 if r.is_idle else 0),
+            ("switchboard_requests_in_window", "Provider requests used", riw),
+            ("switchboard_requests_remaining", "Provider remaining requests", rr),
+            ("switchboard_local_requests_in_window", "Local forwarded in window", lriw),
+            ("switchboard_request_window_delta", "Provider minus local", rwd),
+        ]
+        for metric_name, help_text, value in _gauges:
+            gauge(metric_name, help_text, labels, value)
+
+        emit_enum("switchboard_band", "enforcement band", name,
+                  r.band.value, "normal", "low", "reject",
+                  "boxed", "low_interactivity")
+        emit_enum("switchboard_breaker", "breaker state", name,
+                  r.breaker_state.value, "closed", "open", "half_open")
+
+        if overload_tracker is not None:
+            gauge(
+                "switchboard_overload_consecutive",
+                "Consecutive overloaded responses",
+                labels,
+                overload_tracker.consecutive(name),
+            )
+            gauge(
+                "switchboard_overload_cooling",
+                "1 if overload breaker is cooling",
+                labels,
+                1 if overload_tracker.is_cooling(name, now=now_mono) else 0,
+            )
+
+        if budget_tracker is not None:
+            util = budget_tracker.utilization(name, now=now_mono)
+            gauge(
+                "switchboard_token_utilization",
+                "Token budget utilization (0..1+)",
+                labels,
+                util,
+            )
 
     text = "\n".join(lines) + "\n"
     await send_text(
@@ -459,11 +655,122 @@ async def handle_config_get(
         "failover_margin": routing_config.failover_margin,
         "dwell_interval": routing_config.dwell_interval,
         "headroom_threshold": routing_config.headroom_threshold,
+        "token_budget_threshold": routing_config.token_budget_threshold,
     }
     await send_json(
         send, 200, body,
         extra_headers=cors_extra_headers(cors_allow_origin, None),
     )
+
+
+async def handle_provider_override(
+    send: Send,
+    receive: Receive,
+    providers: dict[str, ProviderContext],
+    admin_token: str | None,
+    scope: Scope,
+    prov_name: str,
+    method: str,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """POST/DELETE /admin/providers/<name>/override — runtime target override.
+
+    POST body: ``{"target": <int>}`` — applies a runtime target override to
+    the named provider's reconcile loop (Plan 012 WI-3).  The reconcile loop
+    validates against the provider's hard_cap.  DELETE reverts to boot value.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(
+            send, 405,
+            {"error": "mutations disabled — set --admin-token to enable"},
+            extra_headers=cors,
+        )
+        return
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    ctx = providers.get(prov_name)
+    if ctx is None:
+        await send_json(send, 404, {"error": "unknown provider"}, extra_headers=cors)
+        return
+
+    if method == "DELETE":
+        try:
+            ctx.reconcile.clear_override("target")
+        except ValueError as exc:
+            await send_json(send, 400, {"error": str(exc)}, extra_headers=cors)
+            return
+        await send_json(send, 200, {"reverted": True}, extra_headers=cors)
+        return
+
+    if method != "POST":
+        await send_text(send, 405, "Method not allowed")
+        return
+
+    ct = next(
+        (
+            v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+            if k == b"content-type"
+        ),
+        "",
+    )
+    if not ct.lower().startswith("application/json"):
+        await send_json(
+            send, 415,
+            {"error": "Content-Type must be application/json"},
+            extra_headers=cors,
+        )
+        return
+
+    try:
+        body = await read_body(receive)
+    except ValueError:
+        await send_json(send, 413, {"error": "request body too large"}, extra_headers=cors)
+        return
+    except ConnectionError:
+        return
+
+    try:
+        data = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        await send_json(send, 400, {"error": "invalid JSON body"}, extra_headers=cors)
+        return
+
+    if not isinstance(data, dict):
+        await send_json(send, 400, {"error": "body must be a JSON object"}, extra_headers=cors)
+        return
+
+    target_val = data.get("target")
+    if not isinstance(target_val, int) or isinstance(target_val, bool):
+        await send_json(
+            send, 400,
+            {"error": "missing or invalid 'target' (must be integer)"},
+            extra_headers=cors,
+        )
+        return
+
+    try:
+        warning = ctx.reconcile.apply_override("target", target_val)
+    except ValueError as exc:
+        await send_json(send, 400, {"error": str(exc)}, extra_headers=cors)
+        return
+
+    log.info(
+        "override applied: %s target=%d", prov_name, target_val
+    )
+    response: dict[str, Any] = {"applied": True, "target": target_val}
+    if warning:
+        response["warning"] = warning
+    await send_json(send, 200, response, extra_headers=cors)
 
 
 async def serve_static(path: str, send: Send) -> None:

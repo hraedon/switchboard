@@ -34,7 +34,7 @@ import json
 import logging
 import os
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
@@ -82,6 +82,8 @@ from switchboard.estimator import ThresholdEstimator
 from switchboard.overload import OverloadConfig, OverloadTracker
 from switchboard.providers import ProviderContext, snapshot_provider_state
 from switchboard.route_table import RouteTableManager
+from switchboard.token_budget import TokenBudgetTracker
+from switchboard.usage_observer import UsageObserver
 
 log = logging.getLogger("switchboard.proxy")
 
@@ -294,6 +296,7 @@ class ProxyApp:
         overload_statuses: frozenset[int] | None = None,
         model_map: ModelMap | None = None,
         estimator: ThresholdEstimator | None = None,
+        budget_tracker: TokenBudgetTracker | None = None,
     ) -> None:
         self._providers = providers
         self._route_table = route_table
@@ -313,11 +316,12 @@ class ProxyApp:
         )
         self._model_map = model_map
         self._estimator = estimator
+        self._budget_tracker = budget_tracker
         self._build_sha = os.environ.get("SWITCHBOARD_BUILD_SHA") or None
         self._login_throttle = LoginThrottle()
         self._metrics = RoutingMetrics()
         self._draining = False
-        self._affinity: dict[str, RouteAffinity] = {}
+        self._affinity: OrderedDict[str, RouteAffinity] = OrderedDict()
 
     @property
     def metrics(self) -> RoutingMetrics:
@@ -346,10 +350,16 @@ class ProxyApp:
         if (
             method == "OPTIONS"
             and self._cors_allow_origin is not None
-            and path in (
-                "/", "/status.json", "/metrics",
-                "/admin/routes", "/admin/config",
-                "/login", "/logout",
+            and (
+                path in (
+                    "/", "/status.json", "/metrics",
+                    "/admin/routes", "/admin/config",
+                    "/login", "/logout",
+                )
+                or (
+                    path.startswith("/admin/providers/")
+                    and path.endswith("/override")
+                )
             )
         ):
             await send_text(
@@ -409,12 +419,16 @@ class ProxyApp:
                     self._metrics, self._build_sha,
                     self._cors_allow_origin,
                     estimator=self._estimator,
+                    overload_tracker=self._overload_tracker,
+                    budget_tracker=self._budget_tracker,
                 )
                 return
             if path == "/metrics":
                 await send_prometheus(
                     send, self._providers, self._metrics,
                     self._cors_allow_origin,
+                    overload_tracker=self._overload_tracker,
+                    budget_tracker=self._budget_tracker,
                 )
                 return
 
@@ -466,18 +480,47 @@ class ProxyApp:
             )
             return
 
+        if (
+            path.startswith("/admin/providers/")
+            and path.endswith("/override")
+        ):
+            from switchboard.admin import (
+                handle_provider_override,
+            )
+
+            parts = path.split("/")
+            if len(parts) == 5 and parts[4] == "override":
+                prov_name = parts[3]
+                await handle_provider_override(
+                    send, receive, self._providers,
+                    self._admin_token, scope, prov_name,
+                    method, self._cors_allow_origin,
+                )
+                return
+
         await self._proxy_request(scope, receive, send)
 
     async def _handle_lifespan(self, receive: Receive, send: Send) -> None:
         """ASGI lifespan: start/stop all reconcile loops, drain, close clients."""
+        prune_task: asyncio.Task[None] | None = None
         while True:
             event = await receive()
             if event["type"] == "lifespan.startup":
                 for ctx in self._providers.values():
                     await ctx.reconcile.start()
+                if self._budget_tracker is not None:
+                    prune_task = asyncio.create_task(
+                        self._budget_prune_loop()
+                    )
                 await send({"type": "lifespan.startup.complete"})
             elif event["type"] == "lifespan.shutdown":
                 self._draining = True
+                if prune_task is not None:
+                    prune_task.cancel()
+                    with contextlib.suppress(
+                        asyncio.CancelledError, Exception
+                    ):
+                        await prune_task
                 for ctx in self._providers.values():
                     await ctx.reconcile.stop()
                 if self._drain_timeout > 0:
@@ -509,8 +552,22 @@ class ProxyApp:
                 for ctx in self._providers.values():
                     await ctx.http_client.aclose()
                 self._route_table.close()
+                if self._budget_tracker is not None:
+                    self._budget_tracker.prune_all(now=time.monotonic())
                 await send({"type": "lifespan.shutdown.complete"})
                 return
+
+    async def _budget_prune_loop(self) -> None:
+        """Periodically prune the token-budget SQLite table (every 5 min)."""
+        while True:
+            try:
+                await asyncio.sleep(300)
+                if self._budget_tracker is not None:
+                    self._budget_tracker.prune_all(now=time.monotonic())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("budget prune failed", exc_info=True)
 
     async def _proxy_request(
         self, scope: Scope, receive: Receive, send: Send
@@ -574,6 +631,25 @@ class ProxyApp:
             if est_ctx is not None:
                 self._estimator.maybe_sample(est_ctx)
 
+        # Reconcile token budgets with dashboard readings (Plan 012 §4.7).
+        if self._budget_tracker is not None:
+            for name in candidates:
+                ctx = self._providers.get(name)
+                if ctx is None:
+                    continue
+                cached = ctx.reconcile.last_reading
+                if cached is not None and cached.ok:
+                    reading = cached.reading
+                    if (
+                        reading.tokens_in is not None
+                        and reading.tokens_out is not None
+                    ):
+                        self._budget_tracker.reconcile(
+                            name,
+                            reading.tokens_in + reading.tokens_out,
+                            now=now_mono,
+                        )
+
         states: dict[str, Any] = {}
         for name in candidates:
             ctx = self._providers.get(name)
@@ -581,6 +657,7 @@ class ProxyApp:
                 states[name] = snapshot_provider_state(
                     name, ctx, now=now_mono,
                     overload_tracker=self._overload_tracker,
+                    budget_tracker=self._budget_tracker,
                 )
 
         table = self._route_table.get_route_table()
@@ -595,7 +672,9 @@ class ProxyApp:
 
         acquired_provider: str | None = None
         try:
-            acquired_provider = await self._admit(plan)
+            acquired_provider = await self._admit(
+                plan, receive=receive, body_buffered=buffered_body is not None,
+            )
         except Exception:
             log.exception("admission failed")
             await send_json(
@@ -676,9 +755,9 @@ class ProxyApp:
                 selected_at=select_time,
                 failover_reason=plan.reason,
             )
+            self._affinity.move_to_end(hashed_key)
             if len(self._affinity) > _AFFINITY_MAX:
-                oldest = next(iter(self._affinity))
-                del self._affinity[oldest]
+                self._affinity.popitem(last=False)
         elif affinity is not None and affinity.provider != primary:
             self._affinity.pop(hashed_key, None)
 
@@ -703,9 +782,29 @@ class ProxyApp:
                 hold_seconds=None if forward_failed else hold_seconds,
             )
 
+        # Increment healthy observations on the affinity entry when a
+        # failover provider served successfully (Plan 012 WI-C5).
+        if (
+            not forward_failed
+            and acquired_provider != primary
+            and hashed_key in self._affinity
+        ):
+            old = self._affinity[hashed_key]
+            if old.provider == acquired_provider:
+                self._affinity[hashed_key] = RouteAffinity(
+                    provider=old.provider,
+                    selected_at=old.selected_at,
+                    failover_reason=old.failover_reason,
+                    healthy_observations=old.healthy_observations + 1,
+                )
+                self._affinity.move_to_end(hashed_key)
+
     async def _admit(
         self,
         plan: AdmissionPlan,
+        *,
+        receive: Receive | None = None,
+        body_buffered: bool = False,
     ) -> str | None:
         """Plan-driven admission (Plan 006 §4).
 
@@ -713,7 +812,12 @@ class ProxyApp:
         2. If all immediate attempts lose the snapshot race, perform one
            final non-blocking retry pass over the same candidates.
         3. If still none, wait on queue_candidate for the remaining queue
-           budget (not the full timeout).
+           budget (not the full timeout).  If ``receive`` is provided AND
+           the request body has already been buffered, race the wait against
+           a client-disconnect check (Plan 012 WI-C3) so a disconnect during
+           queue wait doesn't burn the full timeout.  When the body is NOT
+           buffered, the disconnect watcher would steal body events from
+           ``_forward``'s ``body_stream``, so the plain acquire is used.
         4. Return the acquired provider name, or None.
         """
         admit_start = time.monotonic()
@@ -747,7 +851,14 @@ class ProxyApp:
                 if ctx is not None:
                     acquired = False
                     try:
-                        acquired = await ctx.gate.acquire(timeout=remaining)
+                        if receive is not None and body_buffered:
+                            acquired = await self._acquire_with_disconnect(
+                                ctx, remaining, receive,
+                            )
+                        else:
+                            acquired = await ctx.gate.acquire(
+                                timeout=remaining
+                            )
                     except BaseException:
                         if acquired:
                             await ctx.gate.release()
@@ -756,6 +867,62 @@ class ProxyApp:
                         return plan.queue_candidate
 
         return None
+
+    async def _acquire_with_disconnect(
+        self,
+        ctx: ProviderContext,
+        timeout: float,
+        receive: Receive,
+    ) -> bool:
+        """Race a gate acquire against a client-disconnect check (Plan 012 WI-C3).
+
+        If the client disconnects while waiting on the queue, aborts
+        immediately without burning the full queue timeout.
+
+        **Precondition**: the request body must already be buffered
+        (``body_buffered=True``) — the watcher calls ``receive()`` which
+        would otherwise steal body events from ``_forward``'s ``body_stream``.
+        """
+        disconnect_event = asyncio.Event()
+
+        async def watch_disconnect() -> None:
+            try:
+                while True:
+                    event = await receive()
+                    if event["type"] == "http.disconnect":
+                        disconnect_event.set()
+                        return
+                    if (
+                        event["type"] == "http.request"
+                        and not event.get("more_body", False)
+                    ):
+                        return
+            except Exception:
+                pass
+
+        watcher = asyncio.create_task(watch_disconnect())
+        acquire_task = asyncio.ensure_future(
+            ctx.gate.acquire(timeout=timeout)
+        )
+        disc_task = asyncio.ensure_future(disconnect_event.wait())
+        try:
+            await asyncio.wait(
+                {acquire_task, disc_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if acquire_task.done() and not acquire_task.cancelled():
+                result = acquire_task.result()
+                if result:
+                    return True
+            # Either disconnected or timed out — cancel the acquire.
+            await _cancel_task(acquire_task)
+            return False
+        finally:
+            await _cancel_task(disc_task)
+            if not watcher.done():
+                watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watcher
 
     async def _buffer_request_body(
         self, receive: Receive,
@@ -898,6 +1065,12 @@ class ProxyApp:
                         asyncio.CancelledError, Exception
                     ):
                         await entry_task
+                if not disconnect_task.done():
+                    disconnect_task.cancel()
+                    with contextlib.suppress(
+                        asyncio.CancelledError, Exception
+                    ):
+                        await disconnect_task
                 with contextlib.suppress(Exception):
                     await stream_cm.__aexit__(None, None, None)
                 await send_json(send, 413, {"error": "request body too large"})
@@ -968,6 +1141,27 @@ class ProxyApp:
                 chunk_iter = response.aiter_raw()
                 upstream_idle = False
                 disc_wait = asyncio.ensure_future(disconnect.wait())
+
+                # Token-budget observer (Plan 012 Feature B): read-only
+                # in-flight usage parsing.  Only instantiated when a budget
+                # is configured for this provider and the response is 2xx.
+                # Bytes forwarded to the client are never modified.
+                observer: UsageObserver | None = None
+                non_sse_buf: bytearray | None = None
+                if (
+                    self._budget_tracker is not None
+                    and self._budget_tracker.has_budget(ctx.name)
+                    and 200 <= response.status_code < 300
+                ):
+                    content_type = (
+                        response.headers.get("content-type", "")
+                        .lower()
+                    )
+                    is_sse = "text/event-stream" in content_type
+                    observer = UsageObserver(is_sse=is_sse)
+                    if not is_sse:
+                        non_sse_buf = bytearray()
+
                 try:
                     while True:
                         if disconnect.is_set():
@@ -997,6 +1191,15 @@ class ProxyApp:
                             break
                         if disconnect.is_set():
                             break
+                        # Feed to the read-only observer BEFORE forwarding
+                        # — bytes sent to the client are unchanged.
+                        if observer is not None:
+                            observer.feed_chunk(chunk)
+                        if (
+                            non_sse_buf is not None
+                            and len(non_sse_buf) < 1_048_576
+                        ):
+                            non_sse_buf.extend(chunk)
                         try:
                             await send(
                                 {
@@ -1024,6 +1227,26 @@ class ProxyApp:
                         and not upstream_idle
                     ):
                         ctx.reconcile.record_success()
+
+                    # Record observed usage into the budget tracker
+                    # (Plan 012 Feature B — read-only, best-effort).
+                    if (
+                        observer is not None
+                        and self._budget_tracker is not None
+                        and not disconnect.is_set()
+                    ):
+                        if non_sse_buf is not None:
+                            observer.feed_non_streaming(
+                                bytes(non_sse_buf)
+                            )
+                        usage = observer.usage
+                        if usage is not None:
+                            self._budget_tracker.record_usage(
+                                ctx.name,
+                                usage[0],
+                                usage[1],
+                                now=time.monotonic(),
+                            )
             finally:
                 with contextlib.suppress(Exception):
                     await stream_cm.__aexit__(None, None, None)

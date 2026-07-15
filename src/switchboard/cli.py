@@ -8,6 +8,7 @@ Config precedence: flags → environment variables → config file → built-in 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import sys
@@ -209,6 +210,65 @@ def _validate_config(
                 errors.append(
                     "routing.headroom_threshold must be between 0.0 and 1.0"
                 )
+        token_thresh = routing_section.get("token_budget_threshold")
+        if token_thresh is not None:
+            if not isinstance(token_thresh, (int, float)) or isinstance(token_thresh, bool):
+                errors.append(
+                    "routing.token_budget_threshold must be a number"
+                )
+            elif token_thresh < 0.0 or token_thresh > 1.0:
+                errors.append(
+                    "routing.token_budget_threshold must be "
+                    "between 0.0 and 1.0"
+                )
+
+    token_budget_section = config_data.get("token_budget", {})
+    if isinstance(token_budget_section, dict):
+        for prov_name, prov_cfg in token_budget_section.items():
+            if not isinstance(prov_cfg, dict):
+                errors.append(
+                    f"token_budget.'{prov_name}': must be a table"
+                )
+                continue
+            cap = prov_cfg.get("cap_tokens")
+            if not isinstance(cap, int) or isinstance(cap, bool):
+                errors.append(
+                    f"token_budget.'{prov_name}': cap_tokens must be an integer"
+                )
+            elif cap <= 0:
+                errors.append(
+                    f"token_budget.'{prov_name}': cap_tokens must be > 0"
+                )
+            window = prov_cfg.get("window_seconds", 3600.0)
+            if not isinstance(window, (int, float)) or isinstance(
+                window, bool
+            ):
+                errors.append(
+                    f"token_budget.'{prov_name}': "
+                    f"window_seconds must be a number"
+                )
+            elif window <= 0:
+                errors.append(
+                    f"token_budget.'{prov_name}': "
+                    f"window_seconds must be > 0"
+                )
+            soft = prov_cfg.get("soft_threshold", 0.85)
+            if not isinstance(soft, (int, float)) or isinstance(
+                soft, bool
+            ):
+                errors.append(
+                    f"token_budget.'{prov_name}': "
+                    f"soft_threshold must be a number"
+                )
+            elif not (0.0 < soft <= 1.0):
+                errors.append(
+                    f"token_budget.'{prov_name}': "
+                    f"soft_threshold must be in (0.0, 1.0]"
+                )
+            if prov_name not in providers:
+                errors.append(
+                    f"token_budget.'{prov_name}': references unknown provider"
+                )
 
     model_section = config_data.get("model", {})
     if isinstance(model_section, dict):
@@ -354,6 +414,7 @@ def _build_serve_app(
     from switchboard.providers import build_provider_contexts_from_config
     from switchboard.proxy import ProxyApp
     from switchboard.route_table import RouteTableManager
+    from switchboard.token_budget import TokenBudgetTracker
 
     config_path = _resolve("config", args)
     config_data: dict[str, Any] = {}
@@ -362,7 +423,12 @@ def _build_serve_app(
 
     _validate_config_pre_build(config_data)
 
-    providers = build_provider_contexts_from_config(config_data)
+    store_path = _resolve_route_table_store(args, config_data)
+
+    providers = build_provider_contexts_from_config(
+        config_data,
+        history_store_path=store_path,
+    )
     if not providers:
         raise _ConfigError(
             "no providers configured — provide a TOML config with [provider.*] sections"
@@ -393,8 +459,6 @@ def _build_serve_app(
                 f"default route references unknown provider: {name}"
             )
 
-    store_path = _resolve_route_table_store(args, config_data)
-
     try:
         route_table = RouteTableManager(
             default_providers=default_providers,
@@ -423,6 +487,9 @@ def _build_serve_app(
         headroom = routing_section.get("headroom_threshold")
         if isinstance(headroom, (int, float)) and not isinstance(headroom, bool):
             rc_kwargs["headroom_threshold"] = float(headroom)
+        token_thresh = routing_section.get("token_budget_threshold")
+        if isinstance(token_thresh, (int, float)) and not isinstance(token_thresh, bool):
+            rc_kwargs["token_budget_threshold"] = float(token_thresh)
         if rc_kwargs:
             routing_config = RoutingConfig(**rc_kwargs)
 
@@ -485,6 +552,39 @@ def _build_serve_app(
             )
             estimator.load()
 
+    budget_tracker: TokenBudgetTracker | None = None
+    token_budget_section = config_data.get("token_budget", {})
+    if isinstance(token_budget_section, dict) and token_budget_section:
+        from switchboard.budget import TokenBudgetConfig
+
+        budget_configs: dict[str, TokenBudgetConfig] = {}
+        for prov_name, prov_cfg in token_budget_section.items():
+            if not isinstance(prov_cfg, dict):
+                continue
+            if prov_name not in providers:
+                continue
+            cap = prov_cfg.get("cap_tokens")
+            if not isinstance(cap, int) or isinstance(cap, bool):
+                continue
+            window = prov_cfg.get("window_seconds", 3600.0)
+            if not isinstance(window, (int, float)) or isinstance(window, bool):
+                window = 3600.0
+            soft = prov_cfg.get("soft_threshold", 0.85)
+            if not isinstance(soft, (int, float)) or isinstance(soft, bool):
+                soft = 0.85
+            with contextlib.suppress(ValueError):
+                budget_configs[prov_name] = TokenBudgetConfig(
+                    cap_tokens=cap,
+                    window_seconds=float(window),
+                    soft_threshold=float(soft),
+                )
+        if budget_configs:
+            budget_tracker = TokenBudgetTracker(
+                configs=budget_configs,
+                db=route_table.db,
+            )
+            budget_tracker.load()
+
     app = ProxyApp(
         providers=providers,
         route_table=route_table,
@@ -496,6 +596,7 @@ def _build_serve_app(
         overload_statuses=overload_statuses,
         model_map=model_map,
         estimator=estimator,
+        budget_tracker=budget_tracker,
     )
 
     log.info("switchboard %s starting", __version__)
@@ -518,6 +619,13 @@ def _build_serve_app(
         log.info("  overload:          threshold=%d", overload_config.threshold)
     if estimator is not None:
         log.info("  threshold:         monitoring %s", estimator.provider_name)
+    if budget_tracker is not None:
+        log.info(
+            "  token_budget:      %s",
+            ", ".join(
+                f"{p}={c.cap_tokens}" for p, c in budget_tracker._configs.items()
+            ),
+        )
 
     return app, host, port, str(log_level).lower(), drain_timeout
 

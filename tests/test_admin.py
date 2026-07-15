@@ -14,6 +14,7 @@ from switchboard.admin import (
     _build_status_payload,
     handle_config_get,
     handle_healthz,
+    handle_provider_override,
     handle_readyz,
     handle_route_add,
     handle_route_delete,
@@ -398,3 +399,128 @@ def test_build_status_payload_none_build_sha() -> None:
     metrics = RoutingMetrics()
     payload = _build_status_payload(providers, mgr, metrics)
     assert payload["build"] is None
+
+
+# --- Provider override endpoint tests (Plan 012 WI-3) ---
+
+_ADMIN_TOKEN = "test-admin-token"
+
+
+def _make_override_scope(
+    method: str = "POST",
+    body: bytes = b"",
+) -> dict[str, Any]:
+    import hmac
+
+    sig = hmac.new(
+        _ADMIN_TOKEN.encode(), body, __import__("hashlib").sha256
+    ).hexdigest()
+    return {
+        "type": "http",
+        "method": method,
+        "path": "/admin/providers/test/override",
+        "raw_path": b"/admin/providers/test/override",
+        "query_string": b"",
+        "headers": [
+            (b"authorization", f"Bearer {_ADMIN_TOKEN}".encode()),
+            (b"content-type", b"application/json"),
+            (b"x-csrf-token", sig.encode()),
+        ],
+        "client": ("127.0.0.1", 12345),
+        "server": ("127.0.0.1", 8801),
+        "scheme": "http",
+    }
+
+
+def _make_ready_provider(name: str = "test") -> ProviderContext:
+    from sluice.usage import CachedReading
+
+    ctx = _make_provider_context(name)
+    ctx.reconcile._first_poll_ok = True
+    ctx.reconcile._last_reading_cached = CachedReading(
+        reading=__import__(
+            "sluice.control", fromlist=["LimitState"]
+        ).LimitState(provider="generic", age_seconds=0.0, limit=4, hard_cap=8),
+        fetched_at_monotonic=0.0,
+        ok=True,
+    )
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_override_apply_success() -> None:
+    ctx = _make_ready_provider("test")
+    providers = {"test": ctx}
+    body = json.dumps({"target": 3}).encode()
+    scope = _make_override_scope("POST", body)
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_provider_override(
+        send, receive, providers, _ADMIN_TOKEN, scope,
+        "test", "POST", None,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 200
+
+
+@pytest.mark.asyncio
+async def test_override_apply_rejects_zero() -> None:
+    ctx = _make_ready_provider("test")
+    providers = {"test": ctx}
+    body = json.dumps({"target": 0}).encode()
+    scope = _make_override_scope("POST", body)
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_provider_override(
+        send, receive, providers, _ADMIN_TOKEN, scope,
+        "test", "POST", None,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 400
+
+
+@pytest.mark.asyncio
+async def test_override_unknown_provider_404() -> None:
+    ctx = _make_ready_provider("test")
+    providers = {"test": ctx}
+    body = json.dumps({"target": 3}).encode()
+    scope = _make_override_scope("POST", body)
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_provider_override(
+        send, receive, providers, _ADMIN_TOKEN, scope,
+        "nonexistent", "POST", None,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 404
+
+
+@pytest.mark.asyncio
+async def test_override_no_admin_token_405() -> None:
+    ctx = _make_ready_provider("test")
+    providers = {"test": ctx}
+    body = json.dumps({"target": 3}).encode()
+    scope = _make_override_scope("POST", body)
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_provider_override(
+        send, receive, providers, None, scope,
+        "test", "POST", None,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 405
+
+
+@pytest.mark.asyncio
+async def test_override_delete_reverts() -> None:
+    ctx = _make_ready_provider("test")
+    providers = {"test": ctx}
+    scope = _make_override_scope("DELETE")
+    receive = _make_receive(b"")
+    messages, send = _make_send()
+    await handle_provider_override(
+        send, receive, providers, _ADMIN_TOKEN, scope,
+        "test", "DELETE", None,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 200

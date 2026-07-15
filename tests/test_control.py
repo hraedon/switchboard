@@ -9,7 +9,6 @@ from switchboard.control import (
     Availability,
     ProviderCapabilities,
     ProviderState,
-    ReplayBoundary,
     RouteAffinity,
     RouteEntry,
     RouteTable,
@@ -30,6 +29,7 @@ def _state(
     signal_freshness: SignalFreshness = SignalFreshness.FRESH,
     capabilities: ProviderCapabilities | None = None,
     usage_headroom: float | None = None,
+    token_utilization: float | None = None,
 ) -> ProviderState:
     return ProviderState(
         name=name,
@@ -40,6 +40,7 @@ def _state(
         signal_freshness=signal_freshness,
         capabilities=capabilities,
         usage_headroom=usage_headroom,
+        token_utilization=token_utilization,
     )
 
 
@@ -581,24 +582,6 @@ def test_affinity_same_inputs_same_plan() -> None:
     assert plan1 == plan2
 
 
-# --- ReplayBoundary tests (Plan 008 §6 / WI-008.5) ---
-
-
-def test_replay_boundary_values() -> None:
-    """ReplayBoundary enum has the expected members and values."""
-    assert ReplayBoundary.BEFORE_PERMIT.value == "before_permit"
-    assert ReplayBoundary.PERMIT_ACQUIRED.value == "permit_acquired"
-    assert ReplayBoundary.CONNECT_FAILED.value == "connect_failed"
-    assert ReplayBoundary.UPLOAD_STARTED.value == "upload_started"
-    assert ReplayBoundary.HEADERS_RECEIVED.value == "headers_received"
-    assert ReplayBoundary.STREAMING.value == "streaming"
-
-
-def test_replay_boundary_member_count() -> None:
-    """ReplayBoundary has exactly six members."""
-    assert len(list(ReplayBoundary)) == 6
-
-
 # --- ModelMap + servable filtering (Plan 010 Feature B) --------------------
 
 from switchboard.control import ModelMap  # noqa: E402
@@ -751,3 +734,117 @@ def test_headroom_threshold_zero_is_noop() -> None:
     }
     plan = route_decision(states, table, "k", config, now=0.0)
     assert "ollama-cloud" in plan.immediate_candidates
+
+
+# --- Plan 012: token-budget filtering tests ---
+
+_BUDGET_CONFIG = RoutingConfig(token_budget_threshold=0.85)
+
+
+def test_token_budget_demotes_non_primary_over_budget() -> None:
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state(
+            "ollama-cloud", token_utilization=0.90
+        ),
+    }
+    plan = route_decision(states, table, "k", _BUDGET_CONFIG, now=0.0)
+    assert "umans" in plan.immediate_candidates
+    assert "ollama-cloud" not in plan.immediate_candidates
+    assert plan.queue_candidate == "ollama-cloud"
+
+
+def test_token_budget_does_not_demote_when_below_threshold() -> None:
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state(
+            "ollama-cloud", token_utilization=0.50
+        ),
+    }
+    plan = route_decision(states, table, "k", _BUDGET_CONFIG, now=0.0)
+    assert "umans" in plan.immediate_candidates
+    assert "ollama-cloud" in plan.immediate_candidates
+
+
+def test_token_budget_demotes_at_threshold() -> None:
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state(
+            "ollama-cloud", token_utilization=0.85
+        ),
+    }
+    plan = route_decision(states, table, "k", _BUDGET_CONFIG, now=0.0)
+    assert "umans" in plan.immediate_candidates
+    assert "ollama-cloud" not in plan.immediate_candidates
+
+
+def test_token_budget_none_not_filtered() -> None:
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state(
+            "ollama-cloud", token_utilization=None
+        ),
+    }
+    plan = route_decision(states, table, "k", _BUDGET_CONFIG, now=0.0)
+    assert "umans" in plan.immediate_candidates
+    assert "ollama-cloud" in plan.immediate_candidates
+
+
+def test_token_budget_primary_never_demoted() -> None:
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans", token_utilization=0.99),
+        "ollama-cloud": _state("ollama-cloud", token_utilization=0.10),
+    }
+    plan = route_decision(states, table, "k", _BUDGET_CONFIG, now=0.0)
+    assert "umans" in plan.immediate_candidates
+    assert plan.immediate_candidates[0] == "umans"
+
+
+def test_token_budget_threshold_zero_is_noop() -> None:
+    config = RoutingConfig(token_budget_threshold=0.0)
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans", availability=Availability.CLOSED),
+        "ollama-cloud": _state(
+            "ollama-cloud", token_utilization=0.99
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=0.0)
+    assert "ollama-cloud" in plan.immediate_candidates
+
+
+def test_token_budget_and_headroom_both_demote() -> None:
+    config = RoutingConfig(
+        headroom_threshold=0.15, token_budget_threshold=0.85
+    )
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state(
+            "ollama-cloud",
+            usage_headroom=0.05,
+            token_utilization=0.50,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=0.0)
+    assert "umans" in plan.immediate_candidates
+    assert "ollama-cloud" not in plan.immediate_candidates

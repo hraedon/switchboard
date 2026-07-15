@@ -41,10 +41,13 @@ top.
   provider-level failover. Those are out of scope.
 - **No re-serialization of request bodies** on the primary path.
   Cache-transparency applies to the primary/umans path — bytes are forwarded
-  as-is. *(Exception: when a `[model]` map is configured, the fallback path
-  MAY rewrite the `model` field and re-serialize the request JSON for a
-  provider that expects a different model name. With no `[model]` map,
-  switchboard is fully byte-transparent everywhere.)*
+  as-is. *(Exceptions: (1) when a `[model]` map is configured, the fallback
+  path MAY rewrite the `model` field and re-serialize the request JSON for a
+  provider that expects a different model name. (2) When a `[token_budget]`
+  is configured, switchboard MAY observe the `usage` object in response bytes
+  read-only in-flight for token accounting — bytes forwarded to the client are
+  never modified. Neither exception applies without explicit opt-in
+  configuration.)*
 
 ## Design principles
 

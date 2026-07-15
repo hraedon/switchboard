@@ -19,11 +19,15 @@ gates and decides which upstream provider receives each request.
 - **Inert in-path — per provider.** switchboard forwards live traffic to the
   selected upstream. It **never reads, logs, stores, or rewrites request/response
   bodies.** It routes and streams bytes through untouched. Same guarantee as
-  sluice, applied per-upstream-path. *(Exception: when a `[model]` map is
-  configured, switchboard MAY read the request body's top-level `model` field
-  and MAY rewrite only that field for the fallback path — Plan 010. No other
-  field is read or altered. Response bodies are always fully inert. With no
-  `[model]` map, this exception does not apply.)*
+  sluice, applied per-upstream-path. *(Exceptions, both opt-in and gated:
+  (1) when a `[model]` map is configured, switchboard MAY read the request
+  body's top-level `model` field and MAY rewrite only that field for the
+  fallback path — Plan 010. No other field is read or altered. (2) When a
+  `[token_budget]` is configured for a provider, switchboard MAY observe the
+  `usage` object in the response stream **read-only in-flight** (SSE
+  `data:` lines or non-streaming JSON) for token accounting — Plan 012.
+  Bytes forwarded to the client are never modified; no other field is read.
+  Response bodies are fully inert when neither exception applies.)*
 - **Cache-transparency — indistinguishable from a direct client per upstream.**
   The request switchboard egresses to each upstream must be byte-for-byte what
   the client sent. Routing selects *which* upstream; it does not reshape the

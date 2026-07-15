@@ -108,9 +108,13 @@ def test_no_underscore_imports_from_sluice() -> None:
 
 
 def test_pure_modules_import_stdlib_only() -> None:
-    """overload.py and threshold.py are pure cores (Plan 010): stdlib only,
+    """overload.py, threshold.py, and budget.py are pure cores: stdlib only,
     no httpx/asyncio/sluice — like control.py."""
-    for mod_name in ("switchboard.overload", "switchboard.threshold"):
+    for mod_name in (
+        "switchboard.overload",
+        "switchboard.threshold",
+        "switchboard.budget",
+    ):
         mod = importlib.import_module(mod_name)
         assert not hasattr(mod, "httpx"), f"{mod_name} must not import httpx"
         assert not hasattr(mod, "asyncio"), f"{mod_name} must not import asyncio"

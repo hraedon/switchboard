@@ -46,22 +46,6 @@ class SignalFreshness(Enum):
     UNKNOWN = "unknown"
 
 
-class ReplayBoundary(Enum):
-    """Points after which automatic retry/replay is forbidden (Plan 008 §6).
-
-    The streaming substrate returns enough typed state to enforce this table.
-    The proxy consumes these values to decide whether an alternate provider
-    may be tried after a failure.
-    """
-
-    BEFORE_PERMIT = "before_permit"  # alternate provider allowed
-    PERMIT_ACQUIRED = "permit_acquired"  # allowed after release
-    CONNECT_FAILED = "connect_failed"  # only if zero bytes sent
-    UPLOAD_STARTED = "upload_started"  # NO replay
-    HEADERS_RECEIVED = "headers_received"  # NO replay
-    STREAMING = "streaming"  # NO replay
-
-
 @dataclass(frozen=True)
 class ProviderCapabilities:
     """Declarative provider capability metadata (Plan 008 §4).
@@ -111,6 +95,7 @@ class ProviderState:
     signal_freshness: SignalFreshness
     capabilities: ProviderCapabilities | None = None
     usage_headroom: float | None = None
+    token_utilization: float | None = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +169,7 @@ class RoutingConfig:
     failover_margin: int = 5
     dwell_interval: float = 30.0
     headroom_threshold: float = 0.0
+    token_budget_threshold: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -345,7 +331,14 @@ def route_decision(
                 and state.usage_headroom is not None
                 and state.usage_headroom < config.headroom_threshold
             )
-            if low_headroom:
+            over_budget = (
+                not is_primary
+                and config.token_budget_threshold > 0
+                and state.token_utilization is not None
+                and state.token_utilization
+                >= config.token_budget_threshold
+            )
+            if low_headroom or over_budget:
                 queue_eligible.append(name)
             elif state.availability == Availability.AVAILABLE:
                 immediate.append(name)
