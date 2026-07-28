@@ -30,6 +30,7 @@ def _state(
     capabilities: ProviderCapabilities | None = None,
     usage_headroom: float | None = None,
     token_utilization: float | None = None,
+    usage_24h_utilization: float | None = None,
 ) -> ProviderState:
     return ProviderState(
         name=name,
@@ -41,6 +42,7 @@ def _state(
         capabilities=capabilities,
         usage_headroom=usage_headroom,
         token_utilization=token_utilization,
+        usage_24h_utilization=usage_24h_utilization,
     )
 
 
@@ -848,3 +850,133 @@ def test_token_budget_and_headroom_both_demote() -> None:
     plan = route_decision(states, table, "k", config, now=0.0)
     assert "umans" in plan.immediate_candidates
     assert "ollama-cloud" not in plan.immediate_candidates
+
+
+# --- Plan 013: trailing-24h usage filtering tests ---
+
+_24H_CONFIG = RoutingConfig(usage_24h_threshold=0.85)
+
+
+def test_usage_24h_demotes_primary_over_threshold() -> None:
+    """Plan 013 §2: the ONE proactive signal that may demote the primary.
+
+    umans (primary) over its trailing-24h cap → traffic prefers the
+    fallback; umans stays queue-candidate backstop (de-prefer, never
+    exclude).
+    """
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans", usage_24h_utilization=0.90),
+        "ollama-cloud": _state("ollama-cloud", usage_24h_utilization=0.10),
+    }
+    plan = route_decision(states, table, "k", _24H_CONFIG, now=0.0)
+    assert "umans" not in plan.immediate_candidates
+    assert "ollama-cloud" in plan.immediate_candidates
+    assert plan.immediate_candidates[0] == "ollama-cloud"
+    # Backstop semantics: primary remains the queue candidate.
+    assert plan.queue_candidate == "umans"
+    assert plan.terminal_fallback == "umans"
+    assert plan.reason == "failover"
+
+
+def test_usage_24h_demotes_non_primary_over_threshold() -> None:
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans", usage_24h_utilization=0.10),
+        "ollama-cloud": _state("ollama-cloud", usage_24h_utilization=0.90),
+    }
+    plan = route_decision(states, table, "k", _24H_CONFIG, now=0.0)
+    assert "umans" in plan.immediate_candidates
+    assert "ollama-cloud" not in plan.immediate_candidates
+    assert plan.queue_candidate == "ollama-cloud"
+
+
+def test_usage_24h_does_not_demote_below_threshold() -> None:
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans", usage_24h_utilization=0.84),
+        "ollama-cloud": _state("ollama-cloud", usage_24h_utilization=0.10),
+    }
+    plan = route_decision(states, table, "k", _24H_CONFIG, now=0.0)
+    assert plan.immediate_candidates[0] == "umans"
+
+
+def test_usage_24h_demotes_at_threshold() -> None:
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans", usage_24h_utilization=0.85),
+        "ollama-cloud": _state("ollama-cloud", usage_24h_utilization=0.10),
+    }
+    plan = route_decision(states, table, "k", _24H_CONFIG, now=0.0)
+    assert "umans" not in plan.immediate_candidates
+    assert "ollama-cloud" in plan.immediate_candidates
+
+
+def test_usage_24h_none_not_filtered() -> None:
+    """Fail safe: no data (None) → no filtering, even over threshold."""
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans", usage_24h_utilization=None),
+        "ollama-cloud": _state("ollama-cloud", usage_24h_utilization=None),
+    }
+    plan = route_decision(states, table, "k", _24H_CONFIG, now=0.0)
+    assert plan.immediate_candidates[0] == "umans"
+    assert "ollama-cloud" in plan.immediate_candidates
+
+
+def test_usage_24h_threshold_zero_is_noop() -> None:
+    """Default config (0.0) → feature fully off, today's behavior."""
+    config = RoutingConfig(usage_24h_threshold=0.0)
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans", usage_24h_utilization=0.99),
+        "ollama-cloud": _state("ollama-cloud", usage_24h_utilization=0.99),
+    }
+    plan = route_decision(states, table, "k", config, now=0.0)
+    assert plan.immediate_candidates[0] == "umans"
+
+
+def test_usage_24h_all_over_threshold_primary_still_backstop() -> None:
+    """Every provider over threshold → nothing immediate; the primary is
+    still the queue candidate (fail safe, never strand traffic)."""
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans", usage_24h_utilization=0.95),
+        "ollama-cloud": _state("ollama-cloud", usage_24h_utilization=0.90),
+    }
+    plan = route_decision(states, table, "k", _24H_CONFIG, now=0.0)
+    assert plan.immediate_candidates == ()
+    assert plan.queue_candidate == "umans"
+    assert plan.reason == "queue_only"
+
+
+def test_usage_24h_composes_with_token_budget() -> None:
+    """Both signals fire independently: primary demoted by 24h, fallback
+    demoted by token budget → nothing immediate, primary queues."""
+    config = RoutingConfig(
+        token_budget_threshold=0.85, usage_24h_threshold=0.85
+    )
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans", usage_24h_utilization=0.95),
+        "ollama-cloud": _state("ollama-cloud", token_utilization=0.90),
+    }
+    plan = route_decision(states, table, "k", config, now=0.0)
+    assert plan.immediate_candidates == ()
+    assert plan.queue_candidate == "umans"

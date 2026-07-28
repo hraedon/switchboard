@@ -221,6 +221,41 @@ def _validate_config(
                     "routing.token_budget_threshold must be "
                     "between 0.0 and 1.0"
                 )
+        usage_24h_thresh = routing_section.get("usage_24h_threshold")
+        if usage_24h_thresh is not None:
+            if not isinstance(usage_24h_thresh, (int, float)) or isinstance(usage_24h_thresh, bool):
+                errors.append(
+                    "routing.usage_24h_threshold must be a number"
+                )
+            elif usage_24h_thresh < 0.0 or usage_24h_thresh > 1.0:
+                errors.append(
+                    "routing.usage_24h_threshold must be "
+                    "between 0.0 and 1.0"
+                )
+
+    usage_24h_budget_section = config_data.get("usage_24h_budget", {})
+    if isinstance(usage_24h_budget_section, dict):
+        for prov_name, prov_cfg in usage_24h_budget_section.items():
+            if not isinstance(prov_cfg, dict):
+                errors.append(
+                    f"usage_24h_budget.'{prov_name}': must be a table"
+                )
+                continue
+            cap = prov_cfg.get("cap_tokens")
+            if not isinstance(cap, int) or isinstance(cap, bool):
+                errors.append(
+                    f"usage_24h_budget.'{prov_name}': "
+                    f"cap_tokens must be an integer"
+                )
+            elif cap <= 0:
+                errors.append(
+                    f"usage_24h_budget.'{prov_name}': cap_tokens must be > 0"
+                )
+            if prov_name not in providers:
+                errors.append(
+                    f"usage_24h_budget.'{prov_name}': "
+                    f"references unknown provider"
+                )
 
     token_budget_section = config_data.get("token_budget", {})
     if isinstance(token_budget_section, dict):
@@ -415,6 +450,7 @@ def _build_serve_app(
     from switchboard.proxy import ProxyApp
     from switchboard.route_table import RouteTableManager
     from switchboard.token_budget import TokenBudgetTracker
+    from switchboard.usage_history import UsageHistoryTracker
 
     config_path = _resolve("config", args)
     config_data: dict[str, Any] = {}
@@ -490,6 +526,9 @@ def _build_serve_app(
         token_thresh = routing_section.get("token_budget_threshold")
         if isinstance(token_thresh, (int, float)) and not isinstance(token_thresh, bool):
             rc_kwargs["token_budget_threshold"] = float(token_thresh)
+        usage_24h_thresh = routing_section.get("usage_24h_threshold")
+        if isinstance(usage_24h_thresh, (int, float)) and not isinstance(usage_24h_thresh, bool):
+            rc_kwargs["usage_24h_threshold"] = float(usage_24h_thresh)
         if rc_kwargs:
             routing_config = RoutingConfig(**rc_kwargs)
 
@@ -585,6 +624,28 @@ def _build_serve_app(
             )
             budget_tracker.load()
 
+    usage_history_tracker: UsageHistoryTracker | None = None
+    usage_24h_budget_section = config_data.get("usage_24h_budget", {})
+    if not isinstance(usage_24h_budget_section, dict):
+        usage_24h_budget_section = {}
+    for name, ctx in providers.items():
+        if ctx.usage_base_url and ctx.usage_api_key:
+            if usage_history_tracker is None:
+                usage_history_tracker = UsageHistoryTracker()
+            cap_tokens: int | None = None
+            prov_budget = usage_24h_budget_section.get(name)
+            if isinstance(prov_budget, dict):
+                raw_cap = prov_budget.get("cap_tokens")
+                if isinstance(raw_cap, int) and not isinstance(raw_cap, bool) and raw_cap > 0:
+                    cap_tokens = raw_cap
+            usage_history_tracker.register(
+                name,
+                base_url=ctx.usage_base_url,
+                api_key=ctx.usage_api_key,
+                auth_header=ctx.usage_auth_header,
+                cap_tokens=cap_tokens,
+            )
+
     app = ProxyApp(
         providers=providers,
         route_table=route_table,
@@ -597,6 +658,7 @@ def _build_serve_app(
         model_map=model_map,
         estimator=estimator,
         budget_tracker=budget_tracker,
+        usage_history_tracker=usage_history_tracker,
     )
 
     log.info("switchboard %s starting", __version__)
@@ -626,6 +688,23 @@ def _build_serve_app(
                 f"{p}={c.cap_tokens}" for p, c in budget_tracker._configs.items()
             ),
         )
+    if usage_history_tracker is not None:
+        log.info(
+            "  usage_history:     %s",
+            ", ".join(
+                name for name in providers
+                if usage_history_tracker.has_provider(name)
+            ),
+        )
+        capped = [
+            f"{p}={c}" for p, c in usage_history_tracker._caps.items()
+        ]
+        if capped:
+            log.info(
+                "  usage_24h_budget:  %s (threshold=%.2f)",
+                ", ".join(capped),
+                routing_config.usage_24h_threshold,
+            )
 
     return app, host, port, str(log_level).lower(), drain_timeout
 

@@ -55,7 +55,13 @@ gates and decides which upstream provider receives each request.
 1. **Fail safe.** When all providers are pressured, route to the configured
    default and let its gate reject the request. Never route to a provider whose
    gate is closed without checking alternatives. Never widen the routing
-   decision on bad information.
+   decision on bad information. Proactive utilization signals (headroom,
+   token budget) never demote the **primary** — its own gate handles its
+   limits. The ONE exception is the trailing-24h usage signal (Plan 013):
+   the provider's heavy-usage penalty keys off trailing-day volume, which
+   the gate cannot see coming, so `[routing] usage_24h_threshold` MAY
+   demote the primary to queue-eligible. Demotion de-prefers only — the
+   primary stays the queue backstop and terminal 503 fallback.
 2. **The routing core is pure.** No clock, no randomness, no I/O inside
    `switchboard.control`. Pass time and observations in as arguments so
    decisions are reproducible and testable.
@@ -85,6 +91,11 @@ src/switchboard/
   route_table.py   # route table: API-key → provider mapping, CRUD, persistence
   overload.py      # per-provider overloaded-response breaker (Plan 010 Feature A)
   threshold.py     # pure low-interactivity threshold estimator (Plan 010 Feature C)
+  budget.py        # PURE token-budget math core (Plan 012 Feature B)
+  token_budget.py  # shell: rolling-window token tracker (streaming-tracked counts)
+  usage_observer.py     # read-only SSE/JSON usage parser (streaming-tracked counts)
+  usage_history.py      # shell: 24h rolling token total + penalty event tokens (poll-based)
+  estimator.py     # shell wrapper for threshold estimator
   admin.py         # admin route handlers: health, status, metrics, route table CRUD, dashboard
   cli.py           # `switchboard serve ...` entry point
   static/          # dashboard assets

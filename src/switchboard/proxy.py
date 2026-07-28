@@ -64,6 +64,8 @@ from switchboard.admin import (
     handle_route_add,
     handle_route_delete,
     handle_route_list,
+    handle_threshold_events,
+    handle_usage_history,
     send_dashboard,
     send_login_page,
     send_prometheus,
@@ -83,6 +85,7 @@ from switchboard.overload import OverloadConfig, OverloadTracker
 from switchboard.providers import ProviderContext, snapshot_provider_state
 from switchboard.route_table import RouteTableManager
 from switchboard.token_budget import TokenBudgetTracker
+from switchboard.usage_history import UsageHistoryTracker
 from switchboard.usage_observer import UsageObserver
 
 log = logging.getLogger("switchboard.proxy")
@@ -297,6 +300,7 @@ class ProxyApp:
         model_map: ModelMap | None = None,
         estimator: ThresholdEstimator | None = None,
         budget_tracker: TokenBudgetTracker | None = None,
+        usage_history_tracker: UsageHistoryTracker | None = None,
     ) -> None:
         self._providers = providers
         self._route_table = route_table
@@ -317,6 +321,7 @@ class ProxyApp:
         self._model_map = model_map
         self._estimator = estimator
         self._budget_tracker = budget_tracker
+        self._usage_history_tracker = usage_history_tracker
         self._build_sha = os.environ.get("SWITCHBOARD_BUILD_SHA") or None
         self._login_throttle = LoginThrottle()
         self._metrics = RoutingMetrics()
@@ -354,6 +359,7 @@ class ProxyApp:
                 path in (
                     "/", "/status.json", "/metrics",
                     "/admin/routes", "/admin/config",
+                    "/admin/threshold-events", "/admin/usage-history",
                     "/login", "/logout",
                 )
                 or (
@@ -421,6 +427,7 @@ class ProxyApp:
                     estimator=self._estimator,
                     overload_tracker=self._overload_tracker,
                     budget_tracker=self._budget_tracker,
+                    usage_history_tracker=self._usage_history_tracker,
                 )
                 return
             if path == "/metrics":
@@ -429,6 +436,8 @@ class ProxyApp:
                     self._cors_allow_origin,
                     overload_tracker=self._overload_tracker,
                     budget_tracker=self._budget_tracker,
+                    usage_history_tracker=self._usage_history_tracker,
+                    estimator=self._estimator,
                 )
                 return
 
@@ -480,6 +489,20 @@ class ProxyApp:
             )
             return
 
+        if path == "/admin/usage-history" and method == "GET":
+            await handle_usage_history(
+                send, scope, self._admin_token, self._providers,
+                self._cors_allow_origin,
+            )
+            return
+
+        if path == "/admin/threshold-events" and method == "GET":
+            await handle_threshold_events(
+                send, scope, self._admin_token, self._estimator,
+                self._cors_allow_origin,
+            )
+            return
+
         if (
             path.startswith("/admin/providers/")
             and path.endswith("/override")
@@ -503,6 +526,7 @@ class ProxyApp:
     async def _handle_lifespan(self, receive: Receive, send: Send) -> None:
         """ASGI lifespan: start/stop all reconcile loops, drain, close clients."""
         prune_task: asyncio.Task[None] | None = None
+        usage_history_task: asyncio.Task[None] | None = None
         while True:
             event = await receive()
             if event["type"] == "lifespan.startup":
@@ -511,6 +535,10 @@ class ProxyApp:
                 if self._budget_tracker is not None:
                     prune_task = asyncio.create_task(
                         self._budget_prune_loop()
+                    )
+                if self._usage_history_tracker is not None:
+                    usage_history_task = asyncio.create_task(
+                        self._usage_history_loop()
                     )
                 await send({"type": "lifespan.startup.complete"})
             elif event["type"] == "lifespan.shutdown":
@@ -521,6 +549,12 @@ class ProxyApp:
                         asyncio.CancelledError, Exception
                     ):
                         await prune_task
+                if usage_history_task is not None:
+                    usage_history_task.cancel()
+                    with contextlib.suppress(
+                        asyncio.CancelledError, Exception
+                    ):
+                        await usage_history_task
                 for ctx in self._providers.values():
                     await ctx.reconcile.stop()
                 if self._drain_timeout > 0:
@@ -554,6 +588,8 @@ class ProxyApp:
                 self._route_table.close()
                 if self._budget_tracker is not None:
                     self._budget_tracker.prune_all(now=time.monotonic())
+                if self._usage_history_tracker is not None:
+                    await self._usage_history_tracker.close()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 
@@ -564,10 +600,36 @@ class ProxyApp:
                 await asyncio.sleep(300)
                 if self._budget_tracker is not None:
                     self._budget_tracker.prune_all(now=time.monotonic())
+                if self._estimator is not None:
+                    self._estimator.prune_events()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.warning("budget prune failed", exc_info=True)
+
+    async def _usage_history_loop(self) -> None:
+        """Periodically refresh usage-history token counts.
+
+        Ticks every 10 s so penalty transitions are picked up promptly; the
+        tracker itself throttles successful refreshes to 5 min and failed
+        attempts to 60 s, so the fast tick costs nothing when healthy.
+        """
+        while True:
+            try:
+                await asyncio.sleep(10)
+                if self._usage_history_tracker is not None:
+                    for name, ctx in self._providers.items():
+                        if not self._usage_history_tracker.has_provider(name):
+                            continue
+                        penalty_at = ctx.reconcile.penalty_started_at
+                        await self._usage_history_tracker.refresh(
+                            name,
+                            penalty_started_at=penalty_at,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("usage-history refresh failed", exc_info=True)
 
     async def _proxy_request(
         self, scope: Scope, receive: Receive, send: Send
@@ -658,6 +720,7 @@ class ProxyApp:
                     name, ctx, now=now_mono,
                     overload_tracker=self._overload_tracker,
                     budget_tracker=self._budget_tracker,
+                    usage_history_tracker=self._usage_history_tracker,
                 )
 
         table = self._route_table.get_route_table()

@@ -9,6 +9,7 @@ build multi-provider status payloads and manage route table CRUD.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import ipaddress
 import json
@@ -91,6 +92,7 @@ def _provider_status(
     ctx: ProviderContext,
     overload_tracker: Any | None = None,
     budget_tracker: Any | None = None,
+    usage_history_tracker: Any | None = None,
 ) -> dict[str, Any]:
     """Build a status dict for one provider (Plan 012 §3.1 — full parity surface).
 
@@ -198,6 +200,12 @@ def _provider_status(
         status["token_utilization"] = util
         status["token_budget"] = budget_tracker.budget_summary(ctx.name)
 
+    # Switchboard-specific: usage-history token counts (24h rolling + penalty).
+    if usage_history_tracker is not None:
+        uh = usage_history_tracker.status_dict(ctx.name)
+        if uh is not None:
+            status["usage_history"] = uh
+
     # History trend summary (Plan 012 WI-2).
     hist = ctx.reconcile.history
     if hist is not None and hist.length > 0:
@@ -228,6 +236,7 @@ def _build_status_payload(
     estimator: ThresholdEstimator | None = None,
     overload_tracker: Any | None = None,
     budget_tracker: Any | None = None,
+    usage_history_tracker: Any | None = None,
 ) -> dict[str, Any]:
     """Build the full status payload for /status.json."""
     provider_states: dict[str, Any] = {}
@@ -236,6 +245,7 @@ def _build_status_payload(
             ctx,
             overload_tracker=overload_tracker,
             budget_tracker=budget_tracker,
+            usage_history_tracker=usage_history_tracker,
         )
 
     routes: dict[str, list[str]] = {}
@@ -276,6 +286,7 @@ def _build_status_payload(
                 "contradicted": est.tokens.contradicted,
             },
             "last_edge_concurrent_sessions": est.last_edge_concurrent_sessions,
+            "events": estimator.event_summary(),
         }
 
     return payload
@@ -291,6 +302,7 @@ async def send_status_json(
     estimator: ThresholdEstimator | None = None,
     overload_tracker: Any | None = None,
     budget_tracker: Any | None = None,
+    usage_history_tracker: Any | None = None,
 ) -> None:
     """GET /status.json — per-provider state + route table + routing metrics."""
     payload = _build_status_payload(
@@ -298,6 +310,7 @@ async def send_status_json(
         estimator=estimator,
         overload_tracker=overload_tracker,
         budget_tracker=budget_tracker,
+        usage_history_tracker=usage_history_tracker,
     )
     await send_json(
         send, 200, payload,
@@ -315,6 +328,8 @@ async def send_prometheus(
     cors_allow_origin: str | None = None,
     overload_tracker: Any | None = None,
     budget_tracker: Any | None = None,
+    usage_history_tracker: Any | None = None,
+    estimator: ThresholdEstimator | None = None,
 ) -> None:
     """GET /metrics — Prometheus text exposition format (Plan 012 §3.1)."""
     now_mono = time.monotonic()
@@ -451,6 +466,115 @@ async def send_prometheus(
                 labels,
                 util,
             )
+
+        if usage_history_tracker is not None:
+            uh = usage_history_tracker.status_dict(name)
+            if uh is not None:
+                gauge(
+                    "switchboard_tokens_24h",
+                    "Total tokens (in+out) over the last 24 hours",
+                    labels,
+                    uh.get("tokens_24h"),
+                )
+                gauge(
+                    "switchboard_tokens_24h_in",
+                    "Input tokens over the last 24 hours",
+                    labels,
+                    uh.get("tokens_24h_in"),
+                )
+                gauge(
+                    "switchboard_tokens_24h_out",
+                    "Output tokens over the last 24 hours",
+                    labels,
+                    uh.get("tokens_24h_out"),
+                )
+                penalty = uh.get("penalty")
+                if penalty is not None:
+                    gauge(
+                        "switchboard_penalty_before_tokens",
+                        "Tokens consumed in the 24h before the penalty event",
+                        labels,
+                        penalty.get("before_total"),
+                    )
+                    gauge(
+                        "switchboard_penalty_since_tokens",
+                        "Tokens consumed since the penalty event started",
+                        labels,
+                        penalty.get("since_total"),
+                    )
+
+    if estimator is not None:
+        est = estimator.state().estimate
+        provider = estimator.provider_name
+        elabels = f'provider="{provider}"'
+        if est.requests.lower is not None:
+            gauge(
+                "switchboard_threshold_requests_lower",
+                "Max requests that did NOT trigger low-interactivity",
+                elabels,
+                est.requests.lower,
+            )
+        if est.requests.upper is not None:
+            gauge(
+                "switchboard_threshold_requests_upper",
+                "Min requests that DID trigger low-interactivity",
+                elabels,
+                est.requests.upper,
+            )
+        if est.requests.best_guess is not None:
+            gauge(
+                "switchboard_threshold_requests_best_guess",
+                "Midpoint estimate of the low-interactivity request threshold",
+                elabels,
+                est.requests.best_guess,
+            )
+        if est.tokens.lower is not None:
+            gauge(
+                "switchboard_threshold_tokens_lower",
+                "Max tokens that did NOT trigger low-interactivity",
+                elabels,
+                est.tokens.lower,
+            )
+        if est.tokens.upper is not None:
+            gauge(
+                "switchboard_threshold_tokens_upper",
+                "Min tokens that DID trigger low-interactivity",
+                elabels,
+                est.tokens.upper,
+            )
+        if est.tokens.best_guess is not None:
+            gauge(
+                "switchboard_threshold_tokens_best_guess",
+                "Midpoint estimate of the low-interactivity token threshold",
+                elabels,
+                est.tokens.best_guess,
+            )
+        gauge(
+            "switchboard_threshold_edges_total",
+            "Total OFF->ON edges observed by the estimator",
+            elabels,
+            est.edges,
+        )
+        if est.last_edge_concurrent_sessions is not None:
+            gauge(
+                "switchboard_threshold_last_edge_sessions",
+                "Concurrent sessions at the last trigger edge",
+                elabels,
+                est.last_edge_concurrent_sessions,
+            )
+        summary = estimator.event_summary()
+        gauge(
+            "switchboard_threshold_trigger_events_total",
+            "Total low-interactivity trigger events recorded",
+            elabels,
+            summary["trigger_count"],
+        )
+        gauge(
+            "switchboard_threshold_non_trigger_events_total",
+            "Total non-trigger events (window ended without low-interactivity)",
+            elabels,
+            summary["non_trigger_count"],
+        )
 
     text = "\n".join(lines) + "\n"
     await send_text(
@@ -771,6 +895,168 @@ async def handle_provider_override(
     if warning:
         response["warning"] = warning
     await send_json(send, 200, response, extra_headers=cors)
+
+
+async def handle_usage_history(
+    send: Send,
+    scope: Scope,
+    admin_token: str | None,
+    providers: dict[str, ProviderContext],
+    cors_allow_origin: str | None = None,
+) -> None:
+    """GET /admin/usage-history?provider=<name>&from=...&to=...&granularity=hour
+
+    Proxies umans ``/v1/usage/history`` for the dashboard.  Admin-only —
+    the usage API key never reaches the browser.  Fails safe: 502 on any
+    upstream error.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 401, {"error": "unauthorized"}, extra_headers=cors)
+        return
+
+    from urllib.parse import parse_qs as _parse_qs
+
+    qs = scope.get("query_string", b"").decode("latin-1")
+    parsed = _parse_qs(qs)
+    params: dict[str, str] = {}
+    for key in ("from", "to", "granularity", "scope"):
+        val = parsed.get(key)
+        if val:
+            params[key] = val[0]
+
+    provider_name = parsed.get("provider", [""])[0] if parsed else ""
+    if not provider_name:
+        await send_json(
+            send, 400,
+            {"error": "missing required param 'provider'"},
+            extra_headers=cors,
+        )
+        return
+
+    ctx = providers.get(provider_name)
+    if ctx is None or not ctx.usage_base_url or not ctx.usage_api_key:
+        await send_json(
+            send, 404,
+            {"error": f"provider '{provider_name}' has no usage-history endpoint"},
+            extra_headers=cors,
+        )
+        return
+
+    if "from" not in params or "to" not in params:
+        await send_json(
+            send, 400,
+            {"error": "missing required params 'from' and 'to'"},
+            extra_headers=cors,
+        )
+        return
+
+    if "granularity" not in params:
+        params["granularity"] = "hour"
+
+    url = ctx.usage_base_url.rstrip("/") + "/v1/usage/history"
+    if ctx.usage_auth_header.lower() == "x-api-key":
+        headers = {"x-api-key": ctx.usage_api_key, "Accept": "application/json"}
+    else:
+        headers = {
+            "Authorization": f"Bearer {ctx.usage_api_key}",
+            "Accept": "application/json",
+        }
+
+    try:
+        import httpx as _httpx
+
+        async with _httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+    except _httpx.HTTPStatusError as exc:
+        log.warning("usage history fetch failed: %s", exc)
+        await send_json(
+            send, 502,
+            {"error": f"upstream returned {exc.response.status_code}"},
+            extra_headers=cors,
+        )
+        return
+    except Exception as exc:
+        log.warning("usage history fetch error: %s: %s", type(exc).__name__, exc)
+        await send_json(
+            send, 502,
+            {"error": f"upstream fetch failed: {type(exc).__name__}"},
+            extra_headers=cors,
+        )
+        return
+
+    await send_json(
+        send, 200, data,
+        extra_headers=[*cors, (b"cache-control", b"no-store")],
+    )
+
+
+async def handle_threshold_events(
+    send: Send,
+    scope: Scope,
+    admin_token: str | None,
+    estimator: ThresholdEstimator | None,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """GET /admin/threshold-events?limit=<N>
+
+    Returns the 30-day rolling history of low-interactivity threshold
+    events — both triggers (low priority engaged) and non-triggers
+    (window ended without engaging).  Admin-only.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 401, {"error": "unauthorized"}, extra_headers=cors)
+        return
+
+    if estimator is None:
+        await send_json(
+            send, 404,
+            {"error": "threshold estimator not configured"},
+            extra_headers=cors,
+        )
+        return
+
+    from urllib.parse import parse_qs as _parse_qs
+
+    qs = scope.get("query_string", b"").decode("latin-1")
+    parsed = _parse_qs(qs) if qs else {}
+    limit = 50
+    if parsed and "limit" in parsed:
+        with contextlib.suppress(ValueError, IndexError):
+            limit = max(1, min(500, int(parsed["limit"][0])))
+
+    events = estimator.recent_events(limit=limit)
+    summary = estimator.event_summary()
+    est = estimator.state().estimate
+
+    await send_json(
+        send, 200,
+        {
+            "provider": estimator.provider_name,
+            "estimate": {
+                "edges": est.edges,
+                "requests": {
+                    "lower": est.requests.lower,
+                    "upper": est.requests.upper,
+                    "best_guess": est.requests.best_guess,
+                    "contradicted": est.requests.contradicted,
+                },
+                "tokens": {
+                    "lower": est.tokens.lower,
+                    "upper": est.tokens.upper,
+                    "best_guess": est.tokens.best_guess,
+                    "contradicted": est.tokens.contradicted,
+                },
+                "last_edge_concurrent_sessions": est.last_edge_concurrent_sessions,
+            },
+            "summary": summary,
+            "events": events,
+        },
+        extra_headers=[*cors, (b"cache-control", b"no-store")],
+    )
 
 
 async def serve_static(path: str, send: Send) -> None:

@@ -28,7 +28,7 @@ h1 { font-size: 1.4rem; margin: 0 0 1rem; }
 h2 { font-size: 1.1rem; margin: 1.5rem 0 0.5rem; color: var(--muted); }
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 1rem;
 }
 .card {
@@ -50,7 +50,8 @@ h2 { font-size: 1.1rem; margin: 1.5rem 0 0.5rem; color: var(--muted); }
 }
 .badge.open { background: var(--green); color: #fff; }
 .badge.saturated { background: var(--amber); color: #fff; }
-.badge.boxed, .badge.breaker { background: var(--red); color: #fff; }
+.badge.boxed, .badge.breaker, .badge.low_interactivity { background: var(--red); color: #fff; }
+.badge.unknown { background: var(--muted); color: #fff; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-weight: 600; font-size: 0.85rem; }
@@ -73,12 +74,42 @@ button {
   border-radius: 4px;
   cursor: pointer;
 }
+.section-title {
+  font-size: 0.8rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0.8rem 0 0.3rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.6rem;
+}
+.token-val { font-weight: 600; }
+.token-warn { color: var(--amber); }
+.token-crit { color: var(--red); }
 </style>
 </head>
 <body>
 <h1>switchboard</h1>
 <div id="app">Loading...</div>
 <script>
+function fmtTokens(n) {
+  if (n == null) return '-';
+  if (n >= 1e9) return (n/1e9).toFixed(1)+'B';
+  if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1)+'k';
+  return String(n);
+}
+function fmtPct(f) {
+  if (f == null) return '-';
+  return (f*100).toFixed(1)+'%';
+}
+function fmtDuration(sec) {
+  if (sec == null) return '-';
+  var h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=Math.floor(sec%60);
+  if(h>0) return h+'h '+m+'m';
+  if(m>0) return m+'m '+s+'s';
+  return s+'s';
+}
 async function load() {
   const resp = await fetch('/status.json');
   if (!resp.ok) {
@@ -91,17 +122,98 @@ async function load() {
   let html = '<h2>Providers</h2><div class="grid">';
   for (const [name, p] of Object.entries(data.providers || {})) {
     const reason = p.gate_closed_reason || 'open';
+    const badgeCls = reason === 'open' ? 'open' : reason;
     html += `<div class="card">
-      <h3>${name} <span class="badge ${reason}">${reason}</span></h3>
+      <h3>${name} <span class="badge ${badgeCls}">${reason}</span></h3>
       <div class="stat"><span class="k">effective_permits</span><span class="v">${p.effective_permits}</span></div>
       <div class="stat"><span class="k">in_flight</span><span class="v">${p.in_flight}</span></div>
       <div class="stat"><span class="k">queue_depth</span><span class="v">${p.queue_depth}</span></div>
       <div class="stat"><span class="k">ready</span><span class="v">${p.ready}</span></div>
       <div class="stat"><span class="k">total_429s</span><span class="v">${p.total_429s}</span></div>
-      <div class="stat"><span class="k">total_requests_forwarded</span><span class="v">${p.total_requests_forwarded}</span></div>
-    </div>`;
+      <div class="stat"><span class="k">total_requests_forwarded</span><span class="v">${p.total_requests_forwarded}</span></div>`;
+
+    // Band / penalty
+    if (p.band && p.band !== 'normal') {
+      html += `<div class="section-title">Penalty</div>`;
+      html += `<div class="stat"><span class="k">band</span><span class="v">${p.band}</span></div>`;
+      if (p.penalty_started_at) {
+        const elapsed = Math.floor(Date.now()/1000 - p.penalty_started_at);
+        html += `<div class="stat"><span class="k">penalty_age</span><span class="v">${fmtDuration(elapsed)}</span></div>`;
+      }
+      if (p.low_interactivity) {
+        html += `<div class="stat"><span class="k">low_interactivity</span><span class="v token-crit">yes</span></div>`;
+        if (p.service_mode_resets_at) {
+          const remaining = Math.max(0, Math.floor(p.service_mode_resets_at - Date.now()/1000));
+          html += `<div class="stat"><span class="k">resets_in</span><span class="v">${fmtDuration(remaining)}</span></div>`;
+        }
+      }
+    }
+
+    // Token budget (streaming-tracked)
+    if (p.token_budget) {
+      const tb = p.token_budget;
+      html += `<div class="section-title">Token Budget (streaming-tracked)</div>`;
+      html += `<div class="stat"><span class="k">cap</span><span class="v">${fmtTokens(tb.cap_tokens)}</span></div>`;
+      html += `<div class="stat"><span class="k">own_in_window</span><span class="v">${fmtTokens(tb.own_tokens_in_window)}</span></div>`;
+      html += `<div class="stat"><span class="k">provider_wide</span><span class="v">${fmtTokens(tb.provider_wide_tokens)}</span></div>`;
+      const util = tb.projected_utilization;
+      const cls = util != null && util >= 0.85 ? 'token-crit' : (util != null && util >= 0.7 ? 'token-warn' : '');
+      html += `<div class="stat"><span class="k">projected_util</span><span class="v ${cls}">${fmtPct(util)}</span></div>`;
+    }
+
+    // Usage history (poll-based)
+    if (p.usage_history) {
+      const uh = p.usage_history;
+      html += `<div class="section-title">Usage History (poll-based)</div>`;
+      const t24 = uh.tokens_24h;
+      const cls24 = t24 != null && t24 >= 350e6 ? 'token-crit' : (t24 != null && t24 >= 250e6 ? 'token-warn' : '');
+      html += `<div class="stat"><span class="k">tokens_24h</span><span class="v token-val ${cls24}">${fmtTokens(t24)}</span></div>`;
+      html += `<div class="stat"><span class="k">24h_in</span><span class="v">${fmtTokens(uh.tokens_24h_in)}</span></div>`;
+      html += `<div class="stat"><span class="k">24h_out</span><span class="v">${fmtTokens(uh.tokens_24h_out)}</span></div>`;
+      html += `<div class="stat"><span class="k">24h_requests</span><span class="v">${uh.tokens_24h_requests || '-'}</span></div>`;
+
+      if (uh.penalty) {
+        const pen = uh.penalty;
+        html += `<div class="section-title">Penalty Event Tokens</div>`;
+        html += `<div class="stat"><span class="k">24h_before</span><span class="v">${fmtTokens(pen.before_total)}</span></div>`;
+        html += `<div class="stat"><span class="k">before_reqs</span><span class="v">${pen.before_requests || '-'}</span></div>`;
+        html += `<div class="stat"><span class="k">since_penalty</span><span class="v token-val">${fmtTokens(pen.since_total)}</span></div>`;
+        html += `<div class="stat"><span class="k">since_reqs</span><span class="v">${pen.since_requests || '-'}</span></div>`;
+      }
+    }
+
+    // Tokens from usage reading
+    if (p.tokens_in != null || p.tokens_out != null) {
+      html += `<div class="section-title">Usage Reading</div>`;
+      html += `<div class="stat"><span class="k">tokens_in</span><span class="v">${fmtTokens(p.tokens_in)}</span></div>`;
+      html += `<div class="stat"><span class="k">tokens_out</span><span class="v">${fmtTokens(p.tokens_out)}</span></div>`;
+    }
+
+    html += `</div>`;
   }
   html += '</div>';
+
+  // Estimator
+  if (data.estimator) {
+    const est = data.estimator;
+    html += '<h2>Low-Interactivity Threshold Estimator</h2><div class="grid">';
+    html += `<div class="card"><h3>Estimate</h3>`;
+    html += `<div class="stat"><span class="k">edges_observed</span><span class="v">${est.edges}</span></div>`;
+    const r = est.requests || {};
+    const t = est.tokens || {};
+    html += `<div class="stat"><span class="k">requests_lower</span><span class="v">${r.lower || '-'}</span></div>`;
+    html += `<div class="stat"><span class="k">requests_upper</span><span class="v">${r.upper || '-'}</span></div>`;
+    html += `<div class="stat"><span class="k">requests_best_guess</span><span class="v">${r.best_guess || '-'}</span></div>`;
+    html += `<div class="stat"><span class="k">requests_contradicted</span><span class="v">${r.contradicted}</span></div>`;
+    html += `<div class="stat"><span class="k">tokens_lower</span><span class="v">${fmtTokens(t.lower)}</span></div>`;
+    html += `<div class="stat"><span class="k">tokens_upper</span><span class="v">${fmtTokens(t.upper)}</span></div>`;
+    html += `<div class="stat"><span class="k">tokens_best_guess</span><span class="v">${fmtTokens(t.best_guess)}</span></div>`;
+    html += `<div class="stat"><span class="k">tokens_contradicted</span><span class="v">${t.contradicted}</span></div>`;
+    if (est.last_edge_concurrent_sessions != null) {
+      html += `<div class="stat"><span class="k">last_edge_sessions</span><span class="v">${est.last_edge_concurrent_sessions}</span></div>`;
+    }
+    html += `</div></div>`;
+  }
 
   html += '<h2>Route Table</h2><table><thead><tr><th>Key (truncated)</th><th>Providers</th></tr></thead><tbody>';
   for (const [key, providers] of Object.entries(data.route_table || {})) {

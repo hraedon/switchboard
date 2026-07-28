@@ -46,6 +46,28 @@ class ThresholdSample:
 
 
 @dataclass(frozen=True)
+class ThresholdEvent:
+    """A recorded threshold observation — trigger or non-trigger.
+
+    Emitted by :func:`update` when an edge is detected (``triggered=True``)
+    or when a window ends without low-interactivity ever engaging
+    (``triggered=False``).  The shell persists these to SQLite for a 30-day
+    rolling history so operators can see the dynamic threshold over time.
+
+    For trigger events, ``requests``/``tokens``/``concurrent_sessions`` are
+    the values at the moment low-interactivity engaged.  For non-trigger
+    events, they are the **maximum** OFF usage observed in that window — the
+    highest usage that did *not* trigger low priority.
+    """
+
+    window_id: str
+    requests: int
+    tokens: int
+    concurrent_sessions: int
+    triggered: bool
+
+
+@dataclass(frozen=True)
 class DimensionEstimate:
     """Bracketed estimate for one usage dimension (requests or tokens).
 
@@ -128,33 +150,66 @@ def _tighten(dim: DimensionEstimate, *, off_usage: int | None, on_usage: int) ->
     return DimensionEstimate(lower=lower, upper=upper, edges=dim.edges + 1)
 
 
-def update(state: EstimatorState, sample: ThresholdSample) -> EstimatorState:
-    """Fold one sample into the estimator state.  Pure and deterministic."""
+def update(
+    state: EstimatorState, sample: ThresholdSample,
+) -> tuple[EstimatorState, ThresholdEvent | None]:
+    """Fold one sample into the estimator state.  Pure and deterministic.
+
+    Returns ``(new_state, event)`` where ``event`` is a
+    :class:`ThresholdEvent` when:
+
+    * an OFF→ON edge is detected (``triggered=True``), or
+    * a window ends without low-interactivity ever engaging
+      (``triggered=False`` — the max OFF usage in that window).
+
+    ``event`` is ``None`` for intermediate samples that don't produce an
+    observation worth recording.
+    """
     win = state.window
-    if win is None or win.window_id != sample.window_id:
+    event: ThresholdEvent | None = None
+
+    if win is not None and win.window_id != sample.window_id:
+        # Window transition: if the previous window had OFF samples but no
+        # edge was recorded, emit a non-trigger event with the max OFF usage.
+        if win.saw_off and not win.edge_recorded:
+            event = ThresholdEvent(
+                window_id=win.window_id,
+                requests=win.max_off_requests,
+                tokens=win.max_off_tokens,
+                concurrent_sessions=0,
+                triggered=False,
+            )
         # New window: no carried OFF/edge state.  A window that starts ON has
         # saw_off=False, so its first ON sample records no edge (residual
         # penalty, not a trigger).
         win = _WindowProgress(window_id=sample.window_id)
+    elif win is None:
+        win = _WindowProgress(window_id=sample.window_id)
 
     if not sample.low_interactivity:
-        return EstimatorState(
-            estimate=state.estimate,
-            window=replace(
-                win,
-                saw_off=True,
-                max_off_requests=max(win.max_off_requests, sample.requests),
-                max_off_tokens=max(win.max_off_tokens, sample.tokens),
-                prev_low=False,
+        return (
+            EstimatorState(
+                estimate=state.estimate,
+                window=replace(
+                    win,
+                    saw_off=True,
+                    max_off_requests=max(win.max_off_requests, sample.requests),
+                    max_off_tokens=max(win.max_off_tokens, sample.tokens),
+                    prev_low=False,
+                ),
             ),
+            event,
         )
 
     # sample.low_interactivity is True.
     is_edge = (not win.prev_low) and (not win.edge_recorded) and win.saw_off
     if not is_edge:
-        return EstimatorState(
-            estimate=state.estimate,
-            window=replace(win, prev_low=True),
+        return (
+            EstimatorState(
+                estimate=state.estimate,
+                window=replace(win, prev_low=True),
+            ),
+            event,
         )
 
     est = state.estimate
@@ -168,7 +223,17 @@ def update(state: EstimatorState, sample: ThresholdSample) -> EstimatorState:
         edges=est.edges + 1,
         last_edge_concurrent_sessions=sample.concurrent_sessions,
     )
-    return EstimatorState(
-        estimate=new_estimate,
-        window=replace(win, prev_low=True, edge_recorded=True),
+    trigger_event = ThresholdEvent(
+        window_id=sample.window_id,
+        requests=sample.requests,
+        tokens=sample.tokens,
+        concurrent_sessions=sample.concurrent_sessions,
+        triggered=True,
+    )
+    return (
+        EstimatorState(
+            estimate=new_estimate,
+            window=replace(win, prev_low=True, edge_recorded=True),
+        ),
+        trigger_event,
     )

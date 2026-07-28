@@ -12,8 +12,21 @@ from switchboard.threshold import (
 def _feed(samples: list[ThresholdSample]) -> EstimatorState:
     state = EstimatorState()
     for s in samples:
-        state = update(state, s)
+        state, _ = update(state, s)
     return state
+
+
+def _feed_with_events(
+    samples: list[ThresholdSample],
+) -> tuple[EstimatorState, list]:
+    from switchboard.threshold import ThresholdEvent
+    state = EstimatorState()
+    events: list[ThresholdEvent] = []
+    for s in samples:
+        state, event = update(state, s)
+        if event is not None:
+            events.append(event)
+    return state, events
 
 
 def _s(
@@ -123,3 +136,60 @@ def test_last_edge_concurrent_sessions_recorded() -> None:
         _s("w1", 120, 1200, True, sessions=4),
     ])
     assert state.estimate.last_edge_concurrent_sessions == 4
+
+
+def test_trigger_event_emitted_on_edge() -> None:
+    _state, events = _feed_with_events([
+        _s("w1", 100, 1000, False, sessions=2),
+        _s("w1", 120, 1300, True, sessions=4),
+    ])
+    assert len(events) == 1
+    assert events[0].triggered is True
+    assert events[0].window_id == "w1"
+    assert events[0].requests == 120
+    assert events[0].tokens == 1300
+    assert events[0].concurrent_sessions == 4
+
+
+def test_non_trigger_event_emitted_on_window_end() -> None:
+    _state, events = _feed_with_events([
+        _s("w1", 80, 800, False, sessions=1),
+        _s("w1", 100, 1000, False, sessions=2),
+        # Window changes — w1 had OFF but no edge → non-trigger event
+        _s("w2", 50, 500, False, sessions=1),
+    ])
+    assert len(events) == 1
+    assert events[0].triggered is False
+    assert events[0].window_id == "w1"
+    assert events[0].requests == 100  # max OFF requests
+    assert events[0].tokens == 1000  # max OFF tokens
+
+
+def test_no_event_when_window_starts_on() -> None:
+    _state, events = _feed_with_events([
+        _s("w1", 5, 50, True, sessions=1),
+        _s("w2", 10, 100, False, sessions=1),
+    ])
+    # w1 started ON (residual penalty) — no edge, no non-trigger (saw_off=False)
+    # w2 is a new window with an OFF sample — no event yet (window not ended)
+    assert len(events) == 0
+
+
+def test_both_trigger_and_non_trigger_events() -> None:
+    _state, events = _feed_with_events([
+        # w1: OFF then ON → trigger event
+        _s("w1", 100, 1000, False, sessions=2),
+        _s("w1", 120, 1300, True, sessions=4),
+        # w2: OFF only, then window ends → non-trigger event
+        _s("w2", 90, 900, False, sessions=1),
+        _s("w2", 110, 1100, False, sessions=2),
+        # w3: new window triggers non-trigger for w2
+        _s("w3", 50, 500, False, sessions=1),
+    ])
+    assert len(events) == 2
+    assert events[0].triggered is True
+    assert events[0].window_id == "w1"
+    assert events[1].triggered is False
+    assert events[1].window_id == "w2"
+    assert events[1].requests == 110  # max OFF in w2
+    assert events[1].tokens == 1100

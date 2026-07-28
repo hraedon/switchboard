@@ -432,6 +432,9 @@ These are recommended for future plans, listed by value-to-effort ratio:
    &hours=24` to the usage-dashboard so switchboard (and operators) can query
    stored hourly readings directly, not just the latest. Cross-project
    (changes usage-dashboard, not switchboard).
+   **Shipped 2026-07-28** (usage-dashboard: `GET /history?provider=<name>
+   &hours=<1..168>`, bearer-authed, oldest-first over the append-only
+   readings store).
 5. **Active health probes** — synthetic probe requests to detect a degraded
    provider before real traffic hits it. Currently purely passive
    (reconcile-driven).

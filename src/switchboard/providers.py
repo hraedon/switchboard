@@ -40,11 +40,18 @@ if TYPE_CHECKING:
 
     from switchboard.overload import OverloadTracker
     from switchboard.token_budget import TokenBudgetTracker
+    from switchboard.usage_history import UsageHistoryTracker
 
 
 @dataclass
 class ProviderContext:
-    """One upstream provider: gate + reconcile + truth source + HTTP client."""
+    """One upstream provider: gate + reconcile + truth source + HTTP client.
+
+    ``usage_base_url`` / ``usage_api_key`` / ``usage_auth_header`` are set
+    for umans-type providers that expose ``/v1/usage/history``.  They enable
+    the ``/admin/usage-history`` endpoint and the background
+    :class:`~switchboard.usage_history.UsageHistoryTracker`.
+    """
 
     name: str
     upstream_url: str
@@ -52,6 +59,9 @@ class ProviderContext:
     reconcile: ReconciliationLoop
     truth_source: TruthSource
     http_client: httpx.AsyncClient
+    usage_base_url: str | None = None
+    usage_api_key: str = ""
+    usage_auth_header: str = "authorization"
 
 
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
@@ -127,6 +137,13 @@ def build_provider_context(
 
     http_client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
 
+    usage_base_url: str | None = None
+    usage_api_key = ""
+    usage_auth_header = provider.auth_header
+    if provider.needs_usage_key and usage_key:
+        usage_base_url = upstream_url
+        usage_api_key = usage_key
+
     return ProviderContext(
         name=name,
         upstream_url=upstream_url,
@@ -134,6 +151,9 @@ def build_provider_context(
         reconcile=reconcile,
         truth_source=truth_source,
         http_client=http_client,
+        usage_base_url=usage_base_url,
+        usage_api_key=usage_api_key,
+        usage_auth_header=usage_auth_header,
     )
 
 
@@ -224,6 +244,7 @@ def snapshot_provider_state(
     now: float,
     overload_tracker: OverloadTracker | None = None,
     budget_tracker: TokenBudgetTracker | None = None,
+    usage_history_tracker: UsageHistoryTracker | None = None,
 ) -> ProviderState:
     """Read live state from a provider's reconcile loop and gate.
 
@@ -315,6 +336,11 @@ def snapshot_provider_state(
     if budget_tracker is not None:
         token_utilization = budget_tracker.utilization(name, now=now)
 
+    # Trailing-24h usage utilization (Plan 013).
+    usage_24h_utilization: float | None = None
+    if usage_history_tracker is not None:
+        usage_24h_utilization = usage_history_tracker.utilization(name)
+
     return ProviderState(
         name=name,
         availability=availability,
@@ -324,6 +350,7 @@ def snapshot_provider_state(
         signal_freshness=freshness,
         usage_headroom=usage_headroom,
         token_utilization=token_utilization,
+        usage_24h_utilization=usage_24h_utilization,
     )
 
 

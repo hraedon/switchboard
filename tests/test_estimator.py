@@ -399,3 +399,171 @@ def test_status_payload_without_estimator() -> None:
     assert "estimator" not in payload
 
     _close_ctxs(no_reading_ctx)
+
+
+def test_event_persistence() -> None:
+    """Threshold events are persisted to SQLite and queryable."""
+    db = sqlite3.connect(":memory:")
+    est = ThresholdEstimator(provider_name="umans", db=db)
+
+    ctx_off = _make_ctx_with_reading(
+        requests_in_window=100,
+        tokens_in=1000,
+        tokens_out=500,
+        concurrent_sessions=2,
+        service_mode=None,
+        service_mode_resets_at_epoch=_FUTURE_RESET,
+        wall_clock=lambda: _WALL_NOW,
+    )
+    est.maybe_sample(ctx_off)
+
+    ctx_on = _make_ctx_with_reading(
+        requests_in_window=120,
+        tokens_in=1300,
+        tokens_out=600,
+        concurrent_sessions=4,
+        service_mode="low_interactivity",
+        service_mode_resets_at_epoch=_FUTURE_RESET,
+        wall_clock=lambda: _WALL_NOW,
+    )
+    est.maybe_sample(ctx_on)
+
+    events = est.recent_events(limit=10)
+    assert len(events) == 1
+    assert events[0]["triggered"] is True
+    assert events[0]["requests"] == 120
+    assert events[0]["tokens"] == 1900
+    assert events[0]["concurrent_sessions"] == 4
+
+    summary = est.event_summary()
+    assert summary["trigger_count"] == 1
+    assert summary["non_trigger_count"] == 0
+    assert summary["total_events"] == 1
+
+    _close_ctxs(ctx_off, ctx_on)
+    db.close()
+
+
+def test_non_trigger_event_persistence() -> None:
+    """Non-trigger events are persisted when a window ends without low-interactivity."""
+    db = sqlite3.connect(":memory:")
+    est = ThresholdEstimator(provider_name="umans", db=db)
+
+    reset1 = _WALL_NOW + 1800.0
+    reset2 = _WALL_NOW + 5400.0
+
+    ctx_off_w1 = _make_ctx_with_reading(
+        requests_in_window=90,
+        tokens_in=900,
+        tokens_out=100,
+        service_mode=None,
+        service_mode_resets_at_epoch=reset1,
+        wall_clock=lambda: _WALL_NOW,
+    )
+    est.maybe_sample(ctx_off_w1)
+
+    # New window — w1 had OFF but no edge → non-trigger event
+    ctx_off_w2 = _make_ctx_with_reading(
+        requests_in_window=50,
+        tokens_in=500,
+        tokens_out=100,
+        service_mode=None,
+        service_mode_resets_at_epoch=reset2,
+        wall_clock=lambda: _WALL_NOW,
+    )
+    est.maybe_sample(ctx_off_w2)
+
+    events = est.recent_events(limit=10)
+    assert len(events) == 1
+    assert events[0]["triggered"] is False
+    assert events[0]["requests"] == 90
+    assert events[0]["tokens"] == 1000
+
+    summary = est.event_summary()
+    assert summary["trigger_count"] == 0
+    assert summary["non_trigger_count"] == 1
+
+    _close_ctxs(ctx_off_w1, ctx_off_w2)
+    db.close()
+
+
+def test_event_pruning() -> None:
+    """Old events are pruned by prune_events()."""
+    db = sqlite3.connect(":memory:")
+    est = ThresholdEstimator(provider_name="umans", db=db)
+
+    ctx_off = _make_ctx_with_reading(
+        requests_in_window=100,
+        tokens_in=1000,
+        tokens_out=500,
+        service_mode=None,
+        service_mode_resets_at_epoch=_FUTURE_RESET,
+        wall_clock=lambda: _WALL_NOW,
+    )
+    est.maybe_sample(ctx_off)
+
+    ctx_on = _make_ctx_with_reading(
+        requests_in_window=120,
+        tokens_in=1300,
+        tokens_out=600,
+        concurrent_sessions=4,
+        service_mode="low_interactivity",
+        service_mode_resets_at_epoch=_FUTURE_RESET,
+        wall_clock=lambda: _WALL_NOW,
+    )
+    est.maybe_sample(ctx_on)
+
+    assert len(est.recent_events()) == 1
+
+    # Prune everything older than 0 seconds (i.e. all events)
+    est.prune_events(max_age_seconds=0.0)
+
+    assert len(est.recent_events()) == 0
+
+    _close_ctxs(ctx_off, ctx_on)
+    db.close()
+
+
+def test_status_payload_includes_events() -> None:
+    """_build_status_payload includes threshold events in the estimator section."""
+    db = sqlite3.connect(":memory:")
+    est = ThresholdEstimator(provider_name="umans", db=db)
+
+    ctx_off = _make_ctx_with_reading(
+        requests_in_window=100,
+        tokens_in=1000,
+        tokens_out=500,
+        concurrent_sessions=2,
+        service_mode=None,
+        service_mode_resets_at_epoch=_FUTURE_RESET,
+        wall_clock=lambda: _WALL_NOW,
+    )
+    est.maybe_sample(ctx_off)
+
+    ctx_on = _make_ctx_with_reading(
+        requests_in_window=120,
+        tokens_in=1300,
+        tokens_out=600,
+        concurrent_sessions=4,
+        service_mode="low_interactivity",
+        service_mode_resets_at_epoch=_FUTURE_RESET,
+        wall_clock=lambda: _WALL_NOW,
+    )
+    est.maybe_sample(ctx_on)
+
+    from switchboard.admin import _build_status_payload as _bsp
+
+    no_reading_ctx = _make_ctx_no_reading()
+    providers = {"umans": no_reading_ctx}
+    mgr = RouteTableManager(default_providers=("umans",))
+    metrics = RoutingMetrics()
+    payload = _bsp(providers, mgr, metrics, estimator=est)
+
+    assert "estimator" in payload
+    assert "events" in payload["estimator"]
+    assert payload["estimator"]["events"]["trigger_count"] == 1
+    assert payload["estimator"]["events"]["total_events"] == 1
+    assert len(payload["estimator"]["events"]["events"]) == 1
+
+    _close_ctxs(ctx_off, ctx_on, no_reading_ctx)
+    db.close()

@@ -96,6 +96,9 @@ class ProviderState:
     capabilities: ProviderCapabilities | None = None
     usage_headroom: float | None = None
     token_utilization: float | None = None
+    usage_24h_utilization: float | None = None
+    # tokens_24h / cap_tokens (Plan 013). 0.0 = none used; 1.0 = at cap.
+    # None = no 24h budget configured or no data (no filtering).
 
 
 @dataclass(frozen=True)
@@ -170,6 +173,12 @@ class RoutingConfig:
     dwell_interval: float = 30.0
     headroom_threshold: float = 0.0
     token_budget_threshold: float = 0.0
+    usage_24h_threshold: float = 0.0
+    # 0.0 = disabled. >0 = providers whose usage_24h_utilization >= this are
+    # demoted from immediate to queue_eligible — INCLUDING the primary
+    # (Plan 013 §2: the trailing-24h penalty is what the primary's gate
+    # cannot see coming, so the usual no-primary-demotion rule does not
+    # apply to this signal).
 
 
 @dataclass(frozen=True)
@@ -338,7 +347,15 @@ def route_decision(
                 and state.token_utilization
                 >= config.token_budget_threshold
             )
-            if low_headroom or over_budget:
+            # Plan 013: trailing-24h usage — the ONE proactive signal that
+            # may demote the primary (no `not is_primary` guard).  Demotion
+            # de-prefers only: the primary stays queue-eligible backstop.
+            over_24h = (
+                config.usage_24h_threshold > 0
+                and state.usage_24h_utilization is not None
+                and state.usage_24h_utilization >= config.usage_24h_threshold
+            )
+            if low_headroom or over_budget or over_24h:
                 queue_eligible.append(name)
             elif state.availability == Availability.AVAILABLE:
                 immediate.append(name)

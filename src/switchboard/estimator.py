@@ -20,6 +20,7 @@ from switchboard.threshold import (
     DimensionEstimate,
     EstimatorState,
     ThresholdEstimate,
+    ThresholdEvent,
     ThresholdSample,
     _WindowProgress,
     update,
@@ -70,6 +71,18 @@ class ThresholdEstimator:
                 "CREATE TABLE IF NOT EXISTS threshold_state "
                 "(provider TEXT PRIMARY KEY, "
                 "state_json TEXT, updated_at REAL)"
+            )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS threshold_events "
+                "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "provider TEXT, window_id TEXT, timestamp REAL, "
+                "requests INTEGER, tokens INTEGER, "
+                "concurrent_sessions INTEGER, triggered INTEGER)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_threshold_events_provider_ts "
+                "ON threshold_events (provider, timestamp)"
             )
             db.commit()
 
@@ -125,7 +138,7 @@ class ThresholdEstimator:
             low_interactivity=ctx.reconcile.is_low_interactivity(),
         )
         old_state = self._state
-        new_state = update(self._state, sample)
+        new_state, event = update(self._state, sample)
         self._state = new_state
         if new_state != old_state:
             try:
@@ -133,6 +146,15 @@ class ThresholdEstimator:
             except Exception:
                 log.warning(
                     "failed to persist threshold state for %s",
+                    self.provider_name,
+                    exc_info=True,
+                )
+        if event is not None:
+            try:
+                self._save_event(event)
+            except Exception:
+                log.warning(
+                    "failed to persist threshold event for %s",
                     self.provider_name,
                     exc_info=True,
                 )
@@ -150,6 +172,91 @@ class ThresholdEstimator:
                 json.dumps(dataclasses.asdict(state)),
                 time.time(),
             ),
+        )
+        self._db.commit()
+
+    def _save_event(self, event: ThresholdEvent) -> None:
+        """Persist a threshold event to SQLite. No-op if no DB configured."""
+        if self._db is None:
+            return
+        self._db.execute(
+            "INSERT INTO threshold_events "
+            "(provider, window_id, timestamp, requests, tokens, "
+            "concurrent_sessions, triggered) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                self.provider_name,
+                event.window_id,
+                time.time(),
+                event.requests,
+                event.tokens,
+                event.concurrent_sessions,
+                1 if event.triggered else 0,
+            ),
+        )
+        self._db.commit()
+
+    def recent_events(
+        self, *, limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return recent threshold events, newest first."""
+        if self._db is None:
+            return []
+        cursor = self._db.execute(
+            "SELECT window_id, timestamp, requests, tokens, "
+            "concurrent_sessions, triggered "
+            "FROM threshold_events WHERE provider = ? "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (self.provider_name, limit),
+        )
+        return [
+            {
+                "window_id": row[0],
+                "timestamp": row[1],
+                "requests": row[2],
+                "tokens": row[3],
+                "concurrent_sessions": row[4],
+                "triggered": bool(row[5]),
+            }
+            for row in cursor
+        ]
+
+    def event_summary(self) -> dict[str, Any]:
+        """Aggregate summary of threshold events for /status.json."""
+        if self._db is None:
+            return {
+                "total_events": 0,
+                "trigger_count": 0,
+                "non_trigger_count": 0,
+                "events": [],
+            }
+        cursor = self._db.execute(
+            "SELECT "
+            "COUNT(*) as total, "
+            "SUM(CASE WHEN triggered = 1 THEN 1 ELSE 0 END) as triggers, "
+            "SUM(CASE WHEN triggered = 0 THEN 1 ELSE 0 END) as non_triggers "
+            "FROM threshold_events WHERE provider = ?",
+            (self.provider_name,),
+        )
+        row = cursor.fetchone()
+        total = row[0] if row else 0
+        triggers = row[1] if row and row[1] is not None else 0
+        non_triggers = row[2] if row and row[2] is not None else 0
+        return {
+            "total_events": total,
+            "trigger_count": triggers,
+            "non_trigger_count": non_triggers,
+            "events": self.recent_events(limit=20),
+        }
+
+    def prune_events(self, *, max_age_seconds: float = 2_592_000.0) -> None:
+        """Prune events older than ``max_age_seconds`` (default: 30 days)."""
+        if self._db is None:
+            return
+        cutoff = time.time() - max_age_seconds
+        self._db.execute(
+            "DELETE FROM threshold_events "
+            "WHERE provider = ? AND timestamp < ?",
+            (self.provider_name, cutoff),
         )
         self._db.commit()
 
