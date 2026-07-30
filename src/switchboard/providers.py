@@ -319,6 +319,7 @@ def snapshot_provider_state(
         retry_after = ctx.reconcile.saturation_retry_after()
 
     usage_headroom: float | None = None
+    quota_resets_in: float | None = None
     cached_reading = ctx.reconcile.last_reading
     if cached_reading is not None and cached_reading.ok:
         limit_state = cached_reading.reading
@@ -330,6 +331,11 @@ def snapshot_provider_state(
             usage_headroom = (
                 limit_state.requests_remaining / limit_state.requests_limit
             )
+        bre = limit_state.bucket_reset_epoch
+        if bre is not None and bre > 0:
+            remaining = bre - _time.time()
+            if remaining > 0:
+                quota_resets_in = remaining
 
     # Token-budget utilization (Plan 012 Feature B).
     token_utilization: float | None = None
@@ -349,6 +355,7 @@ def snapshot_provider_state(
         retry_after_seconds=retry_after,
         signal_freshness=freshness,
         usage_headroom=usage_headroom,
+        quota_resets_in=quota_resets_in,
         token_utilization=token_utilization,
         usage_24h_utilization=usage_24h_utilization,
     )

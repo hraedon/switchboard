@@ -74,9 +74,11 @@ from switchboard.admin import (
 )
 from switchboard.control import (
     AdmissionPlan,
+    Availability,
     ModelMap,
     RouteAffinity,
     RoutingConfig,
+    SignalFreshness,
     hash_route_key,
     route_decision,
 )
@@ -240,6 +242,16 @@ class RoutingMetrics:
         default_factory=lambda: deque(maxlen=_RECENT_DECISIONS_MAX)
     )
     evicted_decisions: int = 0
+    affinity_pins_total: int = 0
+    affinity_failbacks_total: int = 0
+
+    def record_affinity_pin(self) -> None:
+        """Record a new affinity pin (non-primary acquisition)."""
+        self.affinity_pins_total += 1
+
+    def record_affinity_failback(self) -> None:
+        """Record a return to the primary that popped an affinity pin."""
+        self.affinity_failbacks_total += 1
 
     def record_decision(
         self, route_key: str, selected: str, primary: str
@@ -327,6 +339,7 @@ class ProxyApp:
         self._metrics = RoutingMetrics()
         self._draining = False
         self._affinity: OrderedDict[str, RouteAffinity] = OrderedDict()
+        self._provider_healthy_since: dict[str, float] = {}
 
     @property
     def metrics(self) -> RoutingMetrics:
@@ -723,6 +736,19 @@ class ProxyApp:
                     usage_history_tracker=self._usage_history_tracker,
                 )
 
+        primary = candidates[0]
+
+        st = states.get(primary)
+        healthy = (
+            st is not None
+            and st.signal_freshness is SignalFreshness.FRESH
+            and st.availability is Availability.AVAILABLE
+        )
+        if healthy:
+            self._provider_healthy_since.setdefault(primary, now_mono)
+        else:
+            self._provider_healthy_since.pop(primary, None)
+
         table = self._route_table.get_route_table()
         affinity = self._affinity.get(hashed_key)
         plan = route_decision(
@@ -730,8 +756,8 @@ class ProxyApp:
             now=now_mono,
             affinity=affinity,
             servable_providers=servable_providers,
+            primary_healthy_since=self._provider_healthy_since.get(primary),
         )
-        primary = candidates[0]
 
         acquired_provider: str | None = None
         try:
@@ -821,8 +847,10 @@ class ProxyApp:
             self._affinity.move_to_end(hashed_key)
             if len(self._affinity) > _AFFINITY_MAX:
                 self._affinity.popitem(last=False)
+            self._metrics.record_affinity_pin()
         elif affinity is not None and affinity.provider != primary:
-            self._affinity.pop(hashed_key, None)
+            if self._affinity.pop(hashed_key, None) is not None:
+                self._metrics.record_affinity_failback()
 
         ctx = self._providers[acquired_provider]
         ctx.reconcile.record_request_forwarded()

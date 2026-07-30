@@ -131,6 +131,8 @@ class TestPrometheusUsageHistory:
         _run(send_prometheus(send, {"umans": ctx}, RoutingMetrics()))
         assert send.status == 200
         assert "switchboard_routing_decisions 0" in send.body
+        assert "switchboard_affinity_pins_total 0" in send.body
+        assert "switchboard_affinity_failbacks_total 0" in send.body
         asyncio.run(ctx.http_client.aclose())
 
     def test_metrics_with_estimator(self) -> None:

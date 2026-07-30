@@ -7,7 +7,7 @@ import httpx
 import pytest
 from sluice.usage import CachedReading
 
-from switchboard.dashboard import DashboardTruthSource
+from switchboard.dashboard import DashboardTruthSource, _reading_to_limit_state
 
 
 def _mock_transport(handler):
@@ -162,3 +162,27 @@ def test_record_response_headers_is_noop() -> None:
         bearer_token="tok",
     )
     ts.record_response_headers({"x-foo": "bar"}, 200, now_monotonic=0.0)
+
+
+def test_reading_to_limit_state_maps_session_resets_at_to_bucket_reset_epoch() -> None:
+    """Plan 016: dashboard's session_resets_at ISO timestamp maps to bucket_reset_epoch."""
+    ts = (datetime.now(tz=UTC) + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reading = {
+        "provider": "zai",
+        "session_percent": 30.0,
+        "session_resets_at": ts,
+    }
+    limit_state = _reading_to_limit_state(reading, "zai")
+    assert limit_state.bucket_reset_epoch is not None
+    expected_epoch = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    assert abs(limit_state.bucket_reset_epoch - expected_epoch) < 1.0
+
+
+def test_reading_to_limit_state_absent_session_resets_at_is_none() -> None:
+    """Missing session_resets_at → bucket_reset_epoch is None (fail safe)."""
+    reading = {
+        "provider": "zai",
+        "session_percent": 30.0,
+    }
+    limit_state = _reading_to_limit_state(reading, "zai")
+    assert limit_state.bucket_reset_epoch is None

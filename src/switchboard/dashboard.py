@@ -65,6 +65,7 @@ def _reading_to_limit_state(
     tokens_remaining = _coerce_int(reading.get("tokens_remaining"))
     tokens_limit = _coerce_int(reading.get("tokens_limit"))
     concurrent_sessions = _coerce_int(reading.get("concurrent_sessions")) or 0
+    session_resets_at = _parse_timestamp(reading.get("session_resets_at"))
 
     return LimitState(
         concurrent_sessions=concurrent_sessions,
@@ -74,6 +75,7 @@ def _reading_to_limit_state(
         requests_limit=requests_limit,
         tokens_remaining=tokens_remaining,
         tokens_limit=tokens_limit,
+        bucket_reset_epoch=session_resets_at,
         provider=provider_name,
         age_seconds=0.0,
     )

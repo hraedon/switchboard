@@ -51,18 +51,36 @@ failover entirely. Unknown data never maps to zero pressure.
 
 ## 3. The routing decision (the pure function)
 
-`route_decision(states, table, route_key, config, now=now) -> AdmissionPlan`
+`route_decision(states, table, route_key, config, now=now,
+primary_healthy_since=None) -> AdmissionPlan`
 
-The decision proceeds in this order (Plan 006 §3.1):
+The decision proceeds in this order (Plans 006, 008, 014, 015, 016):
 
 1. **Resolve** the route key to an ordered candidate list.
-2. **Reject** missing and closed candidates.
-3. **Separate** fresh candidates from unknown/stale candidates.
-4. **Place** candidates with immediate permits (AVAILABLE) first.
-5. **Preserve** primary preference among equally admissible candidates.
-6. **Select** at most one explicit queue candidate.
-7. **Preserve** the configured primary as the terminal safe-failure target so
-   its gate can provide the canonical rejection when nothing is usable.
+2. **Filter** candidates by model servability when the request's model is
+   mapped (Plan 010 Feature B).
+3. **Filter** candidates by declared capability surfaces (Plan 008 §4).
+4. **Reject** missing and closed candidates.
+5. **Separate** fresh candidates from unknown/stale candidates and demote
+   pressured non-primary candidates to queue-eligible (headroom, token budget,
+   trailing-24h usage; Plan 013 allows the last to demote the primary).
+6. **Place** candidates with immediate permits (AVAILABLE) first.
+7. **Order** immediate candidates by `usage_headroom` descending when
+   `[routing] headroom_ranking` is enabled (Plan 015); data-bearing candidates
+   precede ones without headroom data; ties break on table order.
+8. **Apply** affinity stickiness / dwell / failback logic (Plan 008 §5). After
+   `dwell_interval`, if the primary is in immediate and `failback_delay` is
+   configured, failback requires the primary to have been continuously
+   FRESH+AVAILABLE for at least `failback_delay` seconds (Plan 014).  When no
+   affinity pin is active, opportunistically front a qualifying quota-burn
+   fallback carrying measured headroom above `opportunistic_min_headroom` and a
+   reset within `opportunistic_reset_window` (Plan 016); subordinate to
+   affinity, de-preference only.
+9. **Preserve** primary preference among equally admissible candidates when
+   neither an affinity pin nor an opportunistic target pinned the front.
+10. **Select** at most one explicit queue candidate.
+11. **Preserve** the configured primary as the terminal safe-failure target
+    so its gate can provide the canonical rejection when nothing is usable.
 
 The function returns an `AdmissionPlan`:
 
@@ -81,8 +99,13 @@ class AdmissionPlan:
 |---|---|
 | `primary_available` | Primary is in immediate candidates |
 | `failover` | A non-primary is in immediate candidates |
+| `affinity_dwell` | Affinity provider is pinned within `dwell_interval` |
+| `affinity_hysteresis` | Affinity pin held past dwell while primary reproves itself (Plan 014) |
+| `opportunistic` | No affinity pin; a quota-bearing fallback with expiring headroom took front preference (Plan 016) |
 | `queue_only` | No immediate candidates; queue on a candidate |
 | `no_eligible_candidates` | All candidates are closed or unknown |
+| `model_unservable` | No configured provider serves the requested model |
+| `capability_filtered` | No candidate satisfies the route's required capabilities |
 
 Properties this guarantees:
 
@@ -91,7 +114,18 @@ Properties this guarantees:
   silently drop a request.
 - **Stale data never improves preference.** Unknown/stale providers are
   excluded from failover by default.
-- **Pure.** `now` and all provider states are arguments. No I/O, no clock.
+- **Bounded stickiness.** After failover, the routing core prefers the affinity
+  provider for at least `dwell_interval` seconds before considering failback.
+- **Failback hysteresis.** When `failback_delay > 0`, failback to the primary
+  requires the primary to have been continuously FRESH+AVAILABLE for at least
+  `failback_delay` seconds. A single unhealthy poll resets the continuity clock.
+- **Opportunistic quota burn (Plan 016).** Opt-in; subordinate to an active
+  affinity pin; de-preference only. A qualifying fallback with measured headroom
+  and a near-term quota reset may front `immediate`, but the primary remains
+  immediate-eligible, queue backstop, and terminal fallback. Stale or
+  unmeasured quota data never promotes.
+- **Pure.** `now`, `primary_healthy_since`, and all provider states are
+  arguments. No I/O, no clock.
 - **Deterministic.** Same inputs → same plan. Testable without a network.
 
 ## 4. Admission algorithm (the async shell)

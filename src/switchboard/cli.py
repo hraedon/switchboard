@@ -232,6 +232,57 @@ def _validate_config(
                     "routing.usage_24h_threshold must be "
                     "between 0.0 and 1.0"
                 )
+        opportunistic_enabled = routing_section.get("opportunistic_enabled")
+        if opportunistic_enabled is not None and not isinstance(
+            opportunistic_enabled, bool
+        ):
+            errors.append("routing.opportunistic_enabled must be a boolean")
+        opportunistic_min_headroom = routing_section.get(
+            "opportunistic_min_headroom"
+        )
+        if opportunistic_min_headroom is not None:
+            if (
+                not isinstance(opportunistic_min_headroom, (int, float))
+                or isinstance(opportunistic_min_headroom, bool)
+            ):
+                errors.append(
+                    "routing.opportunistic_min_headroom must be a number"
+                )
+            elif (
+                opportunistic_min_headroom <= 0.0
+                or opportunistic_min_headroom > 1.0
+            ):
+                errors.append(
+                    "routing.opportunistic_min_headroom must be in (0.0, 1.0]"
+                )
+        opportunistic_reset_window = routing_section.get(
+            "opportunistic_reset_window"
+        )
+        if opportunistic_reset_window is not None:
+            if (
+                not isinstance(opportunistic_reset_window, (int, float))
+                or isinstance(opportunistic_reset_window, bool)
+            ):
+                errors.append(
+                    "routing.opportunistic_reset_window must be a number"
+                )
+            elif opportunistic_reset_window <= 0.0:
+                errors.append(
+                    "routing.opportunistic_reset_window must be > 0"
+                )
+        opportunistic_margin = routing_section.get("opportunistic_margin")
+        if opportunistic_margin is not None:
+            if (
+                not isinstance(opportunistic_margin, (int, float))
+                or isinstance(opportunistic_margin, bool)
+            ):
+                errors.append(
+                    "routing.opportunistic_margin must be a number"
+                )
+            elif opportunistic_margin < 0.0 or opportunistic_margin >= 1.0:
+                errors.append(
+                    "routing.opportunistic_margin must be in [0.0, 1.0)"
+                )
 
     usage_24h_budget_section = config_data.get("usage_24h_budget", {})
     if isinstance(usage_24h_budget_section, dict):
@@ -520,15 +571,47 @@ def _build_serve_app(
         dwell = routing_section.get("dwell_interval")
         if isinstance(dwell, (int, float)) and not isinstance(dwell, bool):
             rc_kwargs["dwell_interval"] = float(dwell)
+        failback_delay = routing_section.get("failback_delay")
+        if isinstance(failback_delay, (int, float)) and not isinstance(failback_delay, bool):
+            rc_kwargs["failback_delay"] = float(failback_delay)
         headroom = routing_section.get("headroom_threshold")
         if isinstance(headroom, (int, float)) and not isinstance(headroom, bool):
             rc_kwargs["headroom_threshold"] = float(headroom)
+        headroom_ranking = routing_section.get("headroom_ranking")
+        if isinstance(headroom_ranking, bool):
+            rc_kwargs["headroom_ranking"] = headroom_ranking
         token_thresh = routing_section.get("token_budget_threshold")
         if isinstance(token_thresh, (int, float)) and not isinstance(token_thresh, bool):
             rc_kwargs["token_budget_threshold"] = float(token_thresh)
         usage_24h_thresh = routing_section.get("usage_24h_threshold")
         if isinstance(usage_24h_thresh, (int, float)) and not isinstance(usage_24h_thresh, bool):
             rc_kwargs["usage_24h_threshold"] = float(usage_24h_thresh)
+        opportunistic_enabled = routing_section.get("opportunistic_enabled")
+        if isinstance(opportunistic_enabled, bool):
+            rc_kwargs["opportunistic_enabled"] = opportunistic_enabled
+        opportunistic_min_headroom = routing_section.get(
+            "opportunistic_min_headroom"
+        )
+        if isinstance(opportunistic_min_headroom, (int, float)) and not isinstance(
+            opportunistic_min_headroom, bool
+        ):
+            rc_kwargs["opportunistic_min_headroom"] = float(
+                opportunistic_min_headroom
+            )
+        opportunistic_reset_window = routing_section.get(
+            "opportunistic_reset_window"
+        )
+        if isinstance(opportunistic_reset_window, (int, float)) and not isinstance(
+            opportunistic_reset_window, bool
+        ):
+            rc_kwargs["opportunistic_reset_window"] = float(
+                opportunistic_reset_window
+            )
+        opportunistic_margin = routing_section.get("opportunistic_margin")
+        if isinstance(opportunistic_margin, (int, float)) and not isinstance(
+            opportunistic_margin, bool
+        ):
+            rc_kwargs["opportunistic_margin"] = float(opportunistic_margin)
         if rc_kwargs:
             routing_config = RoutingConfig(**rc_kwargs)
 
@@ -675,6 +758,20 @@ def _build_serve_app(
         log.info("  admin_token:       set")
     else:
         log.info("  admin_token:       disabled")
+    if routing_config.failback_delay > 0:
+        log.info(
+            "  failback_delay:    %.1fs",
+            routing_config.failback_delay,
+        )
+    if routing_config.headroom_ranking:
+        log.info("  headroom_ranking:  enabled")
+    if routing_config.opportunistic_enabled:
+        log.info(
+            "  opportunistic:     min_headroom=%.2f reset_window=%.1fs margin=%.2f",
+            routing_config.opportunistic_min_headroom,
+            routing_config.opportunistic_reset_window,
+            routing_config.opportunistic_margin,
+        )
     if model_map is not None:
         log.info("  model_map:         %d model(s)", len(model_map.routes))
     if overload_config is not None:

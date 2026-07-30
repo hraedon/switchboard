@@ -57,11 +57,18 @@ gates and decides which upstream provider receives each request.
    gate is closed without checking alternatives. Never widen the routing
    decision on bad information. Proactive utilization signals (headroom,
    token budget) never demote the **primary** — its own gate handles its
-   limits. The ONE exception is the trailing-24h usage signal (Plan 013):
-   the provider's heavy-usage penalty keys off trailing-day volume, which
-   the gate cannot see coming, so `[routing] usage_24h_threshold` MAY
-   demote the primary to queue-eligible. Demotion de-prefers only — the
-   primary stays the queue backstop and terminal 503 fallback.
+   limits. Two exceptions carve out de-preference-only behaviour. (1) The
+   trailing-24h usage signal (Plan 013): the provider's heavy-usage penalty
+   keys off trailing-day volume, which the gate cannot see coming, so
+   `[routing] usage_24h_threshold` MAY demote the primary to queue-eligible.
+   (2) `[routing] opportunistic_enabled` (Plan 016): an opt-in
+   use-it-or-lose-it signal — a quota-bearing fallback with measured session
+   headroom ≥ `opportunistic_min_headroom` and
+   `quota_resets_in ≤ opportunistic_reset_window` — MAY take front-of-immediate
+   preference over a healthy primary. De-preference only: the primary stays
+   immediate-eligible, queue backstop, and terminal 503 fallback; the
+   selection is pinned by affinity (Plan 014) so conversations do not flap
+   between providers. Stale or unmeasured quota data never promotes.
 2. **The routing core is pure.** No clock, no randomness, no I/O inside
    `switchboard.control`. Pass time and observations in as arguments so
    decisions are reproducible and testable.

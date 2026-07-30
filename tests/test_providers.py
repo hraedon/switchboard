@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import httpx
 import pytest
 from sluice.control import BreakerConfig, ControllerConfig, LimitState
@@ -9,6 +11,7 @@ from sluice.reconcile import ReconciliationLoop
 from sluice.usage import CachedReading
 
 from switchboard.control import Availability, ProviderState, SignalFreshness
+from switchboard.dashboard import DashboardTruthSource
 from switchboard.overload import OverloadConfig, OverloadTracker
 from switchboard.providers import (
     ProviderContext,
@@ -231,6 +234,7 @@ def _make_ready_ctx(
     *,
     requests_remaining: int | None = None,
     requests_limit: int | None = None,
+    bucket_reset_epoch: float | None = None,
 ) -> ProviderContext:
     """Build a ProviderContext with a ready reconcile loop and positive gate."""
     gate = PermitGate(initial_capacity=capacity)
@@ -248,6 +252,7 @@ def _make_ready_ctx(
             age_seconds=0.0,
             requests_remaining=requests_remaining,
             requests_limit=requests_limit,
+            bucket_reset_epoch=bucket_reset_epoch,
         ),
         fetched_at_monotonic=0.0,
         ok=True,
@@ -381,4 +386,83 @@ async def test_headroom_none_when_requests_limit_zero() -> None:
     ctx = _make_ready_ctx("umans", requests_remaining=5, requests_limit=0)
     state = snapshot_provider_state("umans", ctx, now=0.0)
     assert state.usage_headroom is None
+    await ctx.http_client.aclose()
+
+
+# --- Plan 015: z.ai onboarding config-path test ---
+
+
+def test_build_provider_contexts_from_config_zai_dashboard_truth_source() -> None:
+    """A [provider.\"zai\"] section with type=openai + dashboard_url builds a
+    DashboardTruthSource with provider_name == \"zai\"."""
+    config = {
+        "provider": {
+            "zai": {
+                "upstream": "https://api.z.ai/api/paas/v4",
+                "type": "openai",
+                "target": 2,
+                "dashboard_url": "http://usage-dashboard.example.com",
+                "dashboard_token_env": "USAGE_DASHBOARD_TOKEN",
+            },
+        }
+    }
+    import os
+    os.environ["USAGE_DASHBOARD_TOKEN"] = "dashboard-secret"
+    try:
+        contexts = build_provider_contexts_from_config(config)
+    finally:
+        del os.environ["USAGE_DASHBOARD_TOKEN"]
+
+    assert "zai" in contexts
+    ctx = contexts["zai"]
+    assert isinstance(ctx.truth_source, DashboardTruthSource)
+    assert ctx.truth_source._provider_name == "zai"
+
+
+# --- Plan 016: quota_resets_in derivation ---
+
+
+@pytest.mark.asyncio
+async def test_snapshot_quota_resets_in_computed_from_bucket_reset_epoch() -> None:
+    """ProviderState.quota_resets_in = bucket_reset_epoch - wall time."""
+    reset_epoch = time.time() + 10800.0
+    ctx = _make_ready_ctx("zai", bucket_reset_epoch=reset_epoch)
+    state = snapshot_provider_state("zai", ctx, now=0.0)
+    assert state.quota_resets_in is not None
+    assert abs(state.quota_resets_in - 10800.0) < 2.0
+    await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_quota_resets_in_none_when_bucket_reset_epoch_missing() -> None:
+    """No bucket_reset_epoch → quota_resets_in is None (never promotes)."""
+    ctx = _make_ready_ctx("zai", bucket_reset_epoch=None)
+    state = snapshot_provider_state("zai", ctx, now=0.0)
+    assert state.quota_resets_in is None
+    await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_quota_resets_in_none_when_reset_in_past() -> None:
+    """bucket_reset_epoch in the past → quota_resets_in is None (fail safe)."""
+    ctx = _make_ready_ctx("zai", bucket_reset_epoch=time.time() - 60.0)
+    state = snapshot_provider_state("zai", ctx, now=0.0)
+    assert state.quota_resets_in is None
+    await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_quota_resets_in_none_when_reading_stale() -> None:
+    """Stale reading → quota_resets_in is None (fresh data only)."""
+    reset_epoch = time.time() + 10800.0
+    ctx = _make_ready_ctx("zai", bucket_reset_epoch=reset_epoch)
+    cached = ctx.reconcile._last_reading_cached
+    assert cached is not None
+    ctx.reconcile._last_reading_cached = CachedReading(
+        reading=cached.reading,
+        fetched_at_monotonic=cached.fetched_at_monotonic,
+        ok=False,
+    )
+    state = snapshot_provider_state("zai", ctx, now=0.0)
+    assert state.quota_resets_in is None
     await ctx.http_client.aclose()

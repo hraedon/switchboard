@@ -29,6 +29,7 @@ def _state(
     signal_freshness: SignalFreshness = SignalFreshness.FRESH,
     capabilities: ProviderCapabilities | None = None,
     usage_headroom: float | None = None,
+    quota_resets_in: float | None = None,
     token_utilization: float | None = None,
     usage_24h_utilization: float | None = None,
 ) -> ProviderState:
@@ -41,6 +42,7 @@ def _state(
         signal_freshness=signal_freshness,
         capabilities=capabilities,
         usage_headroom=usage_headroom,
+        quota_resets_in=quota_resets_in,
         token_utilization=token_utilization,
         usage_24h_utilization=usage_24h_utilization,
     )
@@ -584,6 +586,102 @@ def test_affinity_same_inputs_same_plan() -> None:
     assert plan1 == plan2
 
 
+# --- Failback hysteresis tests (Plan 014) ---
+
+
+def test_failback_delay_default_unchanged() -> None:
+    """failback_delay=0.0 (default) reproduces Plan 008 §5 failback."""
+    states = {
+        "umans": _state("umans"),
+        "ollama": _state("ollama"),
+    }
+    affinity = _affinity("ollama", selected_at=0.0)
+    plan = route_decision(states, TABLE, "k", CONFIG, now=40.0, affinity=affinity)
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+
+def test_failback_delay_holds_pin_within_delay() -> None:
+    """Post-dwell, insufficient primary continuity → stay on affinity."""
+    config = RoutingConfig(failback_delay=60.0)
+    states = {
+        "umans": _state("umans"),
+        "ollama": _state("ollama"),
+    }
+    affinity = _affinity("ollama", selected_at=0.0)
+    plan = route_decision(
+        states, TABLE, "k", config, now=40.0, affinity=affinity,
+        primary_healthy_since=5.0,
+    )
+    assert plan.immediate_candidates[0] == "ollama"
+    assert plan.reason == "affinity_hysteresis"
+
+
+def test_failback_delay_allows_failback_after_delay() -> None:
+    """Post-dwell, sufficient primary continuity → failback."""
+    config = RoutingConfig(failback_delay=60.0)
+    states = {
+        "umans": _state("umans"),
+        "ollama": _state("ollama"),
+    }
+    affinity = _affinity("ollama", selected_at=0.0)
+    plan = route_decision(
+        states, TABLE, "k", config, now=100.0, affinity=affinity,
+        primary_healthy_since=20.0,
+    )
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+
+def test_failback_delay_none_never_healthy() -> None:
+    """primary_healthy_since=None (never observed healthy) → stay pinned."""
+    config = RoutingConfig(failback_delay=60.0)
+    states = {
+        "umans": _state("umans"),
+        "ollama": _state("ollama"),
+    }
+    affinity = _affinity("ollama", selected_at=0.0)
+    plan = route_decision(
+        states, TABLE, "k", config, now=100.0, affinity=affinity,
+        primary_healthy_since=None,
+    )
+    assert plan.immediate_candidates[0] == "ollama"
+    assert plan.reason == "affinity_hysteresis"
+
+
+def test_failback_delay_not_consulted_when_affinity_not_eligible() -> None:
+    """Affinity provider not FRESH/immediate → existing rules govern."""
+    config = RoutingConfig(failback_delay=60.0)
+    states = {
+        "umans": _state("umans"),
+        # Affinity provider is BUSY, so it is not in immediate.
+        "ollama": _state("ollama", availability=Availability.BUSY),
+    }
+    affinity = _affinity("ollama", selected_at=0.0)
+    plan = route_decision(
+        states, TABLE, "k", config, now=40.0, affinity=affinity,
+        primary_healthy_since=5.0,
+    )
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+
+def test_failback_delay_zero_ignores_healthy_since() -> None:
+    """failback_delay=0 disables hysteresis even with a healthy_since value."""
+    config = RoutingConfig(failback_delay=0.0)
+    states = {
+        "umans": _state("umans"),
+        "ollama": _state("ollama"),
+    }
+    affinity = _affinity("ollama", selected_at=0.0)
+    plan = route_decision(
+        states, TABLE, "k", config, now=40.0, affinity=affinity,
+        primary_healthy_since=5.0,
+    )
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+
 # --- ModelMap + servable filtering (Plan 010 Feature B) --------------------
 
 from switchboard.control import ModelMap  # noqa: E402
@@ -980,3 +1078,333 @@ def test_usage_24h_composes_with_token_budget() -> None:
     plan = route_decision(states, table, "k", config, now=0.0)
     assert plan.immediate_candidates == ()
     assert plan.queue_candidate == "umans"
+
+
+# --- Plan 015: headroom-ordered fallback ranking tests ---
+
+_RANKING_OFF_CONFIG = RoutingConfig(headroom_ranking=False)
+_RANKING_ON_CONFIG = RoutingConfig(headroom_ranking=True)
+
+
+def test_headroom_ranking_off_preserves_table_order() -> None:
+    """Flag off: fallbacks stay in table order even with headroom data."""
+    table = RouteTable(
+        entries={}, default_providers=("umans", "fallback-a", "fallback-b")
+    )
+    states = {
+        "umans": _state("umans", availability=Availability.BUSY),
+        "fallback-a": _state("fallback-a", usage_headroom=0.10),
+        "fallback-b": _state("fallback-b", usage_headroom=0.90),
+    }
+    plan = route_decision(states, table, "k", _RANKING_OFF_CONFIG, now=0.0)
+    assert plan.immediate_candidates == ("fallback-a", "fallback-b")
+
+
+def test_headroom_ranking_on_prefers_higher_headroom_fallback() -> None:
+    """Flag on, primary not immediate: higher-headroom fallback ranks first."""
+    table = RouteTable(
+        entries={}, default_providers=("umans", "fallback-a", "fallback-b")
+    )
+    states = {
+        "umans": _state("umans", availability=Availability.BUSY),
+        "fallback-a": _state("fallback-a", usage_headroom=0.10),
+        "fallback-b": _state("fallback-b", usage_headroom=0.90),
+    }
+    plan = route_decision(states, table, "k", _RANKING_ON_CONFIG, now=0.0)
+    assert plan.immediate_candidates == ("fallback-b", "fallback-a")
+    assert plan.reason == "failover"
+
+
+def test_headroom_ranking_primary_still_fronts() -> None:
+    """Flag on, primary immediate: ranking runs, then primary fronts."""
+    table = RouteTable(
+        entries={}, default_providers=("umans", "fallback-a", "fallback-b")
+    )
+    states = {
+        "umans": _state("umans", usage_headroom=0.10),
+        "fallback-a": _state("fallback-a", usage_headroom=0.90),
+        "fallback-b": _state("fallback-b", usage_headroom=0.50),
+    }
+    plan = route_decision(states, table, "k", _RANKING_ON_CONFIG, now=0.0)
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.immediate_candidates == ("umans", "fallback-a", "fallback-b")
+    assert plan.reason == "primary_available"
+
+
+def test_headroom_ranking_none_sorts_after_data_bearing() -> None:
+    """Providers without headroom data sort after measured ones, in table order."""
+    table = RouteTable(
+        entries={},
+        default_providers=("umans", "fallback-a", "fallback-b", "fallback-c"),
+    )
+    states = {
+        "umans": _state("umans", availability=Availability.BUSY),
+        "fallback-a": _state("fallback-a", usage_headroom=None),
+        "fallback-b": _state("fallback-b", usage_headroom=0.50),
+        "fallback-c": _state("fallback-c", usage_headroom=None),
+    }
+    plan = route_decision(states, table, "k", _RANKING_ON_CONFIG, now=0.0)
+    assert plan.immediate_candidates == ("fallback-b", "fallback-a", "fallback-c")
+
+
+def test_headroom_ranking_single_candidate_no_op() -> None:
+    """One immediate candidate: sorting is a no-op."""
+    table = RouteTable(entries={}, default_providers=("umans", "ollama-cloud"))
+    states = {
+        "umans": _state("umans", availability=Availability.BUSY),
+        "ollama-cloud": _state("ollama-cloud", usage_headroom=0.10),
+    }
+    plan = route_decision(states, table, "k", _RANKING_ON_CONFIG, now=0.0)
+    assert plan.immediate_candidates == ("ollama-cloud",)
+
+
+def test_headroom_ranking_ties_break_on_table_order() -> None:
+    """Equal headroom values keep table order (deterministic)."""
+    table = RouteTable(
+        entries={}, default_providers=("umans", "fallback-a", "fallback-b")
+    )
+    states = {
+        "umans": _state("umans", availability=Availability.BUSY),
+        "fallback-a": _state("fallback-a", usage_headroom=0.50),
+        "fallback-b": _state("fallback-b", usage_headroom=0.50),
+    }
+    plan = route_decision(states, table, "k", _RANKING_ON_CONFIG, now=0.0)
+    assert plan.immediate_candidates == ("fallback-a", "fallback-b")
+
+
+# --- Plan 016: opportunistic quota-burn tests ---
+
+_OPPORTUNISTIC_CONFIG = RoutingConfig(
+    opportunistic_enabled=True,
+    opportunistic_min_headroom=0.5,
+    opportunistic_reset_window=21600.0,
+    opportunistic_margin=0.10,
+)
+
+
+def test_opportunistic_default_disabled_unchanged() -> None:
+    """Default config (opportunistic_enabled=False) keeps primary preference."""
+    table = RouteTable(
+        entries={}, default_providers=("umans", "zai")
+    )
+    states = {
+        "umans": _state("umans"),
+        "zai": _state(
+            "zai",
+            usage_headroom=0.70,
+            quota_resets_in=10800.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", RoutingConfig(), now=0.0)
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+
+def test_opportunistic_qualifier_fronts_target_keeps_primary() -> None:
+    """Healthy primary + qualifying fallback → fallback fronts; primary stays."""
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state(
+            "zai",
+            usage_headroom=0.70,
+            quota_resets_in=10800.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
+    assert plan.immediate_candidates[0] == "zai"
+    assert "umans" in plan.immediate_candidates
+    assert plan.terminal_fallback == "umans"
+    assert plan.reason == "opportunistic"
+
+
+def test_opportunistic_below_min_headroom_returns_none() -> None:
+    """Fallback headroom below floor → primary serves."""
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state(
+            "zai",
+            usage_headroom=0.30,
+            quota_resets_in=10800.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+
+def test_opportunistic_outside_reset_window_returns_none() -> None:
+    """Reset too far in the future → opportunism does not fire."""
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state(
+            "zai",
+            usage_headroom=0.70,
+            quota_resets_in=72000.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+
+def test_opportunistic_quota_resets_in_none_returns_none() -> None:
+    """Unknown reset time (None) never promotes."""
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state(
+            "zai",
+            usage_headroom=0.70,
+            quota_resets_in=None,
+        ),
+    }
+    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+
+def test_opportunistic_headroom_none_returns_none() -> None:
+    """Unknown headroom (None) never promotes."""
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state(
+            "zai",
+            usage_headroom=None,
+            quota_resets_in=10800.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+
+def test_opportunistic_margin_suppresses_close_qualifiers() -> None:
+    """Best and runner-up within margin → keep primary."""
+    table = RouteTable(
+        entries={}, default_providers=("umans", "zai", "fallback-b")
+    )
+    states = {
+        "umans": _state("umans"),
+        "zai": _state(
+            "zai",
+            usage_headroom=0.70,
+            quota_resets_in=10800.0,
+        ),
+        "fallback-b": _state(
+            "fallback-b",
+            usage_headroom=0.65,
+            quota_resets_in=10800.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+
+def test_opportunistic_single_qualifier_no_margin_needed() -> None:
+    """Only one qualifier: margin rule is moot; it wins."""
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state(
+            "zai",
+            usage_headroom=0.51,
+            quota_resets_in=10800.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
+    assert plan.immediate_candidates[0] == "zai"
+    assert plan.reason == "opportunistic"
+
+
+def test_opportunistic_affinity_pin_beats_opportunism() -> None:
+    """An active non-primary affinity pin (within dwell) overrides opportunistic selection."""
+    table = RouteTable(
+        entries={}, default_providers=("umans", "fallback-b", "zai")
+    )
+    states = {
+        "umans": _state("umans"),
+        "fallback-b": _state("fallback-b"),
+        "zai": _state(
+            "zai",
+            usage_headroom=0.70,
+            quota_resets_in=10800.0,
+        ),
+    }
+    affinity = _affinity("fallback-b", selected_at=0.0)
+    plan = route_decision(
+        states, table, "k", _OPPORTUNISTIC_CONFIG, now=10.0, affinity=affinity
+    )
+    assert plan.immediate_candidates[0] == "fallback-b"
+    assert plan.reason == "affinity_dwell"
+
+
+def test_opportunistic_target_demoted_by_other_signal_never_qualifies() -> None:
+    """A fallback demoted by headroom_threshold is not in immediate → no opportunism."""
+    config = RoutingConfig(
+        headroom_threshold=0.15,
+        opportunistic_enabled=True,
+        opportunistic_min_headroom=0.5,
+        opportunistic_reset_window=21600.0,
+        opportunistic_margin=0.10,
+    )
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state(
+            "zai",
+            usage_headroom=0.10,
+            quota_resets_in=10800.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=0.0)
+    assert plan.immediate_candidates[0] == "umans"
+    assert "zai" not in plan.immediate_candidates
+    assert plan.queue_candidate == "zai"
+
+
+def test_opportunistic_after_non_primary_affinity_failback() -> None:
+    """After a non-primary affinity pin is released on failback, the next
+    no-pin re-evaluation can select opportunistically."""
+    config = RoutingConfig(
+        dwell_interval=30.0,
+        failback_delay=60.0,
+        opportunistic_enabled=True,
+        opportunistic_min_headroom=0.5,
+        opportunistic_reset_window=21600.0,
+        opportunistic_margin=0.10,
+    )
+    table = RouteTable(
+        entries={}, default_providers=("umans", "fallback-b", "zai")
+    )
+    states = {
+        "umans": _state("umans"),
+        "fallback-b": _state("fallback-b"),
+        "zai": _state(
+            "zai",
+            usage_headroom=0.70,
+            quota_resets_in=10800.0,
+        ),
+    }
+    # Within dwell: non-primary affinity pins front.
+    affinity = _affinity("fallback-b", selected_at=0.0)
+    plan = route_decision(states, table, "k", config, now=10.0, affinity=affinity)
+    assert plan.immediate_candidates[0] == "fallback-b"
+    assert plan.reason == "affinity_dwell"
+
+    # After dwell + failback_delay: primary is fronted.
+    plan = route_decision(
+        states, table, "k", config, now=100.0, affinity=affinity,
+        primary_healthy_since=20.0,
+    )
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+    # No pin: opportunism can fire.
+    plan = route_decision(states, table, "k", config, now=100.0, affinity=None)
+    assert plan.immediate_candidates[0] == "zai"
+    assert plan.reason == "opportunistic"

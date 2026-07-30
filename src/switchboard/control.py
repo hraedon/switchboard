@@ -95,6 +95,9 @@ class ProviderState:
     signal_freshness: SignalFreshness
     capabilities: ProviderCapabilities | None = None
     usage_headroom: float | None = None
+    quota_resets_in: float | None = None
+    # Seconds until the quota window this headroom refers to resets.
+    # None = unknown (never promotes -- fail safe).
     token_utilization: float | None = None
     usage_24h_utilization: float | None = None
     # tokens_24h / cap_tokens (Plan 013). 0.0 = none used; 1.0 = at cap.
@@ -166,12 +169,22 @@ class RoutingConfig:
 
     ``dwell_interval`` (Plan 008 §5) is the minimum time in seconds to stay
     on a fallback before failing back to the primary.
+
+    ``failback_delay`` (Plan 014) is the minimum continuous time in seconds
+    the primary must be FRESH+AVAILABLE before an affinity pin is released.
+    0.0 = disabled (Plan 008 §5 behaviour: fail back on the first healthy
+    poll after ``dwell_interval``).
     """
 
     failover_threshold_seconds: int = 10
     failover_margin: int = 5
     dwell_interval: float = 30.0
+    failback_delay: float = 0.0
     headroom_threshold: float = 0.0
+    headroom_ranking: bool = False
+    # Order `immediate` candidates by usage_headroom (descending) before
+    # affinity/primary fronting. Providers without headroom data sort after
+    # data-bearing ones, in table order.
     token_budget_threshold: float = 0.0
     usage_24h_threshold: float = 0.0
     # 0.0 = disabled. >0 = providers whose usage_24h_utilization >= this are
@@ -179,6 +192,13 @@ class RoutingConfig:
     # (Plan 013 §2: the trailing-24h penalty is what the primary's gate
     # cannot see coming, so the usual no-primary-demotion rule does not
     # apply to this signal).
+    opportunistic_enabled: bool = False
+    opportunistic_min_headroom: float = 0.5
+    # only when >= half the window remains
+    opportunistic_reset_window: float = 21600.0
+    # seconds; only inside the last 6 h
+    opportunistic_margin: float = 0.10
+    # winner must lead the runner-up by this
 
 
 @dataclass(frozen=True)
@@ -227,6 +247,58 @@ def _satisfies_capabilities(
     return required <= caps.surfaces
 
 
+def _opportunistic_target(
+    immediate: list[str],
+    primary: str,
+    states: dict[str, ProviderState],
+    config: RoutingConfig,
+) -> str | None:
+    """Select an opportunistic quota-burn target, or None.
+
+    A candidate qualifies when it is not the primary, is in ``immediate``
+    (therefore FRESH and AVAILABLE), reports measured headroom above the
+    configured floor, and reports a quota reset within the burn window.
+    The best qualifier wins only if it leads the runner-up by the configured
+    margin (a single qualifier needs no margin).  Ties break on ``immediate``
+    order (table order after ranking).
+    """
+    if not config.opportunistic_enabled:
+        return None
+
+    qualifiers: list[tuple[str, float]] = []
+    for name in immediate:
+        if name == primary:
+            continue
+        state = states.get(name)
+        if state is None:
+            continue
+        headroom = state.usage_headroom
+        if headroom is None or headroom < config.opportunistic_min_headroom:
+            continue
+        resets_in = state.quota_resets_in
+        if resets_in is None or not (0.0 < resets_in <= config.opportunistic_reset_window):
+            continue
+        qualifiers.append((name, headroom))
+
+    if not qualifiers:
+        return None
+
+    # argmax headroom; deterministic tiebreak: earlier in immediate order.
+    order = {name: idx for idx, name in enumerate(immediate)}
+
+    def _sort_key(item: tuple[str, float]) -> tuple[float, int]:
+        return (-item[1], order[item[0]])
+
+    qualifiers.sort(key=_sort_key)
+    best_name, best_headroom = qualifiers[0]
+    if len(qualifiers) == 1:
+        return best_name
+    runnerup_headroom = qualifiers[1][1]
+    if best_headroom - runnerup_headroom >= config.opportunistic_margin:
+        return best_name
+    return None
+
+
 def route_decision(
     states: dict[str, ProviderState],
     table: RouteTable,
@@ -236,10 +308,11 @@ def route_decision(
     now: float,
     affinity: RouteAffinity | None = None,
     servable_providers: frozenset[str] | None = None,
+    primary_healthy_since: float | None = None,
 ) -> AdmissionPlan:
     """Pure routing decision. Returns an :class:`AdmissionPlan`.
 
-    The decision proceeds in this order (Plans 006, 008):
+    The decision proceeds in this order (Plans 006, 008, 014, 015, 016):
 
     1. Resolve the route key to an ordered candidate list.
     2. Filter out candidates whose capabilities don't satisfy the route's
@@ -247,11 +320,21 @@ def route_decision(
     3. Reject missing and closed candidates.
     4. Separate fresh candidates from unknown/stale candidates.
     5. Place candidates with immediate permits first.
-    6. Apply affinity stickiness / dwell / failback logic (Plan 008 §5).
-    7. Preserve primary preference among equally admissible candidates.
-    8. Select at most one explicit queue candidate.
-    9. Preserve the configured primary as the terminal safe-failure target
-       so its gate can provide the canonical rejection when nothing is usable.
+    6. Order immediate candidates by ``usage_headroom`` descending when
+       ``headroom_ranking`` is enabled (Plan 015); data-bearing candidates
+       precede ones without headroom data; ties break on table order.
+    7. Apply affinity stickiness / dwell / failback logic (Plan 008 §5).
+       When ``failback_delay`` is configured and the primary has not been
+       continuously FRESH+AVAILABLE for that duration, the affinity pin is
+       held past ``dwell_interval`` (Plan 014).  Subordinate to an active
+       affinity pin, opportunistically front a qualifying quota-burn
+       fallback (Plan 016); the primary stays immediate-eligible and the
+       terminal fallback.
+    8. Preserve primary preference among equally admissible candidates when
+       neither an affinity pin nor an opportunistic target pinned the front.
+    9. Select at most one explicit queue candidate.
+    10. Preserve the configured primary as the terminal safe-failure target
+        so its gate can provide the canonical rejection when nothing is usable.
 
     Guarantees:
 
@@ -265,7 +348,20 @@ def route_decision(
     * **Bounded stickiness** — after failover, the routing core prefers the
       affinity provider for at least ``dwell_interval`` seconds before
       considering failback to the primary.
-    * **Pure** — ``now`` and all states are arguments.  No I/O, no clock.
+    * **Failback hysteresis** — when ``failback_delay > 0``, failback to the
+      primary requires the primary to have been continuously FRESH+AVAILABLE
+      for at least ``failback_delay`` seconds.  A single unhealthy poll resets
+      the continuity clock.
+    * **Opt-in headroom ranking** — when ``headroom_ranking`` is enabled,
+      immediate candidates are ordered by ``usage_headroom`` descending before
+      affinity/primary fronting; absence of data never outranks a measured
+      provider.
+    * **Opportunistic quota burn (Plan 016)** — opt-in; subordinate to an
+      active affinity pin; de-preference only: the primary remains
+      immediate-eligible, queue backstop, and terminal fallback.  Stale or
+      unmeasured data never promotes.
+    * **Pure** — ``now``, ``primary_healthy_since``, and all states are
+      arguments.  No I/O, no clock.
     * **Deterministic** — same inputs produce the same plan.
     """
     entry = table.entries.get(route_key)
@@ -363,6 +459,18 @@ def route_decision(
                 queue_eligible.append(name)
         # UNKNOWN: excluded from failover preference (fresh-only-for-failover)
 
+    # --- Headroom-ordered fallback ranking (Plan 015) ---
+    if config.headroom_ranking and len(immediate) > 1:
+        order = {name: i for i, name in enumerate(candidates)}
+
+        def _rank_key(name: str) -> tuple[int, float, int]:
+            st = states.get(name)
+            h = st.usage_headroom if st else None
+            # data-bearing first (headroom desc), then table order
+            return (0 if h is not None else 1, -(h or 0.0), order[name])
+
+        immediate.sort(key=_rank_key)
+
     # --- Affinity stickiness / dwell / failback (Plan 008 §5) ---
     affinity_reason = ""
     affinity_state = (
@@ -383,13 +491,30 @@ def route_decision(
             immediate.insert(0, affinity.provider)
             affinity_reason = "affinity_dwell"
         elif primary in immediate:
-            immediate.remove(primary)
-            immediate.insert(0, primary)
+            hysteresis = (
+                config.failback_delay > 0
+                and (
+                    primary_healthy_since is None
+                    or (now - primary_healthy_since) < config.failback_delay
+                )
+            )
+            if hysteresis:
+                immediate.remove(affinity.provider)
+                immediate.insert(0, affinity.provider)
+                affinity_reason = "affinity_hysteresis"
+            else:
+                immediate.remove(primary)
+                immediate.insert(0, primary)
         else:
             immediate.remove(affinity.provider)
             immediate.insert(0, affinity.provider)
     else:
-        if primary in immediate:
+        target = _opportunistic_target(immediate, primary, states, config)
+        if target is not None:
+            immediate.remove(target)
+            immediate.insert(0, target)
+            affinity_reason = "opportunistic"
+        elif primary in immediate:
             immediate.remove(primary)
             immediate.insert(0, primary)
 

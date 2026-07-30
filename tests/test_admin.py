@@ -380,6 +380,8 @@ def test_build_status_payload_structure() -> None:
     assert payload["routing_metrics"]["forwarded_per_provider"]["test"] == 1
     assert "recent_decisions" in payload["routing_metrics"]
     assert "evicted_decisions" in payload["routing_metrics"]
+    assert payload["routing_metrics"]["affinity_pins_total"] == 0
+    assert payload["routing_metrics"]["affinity_failbacks_total"] == 0
 
 
 def test_build_status_payload_with_failover() -> None:

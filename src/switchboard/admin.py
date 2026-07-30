@@ -262,6 +262,8 @@ def _build_status_payload(
             "routing_decisions": routing_metrics.routing_decisions,
             "recent_decisions": list(routing_metrics.recent_decisions),
             "evicted_decisions": routing_metrics.evicted_decisions,
+            "affinity_pins_total": routing_metrics.affinity_pins_total,
+            "affinity_failbacks_total": routing_metrics.affinity_failbacks_total,
         },
         "version": __version__,
         "build": build_sha,
@@ -387,6 +389,24 @@ async def send_prometheus(
         lines.append(
             f'switchboard_forwarded_per_provider{{provider="{name}"}} {count}'
         )
+
+    lines.append(
+        "# HELP switchboard_affinity_pins_total Total affinity pins created"
+    )
+    lines.append("# TYPE switchboard_affinity_pins_total counter")
+    lines.append(
+        f"switchboard_affinity_pins_total {routing_metrics.affinity_pins_total}"
+    )
+
+    lines.append(
+        "# HELP switchboard_affinity_failbacks_total "
+        "Total affinity pins released on failback to primary"
+    )
+    lines.append("# TYPE switchboard_affinity_failbacks_total counter")
+    lines.append(
+        "switchboard_affinity_failbacks_total "
+        f"{routing_metrics.affinity_failbacks_total}"
+    )
 
     for name, ctx in sorted(providers.items()):
         r = ctx.reconcile
