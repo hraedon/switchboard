@@ -190,6 +190,26 @@ inverted; a deployment that trusts the config file would bind the wrong port.
 **Done when:** a config-only `listen` is honoured, a CLI flag still overrides
 it, and tests pin both.
 
+### WI-3b — Validate config values as strictly as CLI flags
+
+Follow-up from WI-3's review. Now that TOML values reach code that
+previously only ever saw argparse-validated input, three gaps opened —
+none blocking, all the same shape: a config typo degrades quietly instead
+of failing loudly, which is the failure mode this deployment can least
+afford once the config lives in a ConfigMap nobody reads.
+
+- `log_level` from config bypasses argparse's `choices`, so `"WARN"`
+  reaches uvicorn and fails with a uvicorn-flavoured error rather than a
+  clean `_ConfigError`. `_validate_config_pre_build` is the natural home.
+- `_resolve_float` silently substitutes the default for unparseable input,
+  so `queue_timeout = "abc"` becomes 30.0 with no signal. Distinguish
+  "absent" from "present but invalid".
+- `float(True)` is `1.0`, so `queue_timeout = true` becomes a one-second
+  timeout. Prefer explicit type checks over `try: float()`.
+
+**Done when:** an invalid value for any serve key fails startup with a
+switchboard error naming the key, under test.
+
 ### WI-4 — Make "the estate is exhausted" observable
 
 When every eligible provider returns a usage error, switchboard surfaces the
