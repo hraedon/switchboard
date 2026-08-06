@@ -35,8 +35,12 @@ jobs:
         with:
           python-version: "3.13"
       - run: uv venv
-      - name: Install switchboard + sluice + dev deps
-        run: uv pip install -e ".[dev]" "sluice @ git+https://github.com/hraedon/sluice.git"
+      # Same sibling requirement as ci.yml: pyproject pins sluice by path, and
+      # a CLI override does not beat a pyproject source.
+      - name: Check out sluice as a sibling (pyproject pins it by path)
+        run: git clone --depth 1 https://github.com/hraedon/sluice.git ../sluice
+      - name: Install switchboard + dev deps
+        run: uv pip install -e ".[dev]"
       - name: pytest
         run: .venv/bin/pytest -q
 
