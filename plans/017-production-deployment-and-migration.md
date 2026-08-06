@@ -130,7 +130,23 @@ parallel, and a wave starts only when the previous one is merged.
    `~/.local/share/opencode/opencode.db` (`SELECT title, tokens_output FROM
    session ...`). A delegated run with zero output tokens after a minute has
    not started, whatever `ps` says.
-10. **Cross-lineage review before merge.** An implementation authored by
+10. **Default to `opencode-go/deepseek-v4-flash` for implementation.**
+    Measured across Wave 0 and Wave 1 rather than assumed: as an implementer
+    it twice exceeded its brief (finding that `_resolve` ignored the config
+    file for EVERY key, not just the reported one; and correcting this plan's
+    own "the routing core is complete" premise with evidence). As a reviewer
+    it produced eight file:line findings with correct severity calls and
+    emitted the requested structure. `zai/glm-5.2` is comparable in substance
+    — its reviews were arguably deeper on "does this test pass for the right
+    reason" — but deepseek is effectively unmetered, so it is the default and
+    glm is the review counterparty that keeps the gate cross-lineage.
+
+    One measured difference worth encoding: **glm-5.2 twice omitted the
+    requested `VERDICT:` line** while giving an unambiguous prose judgment;
+    deepseek emitted the structure both times. Any automation gating on a
+    parsed verdict token needs structured output or a fallback classifier,
+    not a prompt instruction.
+11. **Cross-lineage review before merge.** An implementation authored by
    `zai/glm-5.2` must be reviewed by a different lineage (`openai/gpt-5.6-sol`
    or `opencode-go/deepseek-v4-flash`), per the estate's review gate. Reviewers
    cannot grep outside the repo, so if a review needs sluice internals, paste
