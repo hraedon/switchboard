@@ -3,7 +3,7 @@ table + model map), and dashboard.
 
 Stateless functions that receive the proxy's state as arguments. Shared
 utilities (``send_json``, ``send_text``, ``check_admin_auth``) are borrowed
-from :mod:`sluice.admin` to avoid duplication. Switchboard-specific handlers
+from :mod:`switchboard.utils` to avoid duplication. Switchboard-specific handlers
 build multi-provider status payloads and manage route table CRUD.
 """
 
@@ -21,7 +21,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs
 
-from sluice.admin import (
+from switchboard import __version__
+from switchboard.session import (
+    SESSION_COOKIE,
+    LoginThrottle,
+    mint_session,
+)
+from switchboard.utils import (
     build_set_cookie,
     check_admin_auth,
     check_csrf,
@@ -30,13 +36,6 @@ from sluice.admin import (
     send_json,
     send_text,
 )
-from sluice.session import (
-    SESSION_COOKIE,
-    LoginThrottle,
-    mint_session,
-)
-
-from switchboard import __version__
 
 if TYPE_CHECKING:
     from switchboard.estimator import ThresholdEstimator
