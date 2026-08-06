@@ -57,7 +57,12 @@ instead**, in the order that minimises hand-merging.
 The insight is that most of the removal is *new files*, which conflict with
 nothing:
 
-1. **Land the new modules first, unused.** `limit.py`, `gate.py`,
+1. **Land the new modules first, unused. — DONE (merge d695579).** All six
+   modules and the fixture are on main as pure additions: no sluice import in
+   any of them, all importable, ruff and mypy clean across 22 source files,
+   and the suite unchanged at 463 passing. Nothing imports them yet, so
+   behaviour is untouched and sluice is still the live dependency.
+   *(original text)* `limit.py`, `gate.py`,
    `reconcile.py`, `session.py`, `truth.py`, `utils.py` and
    `tests/fixtures/readings.json` are additions. Cherry-pick them onto main
    with their tests and merge them while nothing imports them. Main keeps
