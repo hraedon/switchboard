@@ -227,6 +227,14 @@ def _classify_429(
             return "concurrency"
 
 
+#: Inbound headers that may carry a caller's credential. All are stripped
+#: before a provider's own credential is applied, so no client- or
+#: other-vendor-issued key can ride along to an upstream that did not issue it.
+_CREDENTIAL_HEADERS = frozenset(
+    {"authorization", "x-api-key", "api-key", "x-goog-api-key"}
+)
+
+
 @dataclass
 class _RerouteProbe:
     """Carries a usage-error verdict out of ``_forward`` without unwinding it.
@@ -1622,9 +1630,15 @@ class ProxyApp:
         """
         if not ctx.api_key:
             return headers
-        target = ctx.auth_header.lower()
+        # Strip EVERY credential header, not just the one this provider uses.
+        # Removing only `ctx.auth_header` leaks across header styles: a client
+        # sending `Authorization` to a provider that wants `x-api-key` would
+        # have its Authorization forwarded intact — one vendor's key handed to
+        # another, which is the exact leak this function exists to prevent.
         value = f"{ctx.auth_prefix}{ctx.api_key}"
-        out = [(k, v) for k, v in headers if k.lower() != target]
+        out = [
+            (k, v) for k, v in headers if k.lower() not in _CREDENTIAL_HEADERS
+        ]
         out.append((ctx.auth_header, value))
         return out
 

@@ -30,7 +30,13 @@ gates and decides which upstream provider receives each request.
   Response bodies are fully inert when neither exception applies.)*
 - **Cache-transparency — indistinguishable from a direct client per upstream.**
   The request switchboard egresses to each upstream must be byte-for-byte what
-  the client sent. Routing selects *which* upstream; it does not reshape the
+  the client sent, with two bounded exceptions (the `model` rewrite below, and
+  provider-credential replacement: when a provider configures `api_key`,
+  switchboard strips every inbound credential header and presents that
+  provider's own key. Without it, cross-vendor failover would hand one
+  vendor's key to another and be rejected — a leak as well as a failure. With
+  no `api_key` configured the client's headers pass through untouched).
+  Routing selects *which* upstream; it does not reshape the
   request. Any switchboard control header and the admin credential are consumed
   and stripped before forwarding, never sent upstream. *(Exception: when
   switchboard rewrites `model` for a fallback provider, it re-serialises the
@@ -83,6 +89,11 @@ gates and decides which upstream provider receives each request.
 6. **Cache-transparency per upstream.** The request egressed to each upstream
    must be byte-for-byte what the client sent — same body bytes, same headers
    (minus hop-by-hop and switchboard-internal), plus nothing switchboard-internal.
+   Two bounded exceptions, both opt-in: the `model` rewrite on the fallback
+   path when a `[model]` map is configured, and credential replacement for a
+   provider that configures `api_key` (every inbound credential header is
+   stripped and that provider's key applied — required for cross-vendor
+   failover, and inert for providers with no key configured).
 7. **Validate on CI early; distrust green local gates.** Push to a branch and
    watch CI (3.12 + 3.13 + 3.14) before trusting. Async/streaming behaviour is
    easy to get locally-green and actually-broken.

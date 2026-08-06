@@ -97,7 +97,7 @@ def build_provider_context(
     history: History | None = None,
     api_key: str = "",
     auth_header_name: str = "authorization",
-    auth_prefix: str = "Bearer ",
+    auth_prefix: str | None = None,
 ) -> ProviderContext:
     """Construct a :class:`ProviderContext` using sluice's building blocks.
 
@@ -170,7 +170,14 @@ def build_provider_context(
         usage_auth_header=usage_auth_header,
         api_key=api_key,
         auth_header=auth_header_name,
-        auth_prefix=auth_prefix,
+        # Derive rather than default: a caller constructing a context directly
+        # for an x-api-key gateway should not have to know that "Bearer " is
+        # wrong for it.
+        auth_prefix=(
+            auth_prefix
+            if auth_prefix is not None
+            else ("Bearer " if auth_header_name.lower() == "authorization" else "")
+        ),
     )
 
 
@@ -212,6 +219,16 @@ def build_provider_contexts_from_config(
         api_key_env = _optional_str(provider_cfg, "api_key_env")
         if api_key_env:
             api_key = os.environ.get(api_key_env, "")
+            if not api_key:
+                # Fail closed. Falling back to passthrough would forward the
+                # CLIENT's credential to this upstream — silently recreating
+                # the cross-provider leak that per-provider credentials exist
+                # to prevent, from nothing worse than a typo in a Secret.
+                raise ValueError(
+                    f"provider '{name}': api_key_env={api_key_env!r} is not "
+                    "set or is empty; refusing to start rather than fall back "
+                    "to forwarding the client's credential"
+                )
         auth_header_name = _str_or(provider_cfg, "auth_header", "authorization")
         auth_prefix = _str_or(
             provider_cfg,

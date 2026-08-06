@@ -454,3 +454,45 @@ class TestPerProviderCredentials:
         await _app({"a": a})(_scope(), _receive_body(), send)
 
         assert healthy.seen[0].headers["x-api-key"] == "raw-key"
+
+    async def test_client_credential_never_survives_a_header_style_change(self) -> None:
+        """The leak the credential feature exists to prevent, in its subtlest form.
+
+        Stripping only the provider's own auth header lets a client's
+        `Authorization` ride along to an upstream that reads `x-api-key` —
+        handing one vendor's key to another while appearing to work.
+        """
+        healthy = _responder(200)
+        a = _ctx("a", healthy)
+        a.api_key, a.auth_header, a.auth_prefix = "provider-key", "x-api-key", ""
+        await _ready(a)
+        _msgs, send = _sender()
+
+        scope = _scope()
+        scope["headers"] = [
+            (b"content-type", b"application/json"),
+            (b"authorization", b"Bearer OTHER-VENDOR-KEY"),
+        ]
+        await _app({"a": a})(scope, _receive_body(), send)
+
+        sent = healthy.seen[0].headers
+        assert sent["x-api-key"] == "provider-key"
+        assert "authorization" not in sent
+
+    async def test_reverse_header_style_also_strips(self) -> None:
+        healthy = _responder(200)
+        a = _ctx("a", healthy)
+        a.api_key = "provider-key"  # authorization/Bearer defaults
+        await _ready(a)
+        _msgs, send = _sender()
+
+        scope = _scope()
+        scope["headers"] = [
+            (b"content-type", b"application/json"),
+            (b"x-api-key", b"OTHER-VENDOR-KEY"),
+        ]
+        await _app({"a": a})(scope, _receive_body(), send)
+
+        sent = healthy.seen[0].headers
+        assert sent["authorization"] == "Bearer provider-key"
+        assert "x-api-key" not in sent

@@ -106,3 +106,24 @@ class TestOpportunisticValidation:
         cfg["routing"] = {"opportunistic_enabled": "true"}
         with pytest.raises(_ConfigError, match="opportunistic_enabled"):
             _validate_config(cfg, {"umans": None})
+
+
+def test_api_key_env_missing_fails_closed(tmp_path, monkeypatch) -> None:
+    """A typo in a Secret must not silently downgrade to credential passthrough.
+
+    Falling back to "" would forward the CLIENT's key to this upstream,
+    recreating the exact cross-provider leak per-provider credentials prevent.
+    """
+    from switchboard.providers import build_provider_contexts_from_config
+
+    monkeypatch.delenv("SWITCHBOARD_TEST_MISSING_KEY", raising=False)
+    config = {
+        "provider": {
+            "p": {
+                "upstream": "https://example.invalid",
+                "api_key_env": "SWITCHBOARD_TEST_MISSING_KEY",
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="api_key_env"):
+        build_provider_contexts_from_config(config)
