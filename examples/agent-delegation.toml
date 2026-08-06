@@ -30,7 +30,7 @@ listen = "127.0.0.1:8900"
 # Keys come from the environment so they never land in a committed file.
 
 [provider.opencode-go]
-upstream = "https://opencode.ai/zen/v1"
+upstream = "https://opencode.ai/zen/go/v1"
 type = "generic"
 target = 4
 api_key_env = "SWITCHBOARD_OPENCODE_GO_KEY"

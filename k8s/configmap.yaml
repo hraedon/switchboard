@@ -39,7 +39,7 @@ data:
     # never fall back to forwarding the client's own credential upstream.
 
     [provider.opencode-go]
-    upstream = "https://opencode.ai/zen/v1"
+    upstream = "https://opencode.ai/zen/go/v1"
     type = "generic"
     target = 4
     api_key_env = "SWITCHBOARD_OPENCODE_GO_KEY"
