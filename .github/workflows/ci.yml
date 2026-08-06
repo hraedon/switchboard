@@ -39,8 +39,11 @@ jobs:
       # refuses a path outside the workspace, hence a plain clone.
       - name: Check out sluice as a sibling (pyproject pins it by path)
         run: git clone --depth 1 https://github.com/hraedon/sluice.git ../sluice
-      - name: Install switchboard + sluice + dev deps
-        run: uv pip install -e ".[dev]"
+      # pip is installed deliberately: test_wheel_install shells out to
+      # `python -m pip wheel` to prove a clean install works, and a uv-created
+      # venv has no pip.
+      - name: Install switchboard + dev deps
+        run: uv pip install -e ".[dev]" pip
       - name: ruff
         run: .venv/bin/ruff check .
       - name: mypy

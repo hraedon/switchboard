@@ -39,8 +39,12 @@ jobs:
       # a CLI override does not beat a pyproject source.
       - name: Check out sluice as a sibling (pyproject pins it by path)
         run: git clone --depth 1 https://github.com/hraedon/sluice.git ../sluice
+      # pip is installed deliberately: test_wheel_install shells out to
+      # `python -m pip wheel` to prove a clean install works, and a uv-created
+      # venv has no pip. Without it that test fails everywhere, which is how it
+      # went unnoticed locally for a whole session.
       - name: Install switchboard + dev deps
-        run: uv pip install -e ".[dev]"
+        run: uv pip install -e ".[dev]" pip
       - name: pytest
         run: .venv/bin/pytest -q
 
