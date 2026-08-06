@@ -1,5 +1,9 @@
 name: image
 on:
+  # Manual trigger: lets an operator republish without an empty commit,
+  # and gives a deterministic way to publish when push events are not
+  # producing runs.
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
