@@ -20,7 +20,8 @@ from sluice.providers import NullTruthSource
 from sluice.reconcile import ReconciliationLoop
 from sluice.usage import CachedReading
 
-from switchboard.control import ModelMap, RoutingConfig
+from switchboard.control import RoutingConfig
+from switchboard.model_map import ModelMapManager
 from switchboard.overload import OverloadConfig
 from switchboard.providers import ProviderContext
 from switchboard.proxy import ProxyApp
@@ -122,14 +123,13 @@ def _make_chat_body(model: str = "umans-kimi-k2.7") -> bytes:
     ).encode()
 
 
-_MODEL_MAP = ModelMap(
-    routes={
-        "umans-kimi-k2.7": {
-            "umans": "umans-kimi-k2.7",
-            "ollama-cloud": "kimi-k2.7-code",
-        }
-    }
-)
+def _make_model_map_mgr() -> ModelMapManager:
+    mgr = ModelMapManager()
+    mgr.set_model(
+        "umans-kimi-k2.7",
+        {"umans": "umans-kimi-k2.7", "ollama-cloud": "kimi-k2.7-code"},
+    )
+    return mgr
 
 
 @pytest.mark.asyncio
@@ -165,7 +165,7 @@ async def test_overload_failover_with_model_rewrite() -> None:
         route_table=route_table,
         routing_config=RoutingConfig(),
         overload_config=OverloadConfig(threshold=3, cooldown_default=30.0),
-        model_map=_MODEL_MAP,
+        model_map_mgr=_make_model_map_mgr(),
     )
 
     body = _make_chat_body()
@@ -233,7 +233,7 @@ async def test_200_clears_overload_cooldown() -> None:
         overload_config=OverloadConfig(
             threshold=3, cooldown_default=0.1, cooldown_min=0.01
         ),
-        model_map=_MODEL_MAP,
+        model_map_mgr=_make_model_map_mgr(),
     )
 
     body = _make_chat_body()
@@ -284,7 +284,7 @@ async def test_model_not_in_map_no_filtering() -> None:
         providers={"umans": umans_ctx},
         route_table=route_table,
         routing_config=RoutingConfig(),
-        model_map=_MODEL_MAP,
+        model_map_mgr=_make_model_map_mgr(),
     )
 
     body = json.dumps(
@@ -323,7 +323,8 @@ async def test_no_model_map_full_passthrough() -> None:
         route_table=route_table,
         routing_config=RoutingConfig(),
     )
-    assert app._model_map is None
+    assert app._model_map_mgr is not None
+    assert app._model_map_mgr.get_model_map().routes == {}
 
     body = _make_chat_body()
 

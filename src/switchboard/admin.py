@@ -1,4 +1,5 @@
-"""Admin route handlers — health, readiness, status, metrics, route table CRUD, dashboard.
+"""Admin route handlers — health, readiness, status, metrics, CRUD (route
+table + model map), and dashboard.
 
 Stateless functions that receive the proxy's state as arguments. Shared
 utilities (``send_json``, ``send_text``, ``check_admin_auth``) are borrowed
@@ -39,6 +40,7 @@ from switchboard import __version__
 
 if TYPE_CHECKING:
     from switchboard.estimator import ThresholdEstimator
+    from switchboard.model_map import ModelMapManager
     from switchboard.providers import ProviderContext
     from switchboard.proxy import RoutingMetrics
     from switchboard.route_table import RouteTableManager
@@ -237,6 +239,7 @@ def _build_status_payload(
     overload_tracker: Any | None = None,
     budget_tracker: Any | None = None,
     usage_history_tracker: Any | None = None,
+    model_map_mgr: ModelMapManager | None = None,
 ) -> dict[str, Any]:
     """Build the full status payload for /status.json."""
     provider_states: dict[str, Any] = {}
@@ -293,6 +296,12 @@ def _build_status_payload(
             "events": estimator.event_summary(),
         }
 
+    if model_map_mgr is not None:
+        payload["model_map"] = {
+            model: dict(aliases)
+            for model, aliases in model_map_mgr.list_models()
+        }
+
     return payload
 
 
@@ -307,6 +316,7 @@ async def send_status_json(
     overload_tracker: Any | None = None,
     budget_tracker: Any | None = None,
     usage_history_tracker: Any | None = None,
+    model_map_mgr: ModelMapManager | None = None,
 ) -> None:
     """GET /status.json — per-provider state + route table + routing metrics."""
     payload = _build_status_payload(
@@ -315,6 +325,7 @@ async def send_status_json(
         overload_tracker=overload_tracker,
         budget_tracker=budget_tracker,
         usage_history_tracker=usage_history_tracker,
+        model_map_mgr=model_map_mgr,
     )
     await send_json(
         send, 200, payload,
@@ -800,6 +811,205 @@ async def handle_route_delete(
         return
 
     log.info("route removed: %s", hashed_key[:16] + "...")
+    await send_json(send, 200, {"removed": True}, extra_headers=cors)
+
+
+async def handle_model_map_list(
+    send: Send,
+    model_map_mgr: ModelMapManager,
+    cors_allow_origin: str | None = None,
+    providers: dict[str, ProviderContext] | None = None,
+) -> None:
+    """GET /admin/model-map — list each model with its per-provider aliases.
+
+    The question an operator actually asks is "which providers can serve this
+    model", so each entry carries ``servable_providers`` (the alias keys) and
+    the response includes ``configured_providers`` when known, letting the
+    dashboard mark the providers that lack an alias for a model.
+    """
+    models: list[dict[str, Any]] = []
+    for model, aliases in model_map_mgr.list_models():
+        models.append({
+            "model": model,
+            "aliases": aliases,
+            "servable_providers": sorted(aliases.keys()),
+        })
+    body: dict[str, Any] = {"models": models}
+    if providers is not None:
+        body["configured_providers"] = sorted(providers.keys())
+    await send_json(
+        send, 200, body,
+        extra_headers=[
+            *cors_extra_headers(cors_allow_origin, None),
+            (b"cache-control", b"no-store"),
+        ],
+    )
+
+
+async def handle_model_map_set(
+    send: Send,
+    receive: Receive,
+    model_map_mgr: ModelMapManager,
+    admin_token: str | None,
+    scope: Scope,
+    cors_allow_origin: str | None = None,
+    providers: dict[str, ProviderContext] | None = None,
+) -> None:
+    """POST /admin/model-map — add or update a model's per-provider aliases.
+
+    Body: ``{"model": "<name>", "aliases": {"umans": "umans-alias", ...}}``.
+
+    Validates that every alias key names a configured provider — a typo here
+    silently makes that provider ineligible for the model (the failure mode
+    WI-017/012 exists to remove), so it is refused at write time with a message
+    naming the offending provider.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(
+            send, 405,
+            {"error": "mutations disabled — set --admin-token to enable"},
+            extra_headers=cors,
+        )
+        return
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    ct = next(
+        (
+            v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+            if k == b"content-type"
+        ),
+        "",
+    )
+    if not ct.lower().startswith("application/json"):
+        await send_json(
+            send, 415,
+            {"error": "Content-Type must be application/json"},
+            extra_headers=cors,
+        )
+        return
+
+    try:
+        body = await read_body(receive)
+    except ValueError:
+        await send_json(
+            send, 413, {"error": "request body too large"},
+            extra_headers=cors,
+        )
+        return
+    except ConnectionError:
+        return
+
+    try:
+        data = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        await send_json(
+            send, 400, {"error": "invalid JSON body"},
+            extra_headers=cors,
+        )
+        return
+
+    if not isinstance(data, dict):
+        await send_json(
+            send, 400, {"error": "body must be a JSON object"},
+            extra_headers=cors,
+        )
+        return
+
+    model_name = data.get("model")
+    aliases_raw = data.get("aliases")
+
+    if not isinstance(model_name, str) or not model_name:
+        await send_json(
+            send, 400, {"error": "missing required field 'model'"},
+            extra_headers=cors,
+        )
+        return
+    if not isinstance(aliases_raw, dict) or not aliases_raw:
+        await send_json(
+            send, 400, {"error": "missing required field 'aliases'"},
+            extra_headers=cors,
+        )
+        return
+    if not all(
+        isinstance(k, str) and isinstance(v, str)
+        for k, v in aliases_raw.items()
+    ):
+        await send_json(
+            send, 400,
+            {"error": "aliases must be an object of provider → string"},
+            extra_headers=cors,
+        )
+        return
+    if providers is not None:
+        unknown = [p for p in aliases_raw if p not in providers]
+        if unknown:
+            await send_json(
+                send, 400,
+                {"error": f"unknown provider(s): {', '.join(sorted(unknown))}"},
+                extra_headers=cors,
+            )
+            return
+
+    aliases = {str(k): str(v) for k, v in aliases_raw.items()}
+    model_map_mgr.set_model(model_name, aliases)
+
+    log.info(
+        "model-map set: %s -> %d alias(es)",
+        model_name, len(aliases),
+    )
+
+    await send_json(
+        send, 200,
+        {"model": model_name, "aliases": aliases},
+        extra_headers=cors,
+    )
+
+
+async def handle_model_map_delete(
+    send: Send,
+    model_map_mgr: ModelMapManager,
+    admin_token: str | None,
+    scope: Scope,
+    model_name: str,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """DELETE /admin/model-map/<model> — remove a model entry."""
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(
+            send, 405,
+            {"error": "mutations disabled — set --admin-token to enable"},
+            extra_headers=cors,
+        )
+        return
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    removed = model_map_mgr.remove_model(model_name)
+    if not removed:
+        await send_json(
+            send, 404, {"error": "model not found"}, extra_headers=cors,
+        )
+        return
+
+    log.info("model-map removed: %s", model_name)
     await send_json(send, 200, {"removed": True}, extra_headers=cors)
 
 

@@ -9,7 +9,8 @@ from sluice.gate import PermitGate
 from sluice.providers import NullTruthSource
 from sluice.reconcile import ReconciliationLoop
 
-from switchboard.control import ModelMap, RoutingConfig
+from switchboard.control import RoutingConfig
+from switchboard.model_map import ModelMapManager
 from switchboard.providers import ProviderContext
 from switchboard.proxy import (
     ProxyApp,
@@ -106,7 +107,7 @@ def _make_app(
     providers: dict[str, ProviderContext] | None = None,
     admin_token: str | None = None,
     default_providers: tuple[str, ...] = ("test",),
-    model_map: ModelMap | None = None,
+    model_map_mgr: ModelMapManager | None = None,
 ) -> ProxyApp:
     if providers is None:
         providers = {"test": _make_provider_context()}
@@ -116,7 +117,7 @@ def _make_app(
         route_table=route_table,
         routing_config=RoutingConfig(),
         admin_token=admin_token,
-        model_map=model_map,
+        model_map_mgr=model_map_mgr,
     )
 
 
@@ -631,7 +632,8 @@ def test_rewrite_model_preserves_other_fields() -> None:
 
 def test_model_map_no_config_is_noop() -> None:
     app = _make_app()
-    assert app._model_map is None
+    assert app._model_map_mgr is not None
+    assert app._model_map_mgr.get_model_map().routes == {}
 
 
 @pytest.mark.asyncio

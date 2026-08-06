@@ -509,8 +509,9 @@ def _build_serve_app(
     args: argparse.Namespace,
 ) -> tuple[Any, str, int, str, float]:
     """Build the ProxyApp + bind params from CLI args, env, and config file."""
-    from switchboard.control import ModelMap, RoutingConfig
+    from switchboard.control import RoutingConfig
     from switchboard.estimator import ThresholdEstimator
+    from switchboard.model_map import ModelMapManager
     from switchboard.overload import OverloadConfig
     from switchboard.providers import build_provider_contexts_from_config
     from switchboard.proxy import ProxyApp
@@ -630,21 +631,10 @@ def _build_serve_app(
         if rc_kwargs:
             routing_config = RoutingConfig(**rc_kwargs)
 
-    model_map: ModelMap | None = None
-    model_section = config_data.get("model", {})
-    if isinstance(model_section, dict) and model_section:
-        routes: dict[str, dict[str, str]] = {}
-        for model_name, provider_map in model_section.items():
-            if not isinstance(provider_map, dict):
-                continue
-            entry: dict[str, str] = {}
-            for pn, alias in provider_map.items():
-                if isinstance(alias, str) and pn in providers:
-                    entry[pn] = alias
-            if entry:
-                routes[model_name] = entry
-        if routes:
-            model_map = ModelMap(routes=routes)
+    model_map_mgr = ModelMapManager(db=route_table.db)
+    model_map_mgr.load_from_config(
+        config_data, overwrite=store_path is None
+    )
 
     overload_config: OverloadConfig | None = None
     overload_statuses: frozenset[int] | None = None
@@ -794,7 +784,7 @@ def _build_serve_app(
         overload_statuses=overload_statuses,
         reroute_statuses=reroute_statuses,
         reroute_max_attempts=reroute_max_attempts,
-        model_map=model_map,
+        model_map_mgr=model_map_mgr,
         estimator=estimator,
         budget_tracker=budget_tracker,
         usage_history_tracker=usage_history_tracker,
@@ -828,8 +818,11 @@ def _build_serve_app(
             routing_config.opportunistic_reset_window,
             routing_config.opportunistic_margin,
         )
-    if model_map is not None:
-        log.info("  model_map:         %d model(s)", len(model_map.routes))
+    if model_map_mgr is not None and model_map_mgr.list_models():
+        log.info(
+            "  model_map:         %d model(s)",
+            len(model_map_mgr.list_models()),
+        )
     if overload_config is not None:
         log.info("  overload:          threshold=%d", overload_config.threshold)
     if estimator is not None:

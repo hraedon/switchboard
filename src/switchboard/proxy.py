@@ -60,6 +60,9 @@ from switchboard.admin import (
     handle_login_get,
     handle_login_post,
     handle_logout,
+    handle_model_map_delete,
+    handle_model_map_list,
+    handle_model_map_set,
     handle_readyz,
     handle_route_add,
     handle_route_delete,
@@ -85,6 +88,7 @@ from switchboard.control import (
     should_reroute,
 )
 from switchboard.estimator import ThresholdEstimator
+from switchboard.model_map import ModelMapManager
 from switchboard.overload import OverloadConfig, OverloadTracker
 from switchboard.providers import ProviderContext, snapshot_provider_state
 from switchboard.route_table import RouteTableManager
@@ -351,7 +355,7 @@ class ProxyApp:
         cors_allow_origin: str | None = None,
         overload_config: OverloadConfig | None = None,
         overload_statuses: frozenset[int] | None = None,
-        model_map: ModelMap | None = None,
+        model_map_mgr: ModelMapManager | None = None,
         estimator: ThresholdEstimator | None = None,
         budget_tracker: TokenBudgetTracker | None = None,
         usage_history_tracker: UsageHistoryTracker | None = None,
@@ -374,7 +378,7 @@ class ProxyApp:
             if overload_statuses is not None
             else _OVERLOAD_STATUSES_DEFAULT
         )
-        self._model_map = model_map
+        self._model_map_mgr = model_map_mgr or ModelMapManager()
         # Usage-error reroute. OFF by default: enabling it requires buffering
         # the request body so a retry can replay it, which changes request
         # streaming semantics and costs memory. An operator opts in per
@@ -425,13 +429,16 @@ class ProxyApp:
             and (
                 path in (
                     "/", "/status.json", "/metrics",
-                    "/admin/routes", "/admin/config",
+                    "/admin/routes", "/admin/config", "/admin/model-map",
                     "/admin/threshold-events", "/admin/usage-history",
                     "/login", "/logout",
                 )
                 or (
                     path.startswith("/admin/providers/")
                     and path.endswith("/override")
+                )
+                or (
+                    path.startswith("/admin/model-map/")
                 )
             )
         ):
@@ -495,6 +502,7 @@ class ProxyApp:
                     overload_tracker=self._overload_tracker,
                     budget_tracker=self._budget_tracker,
                     usage_history_tracker=self._usage_history_tracker,
+                    model_map_mgr=self._model_map_mgr,
                 )
                 return
             if path == "/metrics":
@@ -538,6 +546,43 @@ class ProxyApp:
             await handle_route_delete(
                 send, self._route_table, self._admin_token,
                 scope, hashed_key, self._cors_allow_origin,
+            )
+            return
+
+        if path == "/admin/model-map":
+            if method == "GET":
+                authed = check_admin_auth(scope, self._admin_token)
+                if not authed and self._admin_token:
+                    await send_json(
+                        send, 401, {"error": "unauthorized"},
+                        extra_headers=cors_extra_headers(
+                            self._cors_allow_origin, None
+                        ),
+                    )
+                    return
+                await handle_model_map_list(
+                    send, self._model_map_mgr, self._cors_allow_origin,
+                    self._providers,
+                )
+                return
+            if method == "POST":
+                await handle_model_map_set(
+                    send, receive, self._model_map_mgr,
+                    self._admin_token, scope, self._cors_allow_origin,
+                    self._providers,
+                )
+                return
+            await send_text(send, 405, "Method not allowed")
+            return
+
+        if path.startswith("/admin/model-map/") and method == "DELETE":
+            model_name = path[len("/admin/model-map/"):]
+            from urllib.parse import unquote
+
+            model_name = unquote(model_name)
+            await handle_model_map_delete(
+                send, self._model_map_mgr, self._admin_token,
+                scope, model_name, self._cors_allow_origin,
             )
             return
 
@@ -734,11 +779,14 @@ class ProxyApp:
         request_model: str | None = None
         servable_providers: frozenset[str] | None = None
 
+        # Snapshot the model map once per request so a mid-request admin edit
+        # cannot splice two mappings together.  Empty map = feature off.
+        model_map = self._model_map_mgr.get_model_map()
+        has_model_map = bool(model_map.routes)
+
         # Buffer the body when either feature needs it: model rewriting reads
         # it, and usage-error reroute must be able to replay it.
-        if (
-            self._model_map is not None and self._model_map.routes
-        ) or self._reroute_max_attempts > 0:
+        if has_model_map or self._reroute_max_attempts > 0:
             buffered_body, overflow = await self._buffer_request_body(receive)
             if overflow:
                 await send_json(
@@ -747,14 +795,14 @@ class ProxyApp:
                 return
             if buffered_body is None:
                 return
-            if self._model_map is not None and self._model_map.routes:
+            if has_model_map:
                 request_model = _extract_model(buffered_body)
             if (
                 request_model is not None
-                and self._model_map is not None
-                and request_model in self._model_map
+                and model_map is not None
+                and request_model in model_map
             ):
-                servable_providers = self._model_map.providers_for(
+                servable_providers = model_map.providers_for(
                     request_model
                 )
 
@@ -961,6 +1009,7 @@ class ProxyApp:
                     ctx, scope, receive, send,
                     buffered_body=buffered_body,
                     request_model=request_model,
+                    model_map=model_map,
                     probe=probe,
                 )
                 if not probe.triggered:
@@ -1276,6 +1325,7 @@ class ProxyApp:
         *,
         buffered_body: bytes | None = None,
         request_model: str | None = None,
+        model_map: ModelMap | None = None,
         probe: _RerouteProbe | None = None,
     ) -> None:
         """Stream a request to the selected provider's upstream.
@@ -1342,9 +1392,9 @@ class ProxyApp:
                 content: Any = buffered_body
                 if (
                     request_model is not None
-                    and self._model_map is not None
+                    and model_map is not None
                 ):
-                    alias = self._model_map.alias_for(
+                    alias = model_map.alias_for(
                         request_model, ctx.name
                     )
                     if alias is not None and alias != request_model:

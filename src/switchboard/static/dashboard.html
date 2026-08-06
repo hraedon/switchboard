@@ -221,6 +221,37 @@ async function load() {
   }
   html += '</tbody></table>';
 
+  // Model Map — the operator question is "who can serve this model", so the
+  // matrix shows every configured provider per model, with the alias filled in
+  // or a dash where the provider lacks one.
+  const mm = data.model_map || {};
+  const mmModels = Object.keys(mm);
+  const allProviders = Object.keys(data.providers || {}).sort();
+  html += '<h2>Model Map</h2>';
+  if (mmModels.length === 0) {
+    html += '<p style="color:var(--muted)">No models mapped.</p>';
+  } else {
+    html += '<table><thead><tr><th>Model</th>';
+    for (const pn of allProviders) {
+      html += `<th>${pn}</th>`;
+    }
+    html += '</tr></thead><tbody>';
+    for (const model of mmModels.sort()) {
+      const aliases = mm[model] || {};
+      html += `<tr><td><code>${model}</code></td>`;
+      for (const pn of allProviders) {
+        const alias = aliases[pn];
+        if (alias != null) {
+          html += `<td style="color:var(--green)">${alias}</td>`;
+        } else {
+          html += `<td style="color:var(--muted)">&mdash;</td>`;
+        }
+      }
+      html += '</tr>';
+    }
+    html += '</tbody></table>';
+  }
+
   const m = data.routing_metrics || {};
   html += '<h2>Routing Metrics</h2><div class="grid">';
   html += `<div class="card"><h3>Decisions</h3>
