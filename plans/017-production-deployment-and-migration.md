@@ -89,6 +89,13 @@ parallel, and a wave starts only when the previous one is merged.
    work item, and note that a delegated run that produces nothing looks
    identical to one that is merely slow.
 
+   The eventual diagnosis is worth the retelling, because the obvious answer
+   was wrong: the API key was correct. The provider id `zai` resolves to
+   z.ai's *general* endpoint, which had no balance, while the identical key
+   against the *coding-plan* endpoint answered normally. Use
+   `zai-coding-plan/*`. An "invalid credential" hypothesis would have sent
+   someone rotating a perfectly good key.
+
    Two lessons worth carrying beyond this plan. First, this is precisely the
    failure switchboard exists to remove: a 402-class exhaustion response that
    a client turns into an infinite retry. Second, the usage-dashboard
