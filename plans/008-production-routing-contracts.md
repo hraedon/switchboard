@@ -39,7 +39,13 @@ Not landed:
 - §3 route identifiers as HMAC-SHA-256 with a rotatable route-index key:
   `hash_route_key` (`src/switchboard/control.py`) is plain unkeyed SHA-256.
 - WI-008.6 singleton/fenced production lifecycle: no leadership lease,
-  leadership-aware readiness, or safe drain.
+  leadership-aware readiness, or *leadership-tied* drain. Note that a
+  graceful-shutdown drain IS shipped and tested — `--drain-timeout`
+  (`cli.py`), `_draining` plus the lifespan handler that waits for every
+  gate to reach `held == 0` or the deadline (`proxy.py`), 503-with-reason
+  admission while draining, and `test_proxy_draining_returns_503`. What is
+  missing is only the singleton/fenced lifecycle wrapped around it, not
+  drain capability.
 - WI-008.7 credential-broker mode: no secret-provider protocol, rotation,
   egress header allowlists, or redaction tests.
 - WI-008.8 admin-plane isolation: the admin plane runs on the same listener
