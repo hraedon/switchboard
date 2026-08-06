@@ -1,0 +1,17 @@
+# The build context is the PARENT of this repo, so these patterns are
+# relative to ~/projects/personal — keep the context small and, more
+# importantly, keep secrets and local state out of it entirely.
+**/.git
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/node_modules
+**/samples
+**/*.db
+**/*.sqlite*
+**/secrets*
+**/*.key
+**/*.pem
