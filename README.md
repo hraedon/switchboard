@@ -79,9 +79,13 @@ The safety properties, all enforced in `switchboard.control.should_reroute`:
   returns one error, preserving the upstream status and `Retry-After` so the
   client's own backoff still sees the truth.
 
-Response bodies stay inert: the exhausted upstream's response is closed unread,
-and the give-up path sends switchboard's own JSON body under the upstream's
-status. Reroutes are counted in `/status.json` and exported as
+Response bodies stay inert — the exhausted upstream's response is closed unread
+rather than inspected. When the retry budget is spent or no alternative exists,
+the probe is never armed and the upstream's own response (status, headers and
+body) passes through untouched, exactly as without the feature. switchboard
+synthesises a body only in the narrow case where it had already closed an
+exhausted response and then could not admit anywhere else; that reply still
+carries the upstream's status and `Retry-After`. Reroutes are counted in `/status.json` and exported as
 `switchboard_usage_reroutes_total` plus a per-origin
 `switchboard_usage_reroutes_from_total{provider=...}` — the operational
 question being "who is running out".

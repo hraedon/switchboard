@@ -12,6 +12,7 @@ the client's fault rather than the provider's.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -56,12 +57,32 @@ def _ctx(
     )
 
 
+class _Stream(httpx.AsyncByteStream):
+    """Minimal async byte stream.
+
+    ``httpx.Response(content=...)`` yields an already-consumed body, which the
+    proxy's ``aiter_raw()`` loop cannot read — the response has to arrive as a
+    stream to exercise the real forwarding path.
+    """
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._payload
+
+    async def aclose(self) -> None:
+        pass
+
+
 def _responder(status: int, *, body: bytes = b'{"ok":true}', headers: dict | None = None):
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return httpx.Response(status, content=body, headers=headers or {})
+        return httpx.Response(
+            status, stream=_Stream(body), headers=headers or {}
+        )
 
     handler.seen = seen  # type: ignore[attr-defined]
     return handler
@@ -288,3 +309,91 @@ class TestRerouteThroughProxy:
         # estate leaks capacity every time a provider runs dry.
         assert a.gate.held == 0
         assert b.gate.held == 0
+
+
+@pytest.mark.asyncio
+class TestRerouteSafetyGaps:
+    """The cases an adversarial review said the first cut could get wrong."""
+
+    async def test_no_reroute_after_client_disconnect(self) -> None:
+        """A client that has gone away must not cause a second upstream call.
+
+        Opening a fresh request on behalf of a vanished client is the
+        phantom-request failure the streaming core exists to prevent.
+        """
+        exhausted = _responder(429)
+        healthy = _responder(200)
+        a, b = _ctx("a", exhausted), _ctx("b", healthy)
+        await _ready(a, b)
+
+        async def receive() -> dict[str, Any]:
+            # Body, then an immediate disconnect while the upstream is answering.
+            if not getattr(receive, "sent", False):
+                receive.sent = True  # type: ignore[attr-defined]
+                return {"type": "http.request", "body": _BODY, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        _msgs, send = _sender()
+        await _app({"a": a, "b": b})(_scope(), receive, send)
+
+        assert len(healthy.seen) == 0
+        assert a.gate.held == 0
+        assert b.gate.held == 0
+
+    async def test_affinity_follows_the_provider_that_served(self) -> None:
+        """Otherwise the conversation keeps paying for the exhausted provider."""
+        a, b = _ctx("a", _responder(429)), _ctx("b", _responder(200))
+        await _ready(a, b)
+        app = _app({"a": a, "b": b})
+        _msgs, send = _sender()
+
+        await app(_scope(), _receive_body(), send)
+
+        pinned = [entry.provider for entry in app._affinity.values()]
+        assert pinned == ["b"]
+
+    async def test_queue_only_candidate_counts_as_an_alternative(self) -> None:
+        """A busy-but-alive provider is still somewhere to go.
+
+        With b's only permit already held, b can only be reached through the
+        queue; treating it as "no alternative" would strand the request on the
+        exhausted provider.
+        """
+        exhausted = _responder(429)
+        healthy = _responder(200)
+        a = _ctx("a", exhausted)
+        b = _ctx("b", healthy, capacity=1)
+        await _ready(a, b)
+        assert await b.gate.acquire(timeout=0.0)
+
+        async def release_soon() -> None:
+            await asyncio.sleep(0.05)
+            await b.gate.release()
+
+        releaser = asyncio.ensure_future(release_soon())
+        msgs, send = _sender()
+        await _app({"a": a, "b": b})(_scope(), _receive_body(), send)
+        await releaser
+
+        assert _statuses(msgs) == [200]
+        assert len(healthy.seen) == 1
+
+    async def test_terminal_attempt_passes_the_upstream_body_through(self) -> None:
+        """When there is nowhere left to go, the client gets the real response.
+
+        The upstream's own body is more useful than a switchboard-authored one,
+        and keeping it means response bodies are never inspected or replaced on
+        the ordinary path.
+        """
+        upstream_body = b'{"error":{"message":"quota exceeded","type":"insufficient_quota"}}'
+        a = _ctx("a", _responder(429, body=upstream_body))
+        await _ready(a)
+        msgs, send = _sender()
+
+        await _app({"a": a})(_scope(), _receive_body(), send)
+
+        assert _statuses(msgs) == [429]
+        body = b"".join(
+            m.get("body", b"") for m in msgs if m["type"] == "http.response.body"
+        )
+        assert body == upstream_body

@@ -922,9 +922,19 @@ class ProxyApp:
             # Arm only when a retry could actually happen: the body must be
             # replayable, the budget unspent, and somebody else must be able
             # to serve. Unarmed means `_forward` behaves exactly as before.
+            # Include the queue candidate: `_admit(exclude=...)` will happily
+            # wait on it, so treating only immediate candidates as
+            # alternatives would abandon a provider that could still serve.
             alternatives = [
                 name
-                for name in plan.immediate_candidates
+                for name in (
+                    *plan.immediate_candidates,
+                    *(
+                        (plan.queue_candidate,)
+                        if plan.queue_candidate is not None
+                        else ()
+                    ),
+                )
                 if name not in tried and name in self._providers
             ]
             probe.armed = (
@@ -990,6 +1000,23 @@ class ProxyApp:
             self._metrics.record_usage_reroute(acquired_provider, next_provider)
             reroutes_done += 1
             acquired_provider = next_provider
+            # Re-pin affinity to the provider that will actually serve. Without
+            # this the conversation stays pinned to the exhausted provider and
+            # pays the same failed round trip on every subsequent request —
+            # and a pin left on a provider that did NOT serve makes the route
+            # flap once it recovers.
+            if next_provider != primary:
+                self._affinity[hashed_key] = RouteAffinity(
+                    provider=next_provider,
+                    selected_at=time.monotonic(),
+                    failover_reason="usage_error_reroute",
+                )
+                self._affinity.move_to_end(hashed_key)
+                if len(self._affinity) > _AFFINITY_MAX:
+                    self._affinity.popitem(last=False)
+                self._metrics.record_affinity_pin()
+            elif self._affinity.pop(hashed_key, None) is not None:
+                self._metrics.record_affinity_failback()
 
         # Increment healthy observations on the affinity entry when a
         # failover provider served successfully (Plan 012 WI-C5).
@@ -1011,12 +1038,16 @@ class ProxyApp:
     async def _send_usage_error(
         self, send: Send, probe: _RerouteProbe
     ) -> None:
-        """Surface an upstream exhaustion status the estate could not route around.
+        """Answer a request whose upstream response was already closed.
 
-        The upstream's status and Retry-After are preserved so the client's own
-        backoff still sees the truth; the body is switchboard's, because the
-        original was closed unread when the probe fired (bodies stay inert —
-        switchboard never reads or relays upstream response content).
+        Narrow by design. When the retry budget is spent or no alternative
+        exists, the probe is never armed and the upstream's own response —
+        status, headers and body — streams through untouched, exactly as it
+        would without this feature. This path is only for the case where
+        switchboard *had* armed the probe, closed an exhausted upstream's
+        response, and then failed to admit anywhere else: there is no longer a
+        body to relay, so it synthesises one under the upstream's status and
+        Retry-After, keeping the client's backoff honest.
         """
         status = probe.status or 503
         retry_after = probe.retry_after
@@ -1160,6 +1191,16 @@ class ProxyApp:
             await _cancel_task(acquire_task)
             return False
         finally:
+            # Cancellation of the enclosing request unwinds through the await
+            # above without touching acquire_task, which could then win the
+            # race and hold a permit nobody is left to release — capacity the
+            # gate never gets back. Reclaim it explicitly.
+            if not acquire_task.done():
+                await _cancel_task(acquire_task)
+            elif not acquire_task.cancelled():
+                with contextlib.suppress(Exception):
+                    if acquire_task.result():
+                        await ctx.gate.release()
             await _cancel_task(disc_task)
             if not watcher.done():
                 watcher.cancel()
@@ -1369,6 +1410,13 @@ class ProxyApp:
                 # WITHOUT starting the response; the caller retries elsewhere
                 # or surfaces the error. Closing the response releases the
                 # upstream connection rather than leaking it into the pool.
+                # Disconnect first: a client that has gone away must not
+                # cause switchboard to open a *second* upstream request on its
+                # behalf. Rerouting a dead request is the phantom-request bug
+                # the streaming core exists to prevent.
+                if disconnect.is_set():
+                    return
+
                 if (
                     probe is not None
                     and probe.armed

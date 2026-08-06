@@ -660,6 +660,8 @@ def _build_serve_app(
     reroute_section = config_data.get("reroute", {})
     if isinstance(reroute_section, dict) and reroute_section:
         enabled = reroute_section.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise _ConfigError("reroute.enabled must be a boolean")
         raw_attempts = reroute_section.get("max_attempts", 1)
         if isinstance(raw_attempts, bool) or not isinstance(raw_attempts, int):
             raise _ConfigError("reroute.max_attempts must be an integer")
@@ -667,10 +669,27 @@ def _build_serve_app(
             raise _ConfigError("reroute.max_attempts must be >= 0")
         reroute_max_attempts = raw_attempts if enabled else 0
         statuses_raw = reroute_section.get("statuses")
-        if isinstance(statuses_raw, list):
-            if not statuses_raw:
-                raise _ConfigError("reroute.statuses must not be empty")
-            reroute_statuses = frozenset(int(x) for x in statuses_raw)
+        if statuses_raw is not None:
+            if not isinstance(statuses_raw, list) or not statuses_raw:
+                raise _ConfigError(
+                    "reroute.statuses must be a non-empty list of integers"
+                )
+            parsed: set[int] = set()
+            for raw_status in statuses_raw:
+                if isinstance(raw_status, bool) or not isinstance(raw_status, int):
+                    raise _ConfigError(
+                        "reroute.statuses entries must be integers"
+                    )
+                # Rerouting a success or a redirect would discard a served
+                # response; rerouting a client fault would spray a bad request
+                # across the estate.
+                if not 400 <= raw_status <= 599:
+                    raise _ConfigError(
+                        "reroute.statuses entries must be 4xx or 5xx "
+                        f"(got {raw_status})"
+                    )
+                parsed.add(raw_status)
+            reroute_statuses = frozenset(parsed)
 
     admin_token = _resolve("admin_token", args)
 

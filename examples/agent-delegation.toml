@@ -1,0 +1,91 @@
+# switchboard — agent-delegation routing
+#
+# The shape this estate actually needs: opencode (and any other
+# OpenAI-compatible client) points at switchboard instead of at a vendor, and
+# switchboard decides which upstream serves each request. When one runs out of
+# quota, the request moves rather than failing — which is the whole point, since
+# a delegated review that dies on a 429 costs a whole round trip of human
+# attention to notice and re-dispatch.
+#
+# Copy, fill in the api_key values (or leave them out and let the client's own
+# Authorization header pass through), and run:
+#
+#   switchboard --config examples/agent-delegation.toml
+#
+# NOTE: keys belong in a file that is NOT committed. samples/ is gitignored;
+# this file ships with placeholders only.
+
+listen = "127.0.0.1:8900"
+
+# ── providers ────────────────────────────────────────────────────────────
+#
+# `target` is the concurrency the gate aims to keep in flight. Delegated
+# reviews are long and few, so these are deliberately small: the gate exists to
+# stop switchboard from being the thing that overloads a provider, not to
+# throttle a human.
+
+[provider.opencode-go]
+upstream = "https://opencode.ai/zen/v1"
+type = "generic"
+target = 4
+
+[provider.ollama-cloud]
+upstream = "https://ollama.com/v1"
+type = "generic"
+target = 4
+
+[provider.zai]
+upstream = "https://api.z.ai/api/coding/paas/v4"
+type = "generic"
+target = 2
+
+# ── routing ──────────────────────────────────────────────────────────────
+#
+# Order matters: the first entry is the primary, the rest are failover
+# candidates ranked by headroom at decision time. opencode-go/dsv4-flash is the
+# effectively-unmetered default, so it leads; ollama-cloud carries the same
+# model family and its own generous allotment, so it is the natural second.
+
+[route.default]
+providers = ["opencode-go", "ollama-cloud", "zai"]
+
+# ── usage-error reroute ──────────────────────────────────────────────────
+#
+# The feature that makes a delegated agent survive an exhausted provider: on
+# 429/402/503/529, retry once on the next eligible provider before the client
+# ever sees a byte. One retry is the right default — it covers "this provider
+# is out" without turning a genuinely estate-wide outage into a fan-out.
+
+[reroute]
+enabled = true
+max_attempts = 1
+
+# ── model bridge ─────────────────────────────────────────────────────────
+#
+# Providers label the same model differently, so a bare failover would forward
+# a name the fallback rejects. Map the names that matter; anything unmapped
+# simply never fails over to a provider that cannot serve it.
+
+[model."deepseek-v4-flash"]
+opencode-go = "deepseek-v4-flash"
+ollama-cloud = "deepseek-v4-flash"
+
+[model."kimi-k3"]
+opencode-go = "kimi-k3"
+ollama-cloud = "kimi-k3"
+
+[model."glm-5.2"]
+opencode-go = "glm-5.2"
+ollama-cloud = "glm-5.2"
+zai = "glm-5.2"
+
+# ── truth source ─────────────────────────────────────────────────────────
+#
+# usage-dashboard already tracks claude/claude_work/zai/ollama/codex. Providers
+# it covers get proactive pressure signals (route away BEFORE the client eats an
+# error); providers it does not cover still get the reactive [reroute] backstop
+# above, which is why the backstop is provider-neutral by design.
+#
+# [dashboard]
+# url = "https://usage.k8s.hraedon.com"
+# api_key = "REPLACE_ME"      # Authorization: Bearer <key>
