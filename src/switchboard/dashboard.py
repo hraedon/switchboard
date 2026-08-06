@@ -1,7 +1,7 @@
 """TruthSource backed by the usage-dashboard /readings API.
 
 Polls the dashboard for ollama usage data and normalizes into a
-:class:`~sluice.control.LimitState` for the routing engine.
+:class:`~switchboard.limit.LimitState` for the routing engine.
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from sluice.control import LimitState
-from sluice.usage import CachedReading
+
+from switchboard.limit import CachedReading, LimitState
 
 log = logging.getLogger("switchboard.dashboard")
 
@@ -172,7 +172,7 @@ class DashboardTruthSource:
 
             reading = _reading_to_limit_state(target, self._provider_name)
 
-            ts_raw = target.get("timestamp")
+            ts_raw = target.get("fetched_at")
             ts_epoch = _parse_timestamp(ts_raw if isinstance(ts_raw, str) else None)
 
             stale = True
@@ -180,6 +180,13 @@ class DashboardTruthSource:
                 # ts_epoch is a wall-clock epoch timestamp from the dashboard
                 # API response, so time.time() (not monotonic) is correct here.
                 stale = (time.time() - ts_epoch) > self._stale_ttl
+
+            # A reading the dashboard itself flags stale (its last provider
+            # fetch failed, so it is serving the last-good reading) is
+            # uncertain even when fetched_at is recent — the percentage fields
+            # are not current. Fail safe: never treat it as fresh.
+            if bool(target.get("stale")):
+                stale = True
 
             cached = CachedReading(
                 reading=reading,
