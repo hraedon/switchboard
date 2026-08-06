@@ -1,17 +1,16 @@
-# The build context is the PARENT of this repo, so these patterns are
-# relative to ~/projects/personal — keep the context small and, more
-# importantly, keep secrets and local state out of it entirely.
-**/.git
-**/.venv
+# The build context is THIS repository only; sluice arrives through a named
+# BuildKit context (see Dockerfile). These patterns keep local state and
+# anything credential-shaped out of the image and off the daemon.
+.git
+.venv
 **/__pycache__
 **/*.pyc
-**/.pytest_cache
-**/.mypy_cache
-**/.ruff_cache
-**/node_modules
-**/samples
-**/*.db
-**/*.sqlite*
-**/secrets*
-**/*.key
-**/*.pem
+.pytest_cache
+.mypy_cache
+.ruff_cache
+samples
+*.db
+*.sqlite*
+secrets*
+*.key
+*.pem

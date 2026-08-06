@@ -2,22 +2,27 @@
 
 ## Building the image
 
-**The build context is the parent directory, not this repository.**
-
 ```bash
-cd ~/projects/personal          # the directory holding BOTH checkouts
-docker build -f switchboard/Dockerfile -t switchboard:dev .
+docker build --build-context sluice=../sluice -t switchboard:dev .
 ```
 
 switchboard depends on `sluice`, a private package declared as a path
 dependency on a sibling checkout (`[tool.uv.sources]` in `pyproject.toml`).
-It is not on PyPI, so the build needs both trees visible. Vendoring sluice
-into this repo would make `docker build .` work and would be the wrong
-trade: the two projects are separately versioned, and a copy drifts
-silently. Widening the context is the honest cost.
+It is not on PyPI, so the build needs both trees.
 
-The build fails fast if `../sluice` is missing — which is the correct
-behaviour, since the alternative is resolving the name from the index.
+sluice arrives through a **named BuildKit context**, not by widening the
+main context to the parent directory. The difference matters: the parent
+directory on a working checkout holds every other personal repository —
+here roughly 20 of them and 8.8 GB — and a parent-directory build ships all
+of it to the daemon, leaving nothing but `.dockerignore` patterns between
+another project's contents and this image. A named context takes exactly
+the one tree required.
+
+Vendoring sluice into this repo would also make the build work, and would be
+worse: the two projects are separately versioned and a copy drifts silently.
+
+The build fails if the sluice context is missing, which is correct — the
+alternative is resolving the name from an index.
 
 ## The name-collision hazard, and why both wheels install by file
 

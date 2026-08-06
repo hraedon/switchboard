@@ -1,17 +1,22 @@
 # switchboard container image.
 #
-# BUILD CONTEXT IS THE PARENT DIRECTORY, not this repo:
+#   docker build --build-context sluice=../sluice -t switchboard .
 #
-#   cd ~/projects/personal && docker build -f switchboard/Dockerfile -t switchboard .
+# switchboard depends on `sluice`, a private package declared in
+# pyproject.toml as `[tool.uv.sources] sluice = { path = "../sluice" }`. It
+# is not on PyPI — the public name belongs to an unrelated project — so the
+# build needs both checkouts.
 #
-# That is unusual enough to be worth explaining. switchboard depends on
-# `sluice`, a private package declared in pyproject.toml as
-# `[tool.uv.sources] sluice = { path = "../sluice" }`. It is not on PyPI —
-# the public name belongs to an unrelated project and must never be
-# installed — so the build needs both checkouts visible. Vendoring sluice
-# into this repo would fix the build and break the thing that matters: the
-# two projects are separately versioned, and a copy would drift silently.
-# Widening the context is the honest trade.
+# It gets them through a NAMED BuildKit context rather than by widening the
+# main context to the parent directory. That distinction is not cosmetic:
+# the parent here holds ~20 unrelated repositories and 8.8 GB, all of which
+# a parent-directory build would ship to the daemon, with nothing but
+# .dockerignore patterns between another project's contents and this image.
+# A named context takes exactly the one sibling tree that is needed.
+#
+# Vendoring sluice into this repo would also make the build work, and would
+# be worse: the projects are separately versioned and a copy drifts
+# silently.
 
 FROM python:3.13-slim AS builder
 
@@ -19,8 +24,8 @@ FROM python:3.13-slim AS builder
 COPY --from=ghcr.io/astral-sh/uv:0.9.7 /uv /usr/local/bin/uv
 
 WORKDIR /build
-COPY sluice/ ./sluice/
-COPY switchboard/ ./switchboard/
+COPY --from=sluice . ./sluice/
+COPY . ./switchboard/
 
 # Build both wheels. sluice first: switchboard's own build resolves against it.
 RUN uv build --wheel --out-dir /wheels ./sluice \
