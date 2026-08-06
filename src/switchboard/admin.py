@@ -264,6 +264,8 @@ def _build_status_payload(
             "evicted_decisions": routing_metrics.evicted_decisions,
             "affinity_pins_total": routing_metrics.affinity_pins_total,
             "affinity_failbacks_total": routing_metrics.affinity_failbacks_total,
+            "usage_reroutes_total": routing_metrics.usage_reroutes_total,
+            "usage_reroutes_from": dict(routing_metrics.usage_reroutes_from),
         },
         "version": __version__,
         "build": build_sha,
@@ -388,6 +390,19 @@ async def send_prometheus(
     for name, count in sorted(routing_metrics.forwarded_per_provider.items()):
         lines.append(
             f'switchboard_forwarded_per_provider{{provider="{name}"}} {count}'
+        )
+
+    lines.append(
+        "# HELP switchboard_usage_reroutes_total "
+        "Requests moved off a provider that returned a usage error"
+    )
+    lines.append("# TYPE switchboard_usage_reroutes_total counter")
+    lines.append(
+        f"switchboard_usage_reroutes_total {routing_metrics.usage_reroutes_total}"
+    )
+    for name, count in sorted(routing_metrics.usage_reroutes_from.items()):
+        lines.append(
+            f'switchboard_usage_reroutes_from_total{{provider="{name}"}} {count}'
         )
 
     lines.append(

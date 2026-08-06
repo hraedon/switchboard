@@ -652,6 +652,26 @@ def _build_serve_app(
         if isinstance(statuses_raw, list):
             overload_statuses = frozenset(int(s) for s in statuses_raw)
 
+    # Usage-error reroute (Plan 010 reactive half). Absent section = disabled,
+    # which keeps request-body streaming untouched for deployments that have
+    # not opted in.
+    reroute_statuses: frozenset[int] | None = None
+    reroute_max_attempts = 0
+    reroute_section = config_data.get("reroute", {})
+    if isinstance(reroute_section, dict) and reroute_section:
+        enabled = reroute_section.get("enabled", True)
+        raw_attempts = reroute_section.get("max_attempts", 1)
+        if isinstance(raw_attempts, bool) or not isinstance(raw_attempts, int):
+            raise _ConfigError("reroute.max_attempts must be an integer")
+        if raw_attempts < 0:
+            raise _ConfigError("reroute.max_attempts must be >= 0")
+        reroute_max_attempts = raw_attempts if enabled else 0
+        statuses_raw = reroute_section.get("statuses")
+        if isinstance(statuses_raw, list):
+            if not statuses_raw:
+                raise _ConfigError("reroute.statuses must not be empty")
+            reroute_statuses = frozenset(int(x) for x in statuses_raw)
+
     admin_token = _resolve("admin_token", args)
 
     queue_timeout = _resolve_float("queue_timeout", args)
@@ -738,6 +758,8 @@ def _build_serve_app(
         drain_timeout=drain_timeout,
         overload_config=overload_config,
         overload_statuses=overload_statuses,
+        reroute_statuses=reroute_statuses,
+        reroute_max_attempts=reroute_max_attempts,
         model_map=model_map,
         estimator=estimator,
         budget_tracker=budget_tracker,

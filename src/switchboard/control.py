@@ -549,3 +549,54 @@ def route_decision(
         terminal_fallback=primary,
         reason=reason,
     )
+
+
+# ── Usage-error reroute (Plan 010, reactive half) ─────────────────────────
+
+
+#: Upstream statuses that mean "this provider cannot serve you right now"
+#: rather than "your request is wrong". Every provider in the estate signals
+#: exhaustion with one of these: 429 (rate/quota), 402 (billing/credit
+#: exhausted), 503/529 (overloaded / temporarily unavailable). 500 and 502 are
+#: deliberately absent — a genuine upstream bug or bad gateway is not a usage
+#: signal, and rerouting it would silently spray a broken request across every
+#: provider in turn.
+DEFAULT_REROUTE_STATUSES: frozenset[int] = frozenset({402, 429, 503, 529})
+
+
+def should_reroute(
+    *,
+    status: int,
+    reroute_statuses: frozenset[int],
+    reroutes_done: int,
+    max_attempts: int,
+    body_replayable: bool,
+    response_started: bool,
+    alternatives_remain: bool,
+) -> bool:
+    """Decide whether a usage-error response should be retried elsewhere.
+
+    Pure predicate — the proxy owns the I/O, this owns the rule. Every clause
+    is a safety property, not a preference:
+
+    * ``response_started`` — once a byte has reached the client the request is
+      committed to that upstream; a "retry" would concatenate two responses.
+      This is the invariant that makes rerouting safe at all.
+    * ``body_replayable`` — a streamed (unbuffered) body has already been
+      consumed by the first attempt and cannot be sent again.
+    * ``alternatives_remain`` — retrying the same pressured provider is just a
+      slower failure, and is what the client's own retry loop already does.
+    * ``reroutes_done``/``max_attempts`` — ``max_attempts`` counts RETRIES, not
+      total tries, so 1 means "try the primary, then at most one other".
+      Bounded so a fully-exhausted estate degrades to a single error rather
+      than a fan-out across every provider in turn.
+    """
+    if response_started:
+        return False
+    if not body_replayable:
+        return False
+    if not alternatives_remain:
+        return False
+    if reroutes_done >= max_attempts:
+        return False
+    return status in reroute_statuses

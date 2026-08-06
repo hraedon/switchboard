@@ -26,6 +26,11 @@ top.
   usage percentage)
 - **Fails over** when the primary provider is saturated, boxed, or breaker-open
   — and falls back when it recovers
+- **Reroutes on usage errors**: when an upstream answers `429`/`402`/`503`/`529`
+  — quota exhausted, out of credit, overloaded — switchboard retries the same
+  request on another eligible provider *before any byte reaches the client*,
+  so a delegated agent gets an answer instead of an error or an endless
+  client-side retry loop. Opt-in via `[reroute]`; see below
 - **Streams** request/response bytes through untouched (same streaming +
   disconnect-cancellation + phantom-prevention logic as sluice)
 - Consumes the **usage-dashboard** `/readings` API as a truth source for
@@ -48,6 +53,38 @@ top.
   read-only in-flight for token accounting — bytes forwarded to the client are
   never modified. Neither exception applies without explicit opt-in
   configuration.)*
+
+## Usage-error reroute
+
+```toml
+[reroute]
+enabled = true
+max_attempts = 1          # retries, not total tries: primary + 1 other
+statuses = [402, 429, 503, 529]   # optional; this is the default
+```
+
+Off unless configured, because enabling it requires buffering the request body
+so a retry can replay it — that changes request-streaming semantics and costs
+memory, and no deployment should acquire either by upgrading.
+
+The safety properties, all enforced in `switchboard.control.should_reroute`:
+
+- **Never after the first byte.** The client's response has not started when
+  the probe fires, so a retry can never splice two upstream responses together.
+- **Never without a replayable body.** A streamed body is gone once consumed.
+- **Never for the client's own faults.** `400`/`401`/`404` and genuine upstream
+  breakage (`500`/`502`) are passed through — rerouting those would spray a
+  broken request across the estate.
+- **Bounded.** `max_attempts` caps the fan-out; a fully-exhausted estate
+  returns one error, preserving the upstream status and `Retry-After` so the
+  client's own backoff still sees the truth.
+
+Response bodies stay inert: the exhausted upstream's response is closed unread,
+and the give-up path sends switchboard's own JSON body under the upstream's
+status. Reroutes are counted in `/status.json` and exported as
+`switchboard_usage_reroutes_total` plus a per-origin
+`switchboard_usage_reroutes_from_total{provider=...}` — the operational
+question being "who is running out".
 
 ## Design principles
 

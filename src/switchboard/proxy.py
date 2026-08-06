@@ -73,6 +73,7 @@ from switchboard.admin import (
     serve_static,
 )
 from switchboard.control import (
+    DEFAULT_REROUTE_STATUSES,
     AdmissionPlan,
     Availability,
     ModelMap,
@@ -81,6 +82,7 @@ from switchboard.control import (
     SignalFreshness,
     hash_route_key,
     route_decision,
+    should_reroute,
 )
 from switchboard.estimator import ThresholdEstimator
 from switchboard.overload import OverloadConfig, OverloadTracker
@@ -226,6 +228,25 @@ def _classify_429(
 
 
 @dataclass
+class _RerouteProbe:
+    """Carries a usage-error verdict out of ``_forward`` without unwinding it.
+
+    ``_forward`` has many early-return paths; threading a return type through
+    all of them would be a large, risky edit to the streaming core for a
+    feature that only ever fires before the first byte reaches the client.
+    The probe is passed in, ``_forward`` stamps it and returns early *without
+    sending anything*, and the caller decides whether to retry elsewhere or
+    surface the error. ``armed`` is False for every attempt that cannot be
+    retried, which makes the whole feature inert by default.
+    """
+
+    armed: bool = False
+    triggered: bool = False
+    status: int | None = None
+    retry_after: float | None = None
+
+
+@dataclass
 class RoutingMetrics:
     """Per-provider routing counters surfaced in /status.json and /metrics.
 
@@ -244,6 +265,8 @@ class RoutingMetrics:
     evicted_decisions: int = 0
     affinity_pins_total: int = 0
     affinity_failbacks_total: int = 0
+    usage_reroutes_total: int = 0
+    usage_reroutes_from: dict[str, int] = field(default_factory=dict)
 
     def record_affinity_pin(self) -> None:
         """Record a new affinity pin (non-primary acquisition)."""
@@ -267,6 +290,17 @@ class RoutingMetrics:
         })
         if selected != primary:
             self.failovers += 1
+
+    def record_usage_reroute(self, from_provider: str, to_provider: str) -> None:
+        """Record a request moved off a provider that returned a usage error.
+
+        Counted by ORIGIN: the useful operational question is "who is running
+        out", and the destination is already visible in forwarded_per_provider.
+        """
+        self.usage_reroutes_total += 1
+        self.usage_reroutes_from[from_provider] = (
+            self.usage_reroutes_from.get(from_provider, 0) + 1
+        )
 
     def record_forwarded(self, provider: str) -> None:
         """Record a successful forward to a provider."""
@@ -313,6 +347,8 @@ class ProxyApp:
         estimator: ThresholdEstimator | None = None,
         budget_tracker: TokenBudgetTracker | None = None,
         usage_history_tracker: UsageHistoryTracker | None = None,
+        reroute_statuses: frozenset[int] | None = None,
+        reroute_max_attempts: int = 0,
     ) -> None:
         self._providers = providers
         self._route_table = route_table
@@ -331,6 +367,16 @@ class ProxyApp:
             else _OVERLOAD_STATUSES_DEFAULT
         )
         self._model_map = model_map
+        # Usage-error reroute. OFF by default: enabling it requires buffering
+        # the request body so a retry can replay it, which changes request
+        # streaming semantics and costs memory. An operator opts in per
+        # deployment; unconfigured switchboard behaves exactly as before.
+        self._reroute_statuses = (
+            reroute_statuses
+            if reroute_statuses is not None
+            else DEFAULT_REROUTE_STATUSES
+        )
+        self._reroute_max_attempts = max(0, int(reroute_max_attempts))
         self._estimator = estimator
         self._budget_tracker = budget_tracker
         self._usage_history_tracker = usage_history_tracker
@@ -680,7 +726,11 @@ class ProxyApp:
         request_model: str | None = None
         servable_providers: frozenset[str] | None = None
 
-        if self._model_map is not None and self._model_map.routes:
+        # Buffer the body when either feature needs it: model rewriting reads
+        # it, and usage-error reroute must be able to replay it.
+        if (
+            self._model_map is not None and self._model_map.routes
+        ) or self._reroute_max_attempts > 0:
             buffered_body, overflow = await self._buffer_request_body(receive)
             if overflow:
                 await send_json(
@@ -689,9 +739,11 @@ class ProxyApp:
                 return
             if buffered_body is None:
                 return
-            request_model = _extract_model(buffered_body)
+            if self._model_map is not None and self._model_map.routes:
+                request_model = _extract_model(buffered_body)
             if (
                 request_model is not None
+                and self._model_map is not None
                 and request_model in self._model_map
             ):
                 servable_providers = self._model_map.providers_for(
@@ -852,26 +904,92 @@ class ProxyApp:
             if self._affinity.pop(hashed_key, None) is not None:
                 self._metrics.record_affinity_failback()
 
-        ctx = self._providers[acquired_provider]
-        ctx.reconcile.record_request_forwarded()
+        # Usage-error reroute loop (Plan 010, reactive half). One pass per
+        # attempt: forward, and if the upstream answered with an exhaustion
+        # status before any byte reached the client, hand the request to a
+        # different provider. Each attempt owns its own permit — the failed
+        # provider's is released before the next is acquired, so a reroute
+        # never holds two gates at once.
+        tried: set[str] = set()
+        probe = _RerouteProbe()
+        reroutes_done = 0
 
-        acquire_mono = time.monotonic()
-        forward_failed = False
-        try:
-            await self._forward(
-                ctx, scope, receive, send,
-                buffered_body=buffered_body,
-                request_model=request_model,
+        while True:
+            ctx = self._providers[acquired_provider]
+            ctx.reconcile.record_request_forwarded()
+            tried.add(acquired_provider)
+
+            # Arm only when a retry could actually happen: the body must be
+            # replayable, the budget unspent, and somebody else must be able
+            # to serve. Unarmed means `_forward` behaves exactly as before.
+            alternatives = [
+                name
+                for name in plan.immediate_candidates
+                if name not in tried and name in self._providers
+            ]
+            probe.armed = (
+                self._reroute_max_attempts > 0
+                and buffered_body is not None
+                and reroutes_done < self._reroute_max_attempts
+                and bool(alternatives)
             )
-            self._metrics.record_forwarded(acquired_provider)
-        except Exception:
-            forward_failed = True
-            log.exception("proxy forward failed")
-        finally:
-            hold_seconds = time.monotonic() - acquire_mono
-            await ctx.gate.release(
-                hold_seconds=None if forward_failed else hold_seconds,
+            probe.triggered = False
+
+            acquire_mono = time.monotonic()
+            forward_failed = False
+            try:
+                await self._forward(
+                    ctx, scope, receive, send,
+                    buffered_body=buffered_body,
+                    request_model=request_model,
+                    probe=probe,
+                )
+                if not probe.triggered:
+                    self._metrics.record_forwarded(acquired_provider)
+            except Exception:
+                forward_failed = True
+                log.exception("proxy forward failed")
+            finally:
+                hold_seconds = time.monotonic() - acquire_mono
+                await ctx.gate.release(
+                    hold_seconds=None if forward_failed else hold_seconds,
+                )
+
+            if not probe.triggered:
+                break
+
+            if not should_reroute(
+                status=probe.status or 0,
+                reroute_statuses=self._reroute_statuses,
+                reroutes_done=reroutes_done,
+                max_attempts=self._reroute_max_attempts,
+                body_replayable=buffered_body is not None,
+                response_started=False,
+                alternatives_remain=bool(alternatives),
+            ):
+                await self._send_usage_error(send, probe)
+                return
+
+            next_provider = await self._admit(
+                plan,
+                receive=receive,
+                body_buffered=True,
+                exclude=frozenset(tried),
             )
+            if next_provider is None:
+                # Nobody else could take it: surface the upstream's own
+                # status so the client's backoff still sees the truth.
+                await self._send_usage_error(send, probe)
+                return
+            log.info(
+                "rerouting after usage error: %s -> %s (status=%s)",
+                acquired_provider,
+                next_provider,
+                probe.status,
+            )
+            self._metrics.record_usage_reroute(acquired_provider, next_provider)
+            reroutes_done += 1
+            acquired_provider = next_provider
 
         # Increment healthy observations on the affinity entry when a
         # failover provider served successfully (Plan 012 WI-C5).
@@ -890,12 +1008,41 @@ class ProxyApp:
                 )
                 self._affinity.move_to_end(hashed_key)
 
+    async def _send_usage_error(
+        self, send: Send, probe: _RerouteProbe
+    ) -> None:
+        """Surface an upstream exhaustion status the estate could not route around.
+
+        The upstream's status and Retry-After are preserved so the client's own
+        backoff still sees the truth; the body is switchboard's, because the
+        original was closed unread when the probe fired (bodies stay inert —
+        switchboard never reads or relays upstream response content).
+        """
+        status = probe.status or 503
+        retry_after = probe.retry_after
+        await send_json(
+            send,
+            status,
+            {
+                "error": "all eligible providers returned a usage error",
+                "reason": "usage_error_exhausted",
+                "upstream_status": status,
+                "retry_after": retry_after
+                if retry_after is not None
+                else RETRY_AFTER_SHORT,
+            },
+            retry_after=(
+                retry_after if retry_after is not None else RETRY_AFTER_SHORT
+            ),
+        )
+
     async def _admit(
         self,
         plan: AdmissionPlan,
         *,
         receive: Receive | None = None,
         body_buffered: bool = False,
+        exclude: frozenset[str] = frozenset(),
     ) -> str | None:
         """Plan-driven admission (Plan 006 §4).
 
@@ -914,6 +1061,8 @@ class ProxyApp:
         admit_start = time.monotonic()
 
         for name in plan.immediate_candidates:
+            if name in exclude:
+                continue
             ctx = self._providers.get(name)
             if ctx is None:
                 continue
@@ -922,6 +1071,8 @@ class ProxyApp:
                 return name
 
         for name in plan.immediate_candidates:
+            if name in exclude:
+                continue
             ctx = self._providers.get(name)
             if ctx is None:
                 continue
@@ -934,7 +1085,7 @@ class ProxyApp:
             if acquired:
                 return name
 
-        if plan.queue_candidate is not None:
+        if plan.queue_candidate is not None and plan.queue_candidate not in exclude:
             elapsed = time.monotonic() - admit_start
             remaining = max(0.0, self._queue_timeout - elapsed)
             if remaining > 0:
@@ -1041,6 +1192,7 @@ class ProxyApp:
                     return bytes(body), False
             # ignore other event types
 
+
     async def _forward(
         self,
         ctx: ProviderContext,
@@ -1050,6 +1202,7 @@ class ProxyApp:
         *,
         buffered_body: bytes | None = None,
         request_model: str | None = None,
+        probe: _RerouteProbe | None = None,
     ) -> None:
         """Stream a request to the selected provider's upstream.
 
@@ -1209,6 +1362,31 @@ class ProxyApp:
                 ctx.reconcile.record_response_headers(
                     dict(response.headers), response.status_code
                 )
+
+                # Usage-error reroute (Plan 010, reactive half). Nothing has
+                # been sent to the client yet, so the request is still free to
+                # be served by somebody else. Stamp the probe and return
+                # WITHOUT starting the response; the caller retries elsewhere
+                # or surfaces the error. Closing the response releases the
+                # upstream connection rather than leaking it into the pool.
+                if (
+                    probe is not None
+                    and probe.armed
+                    and response.status_code in self._reroute_statuses
+                ):
+                    probe.triggered = True
+                    probe.status = response.status_code
+                    probe.retry_after = _parse_retry_after_seconds(
+                        response.headers.get("retry-after")
+                    )
+                    log.info(
+                        "usage error from %s: status=%s — rerouting",
+                        ctx.name,
+                        response.status_code,
+                    )
+                    with contextlib.suppress(Exception):
+                        await response.aclose()
+                    return
 
                 if disconnect.is_set():
                     return
