@@ -12,6 +12,7 @@ the client's fault rather than the provider's.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -397,6 +398,105 @@ class TestRerouteSafetyGaps:
             m.get("body", b"") for m in msgs if m["type"] == "http.response.body"
         )
         assert body == upstream_body
+
+
+@pytest.mark.asyncio
+class TestUsageGiveUpObservability:
+    """WI-4: the estate-is-exhausted condition must be observable.
+
+    When every eligible provider returns a usage error, the reroute has
+    nowhere to go and switchboard surfaces the upstream's status.  That give-up
+    is the one exhaustion condition routing cannot fix, so it is counted and
+    logged at WARNING — and a successful reroute must not count.  Both give-up
+    paths are covered: the terminal attempt whose probe was never armed (the
+    upstream response passes through untouched) and the probe-that-fired with
+    no further provider admitted (a synthesized error).
+    """
+
+    def _give_up_logs(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> list[logging.LogRecord]:
+        return [
+            r for r in caplog.records
+            if r.getMessage().startswith("usage-error give-up:")
+        ]
+
+    async def test_terminal_attempt_counts_and_logs_once(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Give-up path 1: the terminal attempt's probe is never armed, so the
+        upstream's response passes through untouched — still a give-up."""
+        caplog.set_level(logging.WARNING, logger="switchboard.proxy")
+        a, b = _ctx("a", _responder(429)), _ctx("b", _responder(429))
+        await _ready(a, b)
+        app = _app({"a": a, "b": b})
+        msgs, send = _sender()
+
+        await app(_scope(), _receive_body(), send)
+
+        assert _statuses(msgs) == [429]
+        assert app._metrics.usage_giveups_total == 1
+        give_ups = self._give_up_logs(caplog)
+        assert len(give_ups) == 1
+        message = give_ups[0].getMessage()
+        assert "a=429" in message
+        assert "b=429" in message
+
+    async def test_unadmittable_alternative_counts_and_logs_once(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Give-up path 2: the probe fired but no further provider could be
+        admitted, so the error is synthesised under the upstream's status."""
+        caplog.set_level(logging.WARNING, logger="switchboard.proxy")
+        a = _ctx("a", _responder(429))
+        b = _ctx("b", _responder(200), capacity=1)
+        await _ready(a, b)
+        # Occupy b's only permit: the plan keeps it as queue candidate, but
+        # admission cannot reach it within the queue timeout.
+        assert await b.gate.acquire(timeout=0.0)
+        app = _app({"a": a, "b": b})
+        msgs, send = _sender()
+
+        await app(_scope(), _receive_body(), send)
+
+        assert _statuses(msgs) == [429]
+        assert app._metrics.usage_giveups_total == 1
+        give_ups = self._give_up_logs(caplog)
+        assert len(give_ups) == 1
+        assert "a=429" in give_ups[0].getMessage()
+        await b.gate.release()
+
+    async def test_successful_reroute_does_not_count(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.WARNING, logger="switchboard.proxy")
+        a, b = _ctx("a", _responder(429)), _ctx("b", _responder(200))
+        await _ready(a, b)
+        app = _app({"a": a, "b": b})
+        msgs, send = _sender()
+
+        await app(_scope(), _receive_body(), send)
+
+        assert _statuses(msgs) == [200]
+        assert app._metrics.usage_giveups_total == 0
+        assert self._give_up_logs(caplog) == []
+
+    async def test_feature_disabled_does_not_count(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """With the reroute off, a 429 is plain pass-through behaviour, not a
+        give-up: switchboard never attempted to route around it."""
+        caplog.set_level(logging.WARNING, logger="switchboard.proxy")
+        a = _ctx("a", _responder(429))
+        await _ready(a)
+        app = _app({"a": a}, attempts=0)
+        msgs, send = _sender()
+
+        await app(_scope(), _receive_body(), send)
+
+        assert _statuses(msgs) == [429]
+        assert app._metrics.usage_giveups_total == 0
+        assert self._give_up_logs(caplog) == []
 
 
 @pytest.mark.asyncio

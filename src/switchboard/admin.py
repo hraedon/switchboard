@@ -266,6 +266,7 @@ def _build_status_payload(
             "affinity_failbacks_total": routing_metrics.affinity_failbacks_total,
             "usage_reroutes_total": routing_metrics.usage_reroutes_total,
             "usage_reroutes_from": dict(routing_metrics.usage_reroutes_from),
+            "usage_giveups_total": routing_metrics.usage_giveups_total,
         },
         "version": __version__,
         "build": build_sha,
@@ -404,6 +405,17 @@ async def send_prometheus(
         lines.append(
             f'switchboard_usage_reroutes_from_total{{provider="{name}"}} {count}'
         )
+
+    lines.append(
+        "# HELP switchboard_usage_giveups_total "
+        "Requests that got a usage error with no eligible provider left to "
+        "route to (all candidates exhausted)"
+    )
+    lines.append("# TYPE switchboard_usage_giveups_total counter")
+    lines.append(
+        "switchboard_usage_giveups_total "
+        f"{routing_metrics.usage_giveups_total}"
+    )
 
     lines.append(
         "# HELP switchboard_affinity_pins_total Total affinity pins created"

@@ -275,6 +275,7 @@ class RoutingMetrics:
     affinity_failbacks_total: int = 0
     usage_reroutes_total: int = 0
     usage_reroutes_from: dict[str, int] = field(default_factory=dict)
+    usage_giveups_total: int = 0
 
     def record_affinity_pin(self) -> None:
         """Record a new affinity pin (non-primary acquisition)."""
@@ -309,6 +310,16 @@ class RoutingMetrics:
         self.usage_reroutes_from[from_provider] = (
             self.usage_reroutes_from.get(from_provider, 0) + 1
         )
+
+    def record_usage_giveup(self) -> None:
+        """Record a give-up: a usage error with no eligible provider left.
+
+        The one condition routing cannot fix — every eligible provider
+        answered with a usage error, so the upstream's error is surfaced to
+        the client.  Distinct from ``usage_reroutes_total``, which counts the
+        reroutes that actually moved a request.
+        """
+        self.usage_giveups_total += 1
 
     def record_forwarded(self, provider: str) -> None:
         """Record a successful forward to a provider."""
@@ -919,6 +930,7 @@ class ProxyApp:
         # provider's is released before the next is acquired, so a reroute
         # never holds two gates at once.
         tried: set[str] = set()
+        tried_statuses: dict[str, int] = {}
         rerouted_to: str | None = None
         probe = _RerouteProbe()
         reroutes_done = 0
@@ -953,6 +965,7 @@ class ProxyApp:
                 and bool(alternatives)
             )
             probe.triggered = False
+            probe.status = None
 
             acquire_mono = time.monotonic()
             forward_failed = False
@@ -974,6 +987,9 @@ class ProxyApp:
                     hold_seconds=None if forward_failed else hold_seconds,
                 )
 
+            if not forward_failed and probe.status is not None:
+                tried_statuses[acquired_provider] = probe.status
+
             if not probe.triggered:
                 served = (
                     not forward_failed
@@ -993,6 +1009,18 @@ class ProxyApp:
                     if len(self._affinity) > _AFFINITY_MAX:
                         self._affinity.popitem(last=False)
                     self._metrics.record_affinity_pin()
+                if (
+                    not forward_failed
+                    and self._reroute_max_attempts > 0
+                    and probe.status is not None
+                    and probe.status in self._reroute_statuses
+                ):
+                    # Terminal attempt: the probe was never armed because the
+                    # retry budget was spent or no alternative remained, so
+                    # the upstream's response passes through untouched. This
+                    # is still a give-up — every eligible provider returned a
+                    # usage error.
+                    self._record_usage_give_up(tried, tried_statuses)
                 break
 
             if not should_reroute(
@@ -1004,6 +1032,7 @@ class ProxyApp:
                 response_started=False,
                 alternatives_remain=bool(alternatives),
             ):
+                self._record_usage_give_up(tried, tried_statuses)
                 await self._send_usage_error(send, probe)
                 return
 
@@ -1016,6 +1045,7 @@ class ProxyApp:
             if next_provider is None:
                 # Nobody else could take it: surface the upstream's own
                 # status so the client's backoff still sees the truth.
+                self._record_usage_give_up(tried, tried_statuses)
                 await self._send_usage_error(send, probe)
                 return
             log.info(
@@ -1051,6 +1081,28 @@ class ProxyApp:
                     healthy_observations=old.healthy_observations + 1,
                 )
                 self._affinity.move_to_end(hashed_key)
+
+    def _record_usage_give_up(
+        self, tried: set[str], statuses: Mapping[str, int]
+    ) -> None:
+        """Record a give-up: a usage error with nowhere left to route.
+
+        Every provider on this request's path answered with a usage error, so
+        the reroute has nothing left to try and the upstream's error reaches
+        the client.  This is the one exhaustion condition routing cannot fix,
+        which is exactly why it must be observable: it is counted and logged
+        at WARNING naming the providers tried and the status each returned,
+        so the line alone is actionable.
+        """
+        self._metrics.record_usage_giveup()
+        detail = ", ".join(
+            f"{name}={statuses[name]}" for name in sorted(tried)
+        )
+        log.warning(
+            "usage-error give-up: every eligible provider returned a usage "
+            "error — providers tried: %s",
+            detail,
+        )
 
     async def _send_usage_error(
         self, send: Send, probe: _RerouteProbe
