@@ -14,3 +14,6 @@ samples
 secrets*
 *.key
 *.pem
+
+# CI checks sluice out here; it reaches the build as a named context.
+_sluice
