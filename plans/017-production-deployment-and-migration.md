@@ -364,6 +364,36 @@ that model, which surfaces later as "failover mysteriously didn't happen".
 and see which providers can serve it, without editing TOML — and a bad alias
 is refused at write time with a message naming the offending provider.
 
+### WI-12b — Follow-ups from the model-map review
+
+Non-blocking findings from WI-12's cross-lineage review, kept here rather
+than left in a task output nobody reads. The first two are the ones that
+matter; the rest are noted because they are pattern-consistent with existing
+warts, which is a reason to fix the pattern once, not to ignore it.
+
+- **Partial write with no rollback** (`model_map.py`, `admin.py`): a
+  persistence failure can leave the in-memory map and the stored map
+  disagreeing. Since the whole point of the feature is that operators trust
+  the UI over the file, a silent divergence is the worst outcome.
+- **SQLite rows bypass the provider-name validation config rows get**: a
+  persisted alias naming a provider that no longer exists is accepted at
+  load, reintroducing the silent-ineligibility failure the feature exists to
+  prevent.
+- Startup validation of the `[model]` section is untested; proxy-level
+  dispatch of the new endpoints is untested (note two admin paths currently
+  fall through to `_proxy_request` and get proxied upstream — pre-existing
+  for `/admin/routes/<key>` too, but now doubled).
+- Dashboard interpolates model/provider/alias into `innerHTML` unescaped.
+  Admin-authored content only, and consistent with the rest of the
+  dashboard, so self-XSS at worst — but a shared escape helper is cheap.
+- `_load_from_db` dies on one corrupt row, taking the server down at
+  startup; a stale SQLite handle survives shutdown into the drain window.
+  Both mirror `RouteTableManager` exactly, so fix the shared pattern.
+
+**Done when:** a write that fails to persist does not leave a diverged
+in-memory map, and a persisted alias naming an unconfigured provider is
+rejected at load with the provider named.
+
 ### WI-11 — Operator runbook
 
 `docs/runbook.md`: how to read `/status.json`, what each throttle state means,
