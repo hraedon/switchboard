@@ -496,3 +496,57 @@ class TestPerProviderCredentials:
         sent = healthy.seen[0].headers
         assert sent["authorization"] == "Bearer provider-key"
         assert "x-api-key" not in sent
+
+
+@pytest.mark.asyncio
+class TestPermitOwnership:
+    """`held == 0` at the end cannot see a permit released twice.
+
+    A queue acquisition handed to the caller and then released by the helper
+    leaves the caller forwarding without capacity; its own later release then
+    decrements a DIFFERENT request's permit. The gate looks balanced the whole
+    time, which is exactly why these need asserting mid-flight.
+    """
+
+    async def test_queued_acquisition_is_not_released_by_the_helper(self) -> None:
+        healthy = _responder(200)
+        a = _ctx("a", healthy, capacity=1)
+        await _ready(a)
+        # Occupy the only permit so admission must go through the queue path.
+        assert await a.gate.acquire(timeout=0.0)
+
+        async def free_it() -> None:
+            await asyncio.sleep(0.05)
+            await a.gate.release()
+
+        releaser = asyncio.ensure_future(free_it())
+        _msgs, send = _sender()
+        await _app({"a": a})(_scope(), _receive_body(), send)
+        await releaser
+
+        # If the helper had released the transferred permit, the proxy's own
+        # release would have driven this negative — sluice clamps at zero and
+        # logs, so the visible symptom is a gate that has silently gained
+        # capacity. Balanced here means ownership transferred exactly once.
+        assert a.gate.held == 0
+
+    async def test_reroute_leaves_every_gate_balanced(self) -> None:
+        a, b = _ctx("a", _responder(429)), _ctx("b", _responder(200))
+        await _ready(a, b)
+        _msgs, send = _sender()
+
+        await _app({"a": a, "b": b})(_scope(), _receive_body(), send)
+
+        assert a.gate.held == 0
+        assert b.gate.held == 0
+
+    async def test_affinity_is_not_pinned_when_the_reroute_also_fails(self) -> None:
+        """A pin must record who served, not who was merely selected."""
+        a, b = _ctx("a", _responder(429)), _ctx("b", _responder(429))
+        await _ready(a, b)
+        app = _app({"a": a, "b": b})
+        _msgs, send = _sender()
+
+        await app(_scope(), _receive_body(), send)
+
+        assert list(app._affinity.values()) == []

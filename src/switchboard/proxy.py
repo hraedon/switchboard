@@ -919,6 +919,7 @@ class ProxyApp:
         # provider's is released before the next is acquired, so a reroute
         # never holds two gates at once.
         tried: set[str] = set()
+        rerouted_to: str | None = None
         probe = _RerouteProbe()
         reroutes_done = 0
 
@@ -974,6 +975,24 @@ class ProxyApp:
                 )
 
             if not probe.triggered:
+                served = (
+                    not forward_failed
+                    and probe.status is not None
+                    and probe.status not in self._reroute_statuses
+                )
+                if rerouted_to is not None and served and rerouted_to != primary:
+                    # This attempt served. Re-pin so later requests in the
+                    # conversation go straight here instead of repaying the
+                    # exhausted provider's failed round trip.
+                    self._affinity[hashed_key] = RouteAffinity(
+                        provider=rerouted_to,
+                        selected_at=time.monotonic(),
+                        failover_reason="usage_error_reroute",
+                    )
+                    self._affinity.move_to_end(hashed_key)
+                    if len(self._affinity) > _AFFINITY_MAX:
+                        self._affinity.popitem(last=False)
+                    self._metrics.record_affinity_pin()
                 break
 
             if not should_reroute(
@@ -1008,23 +1027,13 @@ class ProxyApp:
             self._metrics.record_usage_reroute(acquired_provider, next_provider)
             reroutes_done += 1
             acquired_provider = next_provider
-            # Re-pin affinity to the provider that will actually serve. Without
-            # this the conversation stays pinned to the exhausted provider and
-            # pays the same failed round trip on every subsequent request —
-            # and a pin left on a provider that did NOT serve makes the route
-            # flap once it recovers.
-            if next_provider != primary:
-                self._affinity[hashed_key] = RouteAffinity(
-                    provider=next_provider,
-                    selected_at=time.monotonic(),
-                    failover_reason="usage_error_reroute",
-                )
-                self._affinity.move_to_end(hashed_key)
-                if len(self._affinity) > _AFFINITY_MAX:
-                    self._affinity.popitem(last=False)
-                self._metrics.record_affinity_pin()
-            elif self._affinity.pop(hashed_key, None) is not None:
-                self._metrics.record_affinity_failback()
+            # Affinity is NOT written here. A pin must record who actually
+            # served, not who was merely selected: cancellation, a forwarding
+            # failure, or another usage error would otherwise leave the
+            # conversation pinned to a provider that never answered — the same
+            # stale-pin problem in a new place. The write happens after the
+            # loop, once an attempt has succeeded.
+            rerouted_to = next_provider
 
         # Increment healthy observations on the affinity entry when a
         # failover provider served successfully (Plan 012 WI-C5).
@@ -1186,14 +1195,29 @@ class ProxyApp:
             ctx.gate.acquire(timeout=timeout)
         )
         disc_task = asyncio.ensure_future(disconnect_event.wait())
+        # True once the permit belongs to the CALLER. Until then this function
+        # owns it and must reclaim it on any exit; afterwards it must not
+        # touch it — releasing a transferred permit hands the caller a permit
+        # it does not hold, and its own later release then decrements some
+        # OTHER request's permit. That corruption is worse than the leak this
+        # bookkeeping exists to prevent.
+        transferred = False
         try:
             await asyncio.wait(
                 {acquire_task, disc_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            # Disconnect wins a tie. When both complete together, treating the
+            # acquisition as authoritative consumes the disconnect silently and
+            # lets the caller forward — or retry — on behalf of a client that
+            # has already gone.
+            if disc_task.done() and not disc_task.cancelled():
+                await _cancel_task(acquire_task)
+                return False
             if acquire_task.done() and not acquire_task.cancelled():
                 result = acquire_task.result()
                 if result:
+                    transferred = True
                     return True
             # Either disconnected or timed out — cancel the acquire.
             await _cancel_task(acquire_task)
@@ -1202,13 +1226,14 @@ class ProxyApp:
             # Cancellation of the enclosing request unwinds through the await
             # above without touching acquire_task, which could then win the
             # race and hold a permit nobody is left to release — capacity the
-            # gate never gets back. Reclaim it explicitly.
-            if not acquire_task.done():
-                await _cancel_task(acquire_task)
-            elif not acquire_task.cancelled():
-                with contextlib.suppress(Exception):
-                    if acquire_task.result():
-                        await ctx.gate.release()
+            # gate never gets back. Reclaim it, but only while it is still ours.
+            if not transferred:
+                if not acquire_task.done():
+                    await _cancel_task(acquire_task)
+                elif not acquire_task.cancelled():
+                    with contextlib.suppress(Exception):
+                        if acquire_task.result():
+                            await ctx.gate.release()
             await _cancel_task(disc_task)
             if not watcher.done():
                 watcher.cancel()
@@ -1427,13 +1452,18 @@ class ProxyApp:
                 if disconnect.is_set():
                     return
 
+                # Record the status unconditionally: even when no reroute is
+                # possible the caller needs to know whether this attempt
+                # actually SERVED, so it does not pin affinity to a provider
+                # that merely handed back an exhaustion response.
+                if probe is not None:
+                    probe.status = response.status_code
                 if (
                     probe is not None
                     and probe.armed
                     and response.status_code in self._reroute_statuses
                 ):
                     probe.triggered = True
-                    probe.status = response.status_code
                     probe.retry_after = _parse_retry_after_seconds(
                         response.headers.get("retry-after")
                     )

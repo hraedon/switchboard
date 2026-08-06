@@ -95,5 +95,5 @@ zai = "glm-5.2"
 # above, which is why the backstop is provider-neutral by design.
 #
 # [dashboard]
-# url = "https://usage.k8s.hraedon.com"
+# url = "https://usage.internal.example"
 # api_key = "REPLACE_ME"      # Authorization: Bearer <key>
