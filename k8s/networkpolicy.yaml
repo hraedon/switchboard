@@ -1,0 +1,41 @@
+# switchboard holds every provider credential and will spend them on behalf
+# of whoever asks it. ClusterIP plus an internal ingress class stops traffic
+# arriving from OUTSIDE the cluster; neither stops any pod INSIDE it. This
+# policy makes the deployment match the threat model its own comments
+# describe.
+#
+# Adjust the selectors to your cluster: the ingress controller's namespace
+# and whichever namespaces legitimately route model traffic. Deliberately
+# not a bare `{}` allow-all — an ineffective policy is worse than none,
+# because it looks like protection.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: switchboard
+  namespace: switchboard
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: switchboard
+  policyTypes:
+    - Ingress
+  ingress:
+    # The ingress controller, so the internal hostname works.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 8801
+    # Clients that legitimately route model traffic. REPLACE this selector —
+    # as written it admits only pods labelled switchboard-client, which is a
+    # deliberate default-deny starting point rather than a guess at your
+    # topology.
+    - from:
+        - podSelector:
+            matchLabels:
+              switchboard-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8801

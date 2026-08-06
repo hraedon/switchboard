@@ -99,6 +99,8 @@ data:
     # is a PLACEHOLDER — replace before enabling. Token should arrive via a
     # dashboard_token_env Secret key, never inline here.
     #
-    # [dashboard]
-    # url = "https://usage.internal.example"
-    # api_key = "REPLACE_ME"      # Authorization: Bearer <key>
+    # Dashboard truth-source keys are PER PROVIDER, not a top-level
+    # [dashboard] table. Put them inside the provider they describe:
+    #   [provider.ollama-cloud]
+    #   dashboard_url = "https://usage.internal.example"
+    #   dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"
