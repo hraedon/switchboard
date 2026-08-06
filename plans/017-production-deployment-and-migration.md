@@ -322,6 +322,33 @@ permits (`held == 0` everywhere at the end), no duplicated responses.
 
 **Done when:** one command exercises all five and reports pass/fail.
 
+### WI-12 — Model-map management in the admin API and dashboard
+
+The dashboard (Plan 005) already does Providers, Route Table, Threshold
+Estimator and Routing Metrics. The **model map does not appear at all** — it
+is TOML-only, with no admin endpoint and no UI. That is the one piece of
+configuration an operator changes most often once routing is live, because
+every new model or provider needs its aliases, and it is the fiddliest to
+hand-edit: a nested `[model."name"]` table per model, one key per provider,
+where a typo does not error — it silently makes that provider ineligible for
+that model, which surfaces later as "failover mysteriously didn't happen".
+
+- Admin endpoints for reading and editing the map, following the route-table
+  CRUD already in `admin.py` (same auth, same CSRF, same persistence shape).
+  Do not invent a second pattern.
+- A dashboard section listing each model with its per-provider aliases,
+  showing clearly which providers can serve it — the question an operator
+  actually asks is "who can serve this model", not "what is this alias".
+- Validation on write: reject an alias for a provider that is not
+  configured, and surface unmapped-but-referenced models rather than
+  silently dropping them.
+- Persist consistently with the route table (`sqlite_path` when set, config
+  otherwise), so a restart does not resurrect stale mappings.
+
+**Done when:** an operator can add a model, give it per-provider aliases,
+and see which providers can serve it, without editing TOML — and a bad alias
+is refused at write time with a message naming the offending provider.
+
 ### WI-11 — Operator runbook
 
 `docs/runbook.md`: how to read `/status.json`, what each throttle state means,
