@@ -75,7 +75,12 @@ parallel, and a wave starts only when the previous one is merged.
    status line is sent first, **status-only assertions still pass while the
    body path silently fails**. This has already cost one round of debugging.
 5. One work item per branch, named `wi-017-<n>-<slug>`. Do not batch.
-6. **Cross-lineage review before merge.** An implementation authored by
+6. **Give reviews room.** `openai/gpt-5.6-sol` reads deeply on this codebase:
+   two review runs at a 1500s ceiling died mid-analysis having produced
+   nothing, which is worse than a narrow review that finishes. Allow ~2700s,
+   scope each review to a single commit or work item, and tell the reviewer
+   explicitly to budget its reading rather than survey the repo.
+7. **Cross-lineage review before merge.** An implementation authored by
    `zai/glm-5.2` must be reviewed by a different lineage (`openai/gpt-5.6-sol`
    or `opencode-go/deepseek-v4-flash`), per the estate's review gate. Reviewers
    cannot grep outside the repo, so if a review needs sluice internals, paste
