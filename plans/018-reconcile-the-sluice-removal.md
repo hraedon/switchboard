@@ -14,11 +14,15 @@ repository's history was scrubbed and made public — and it was one
 `git clean` from being lost. Advice to re-clone the host would have
 destroyed it.
 
-It is now preserved three ways: branch `feat/drop-sluice` on origin (replayed
-onto scrubbed history, so it is safe to push), branch
-`wip/drop-sluice-rescued` on the second host (**never push this** — its
-ancestry contains the pre-scrub commits), and a patch plus tarball in
-`~/switchboard-sluice-removal-rescue`.
+It is preserved on origin as branch `feat/drop-sluice`, replayed onto
+scrubbed history — the replay's tree hash was verified byte-identical to the
+rescued original before anything was deleted. A patch and tarball also remain
+in `~/switchboard-sluice-removal-rescue`.
+
+The second host has since been reset to scrubbed `origin/main`, its
+pre-scrub branch deleted and its objects pruned: no reachable commit there
+contains the redacted work-domain string. That clone was the last place
+pre-scrub history survived.
 
 The work is real and it passes: **411 tests green at its base, with no
 `sluice` import remaining in `src/`.** It vendors the flow-control core
@@ -57,17 +61,14 @@ instead**, in the order that minimises hand-merging.
 The insight is that most of the removal is *new files*, which conflict with
 nothing:
 
-1. **Land the new modules first, unused. — DONE (merge d695579).** All six
-   modules and the fixture are on main as pure additions: no sluice import in
-   any of them, all importable, ruff and mypy clean across 22 source files,
-   and the suite unchanged at 463 passing. Nothing imports them yet, so
-   behaviour is untouched and sluice is still the live dependency.
-   *(original text)* `limit.py`, `gate.py`,
-   `reconcile.py`, `session.py`, `truth.py`, `utils.py` and
-   `tests/fixtures/readings.json` are additions. Cherry-pick them onto main
-   with their tests and merge them while nothing imports them. Main keeps
-   depending on sluice at this point and stays green. This is the large,
-   reviewable, low-risk half.
+1. **Land the new modules first, unused. — DONE (merge `d695579`).**
+   `limit.py`, `gate.py`, `reconcile.py`, `session.py`, `truth.py`,
+   `utils.py` and `tests/fixtures/readings.json` are additions, so they
+   conflict with nothing. They are now on main (1,898 lines) with nothing
+   importing them: no sluice import in any of the six, all import cleanly,
+   ruff and mypy clean across 22 source files, suite unchanged at 463
+   passing. sluice is still the live dependency and behaviour is untouched.
+   This was the large, reviewable, low-risk half.
 2. **Then switch the call sites, one module at a time**, in dependency order:
    `providers.py` → `dashboard.py` → `admin.py` → `cli.py` → `proxy.py`.
    Each step is a small diff against *current* main rather than a merge
