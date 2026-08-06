@@ -62,25 +62,40 @@ parallel, and a wave starts only when the previous one is merged.
    proceeding; that is a finding, not an obstacle.
 2. sluice must be checked out as a **sibling directory** (`../sluice`). The
    public PyPI `sluice` is an unrelated package and must never be installed.
-3. Verify with all three, and paste the output in the handoff:
+   **Related supply-chain trap, verified the hard way:** `switchboard` ALSO
+   has a public namesake (1.6.9, unrelated), which outranks our 0.1.0. Any
+   install that resolves either name against an index can silently fetch a
+   stranger's package — `--find-links` supplements the index, it does not
+   replace it. Install first-party wheels by explicit file path and verify
+   the installed version, never the build's exit code.
+3. **Tell every implementer that reads outside the repo are auto-rejected,
+   and that the rejection is not fatal.** This is the single largest cause of
+   wasted delegations so far: three of five runs died after an agent tried to
+   grep `../sluice`, hit the sandbox, and gave up — each having done real
+   work first. One sentence in the prompt ("you can only read this repo; if
+   you think you need sluice internals, state the assumption and continue")
+   turned a failing run into a passing one. Tasks that GENUINELY need the
+   sibling checkout (the container build) are not delegable under this
+   sandbox and should be done directly.
+4. Verify with all three, and paste the output in the handoff:
    ```
    uv run --extra dev --with pip pytest -q     # --with pip: uv venvs lack it,
    uv run --extra dev ruff check src/ tests/   #   and test_wheel_install shells
    uv run --extra dev mypy src/switchboard/    #   out to pip
    ```
-4. Mock upstreams in tests must return
+5. Mock upstreams in tests must return
    `httpx.Response(status, stream=_Stream(body))` where `_Stream` subclasses
    `httpx.AsyncByteStream`. `Response(content=...)` arrives pre-consumed, so
    the proxy's `aiter_raw()` loop raises `StreamConsumed` — and because the
    status line is sent first, **status-only assertions still pass while the
    body path silently fails**. This has already cost one round of debugging.
-5. One work item per branch, named `wi-017-<n>-<slug>`. Do not batch.
-6. **Give reviews room.** `openai/gpt-5.6-sol` reads deeply on this codebase:
+6. One work item per branch, named `wi-017-<n>-<slug>`. Do not batch.
+7. **Give reviews room.** `openai/gpt-5.6-sol` reads deeply on this codebase:
    two review runs at a 1500s ceiling died mid-analysis having produced
    nothing, which is worse than a narrow review that finishes. Allow ~2700s,
    scope each review to a single commit or work item, and tell the reviewer
    explicitly to budget its reading rather than survey the repo.
-7. **Confirm the model answers before delegating to it.** On 2026-08-06 two
+8. **Confirm the model answers before delegating to it.** On 2026-08-06 two
    work items were dispatched to `zai/glm-5.2`; both produced zero output
    tokens, and opencode retried the upstream **indefinitely** until an
    external timeout killed them — 25 minutes each, no work, no error surfaced
@@ -103,7 +118,7 @@ parallel, and a wave starts only when the previous one is merged.
    `alert=none`) throughout, because it tracks quota consumption and not
    account balance — evidence that the **reactive** signal (what the provider
    actually answered) deserves more trust than the proactive one.
-8. **Redirect stdin when backgrounding a delegated run: `< /dev/null`.**
+9. **Redirect stdin when backgrounding a delegated run: `< /dev/null`.**
    Without it, a backgrounded `opencode run` can hang before it ever creates
    a session — no tokens, no log line, no error, indistinguishable from slow
    work. Three runs burned 25–45 minutes each this way. The identical command
@@ -115,7 +130,7 @@ parallel, and a wave starts only when the previous one is merged.
    `~/.local/share/opencode/opencode.db` (`SELECT title, tokens_output FROM
    session ...`). A delegated run with zero output tokens after a minute has
    not started, whatever `ps` says.
-9. **Cross-lineage review before merge.** An implementation authored by
+10. **Cross-lineage review before merge.** An implementation authored by
    `zai/glm-5.2` must be reviewed by a different lineage (`openai/gpt-5.6-sol`
    or `opencode-go/deepseek-v4-flash`), per the estate's review gate. Reviewers
    cannot grep outside the repo, so if a review needs sluice internals, paste
