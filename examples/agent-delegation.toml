@@ -30,7 +30,7 @@ listen = "127.0.0.1:8900"
 # Keys come from the environment so they never land in a committed file.
 
 [provider.opencode-go]
-upstream = "https://opencode.ai/zen/go/v1"
+upstream = "https://opencode.ai/zen/go/v1"   # full API root; clients send /chat/completions
 type = "generic"
 target = 4
 api_key_env = "SWITCHBOARD_OPENCODE_GO_KEY"
@@ -41,8 +41,8 @@ type = "generic"
 target = 4
 api_key_env = "SWITCHBOARD_OLLAMA_CLOUD_KEY"
 
-[provider.zai]
-upstream = "https://api.z.ai/api/coding/paas/v4"
+[provider.zai-coding-plan]
+upstream = "https://api.z.ai/api/coding/paas/v4"  # no /v1 — see docs/deployment.md
 type = "generic"
 target = 2
 api_key_env = "SWITCHBOARD_ZAI_KEY"
@@ -55,7 +55,7 @@ api_key_env = "SWITCHBOARD_ZAI_KEY"
 # model family and its own generous allotment, so it is the natural second.
 
 [route.default]
-providers = ["opencode-go", "ollama-cloud", "zai"]
+providers = ["opencode-go", "ollama-cloud", "zai-coding-plan"]
 
 # ── usage-error reroute ──────────────────────────────────────────────────
 #
@@ -85,7 +85,7 @@ ollama-cloud = "kimi-k3"
 [model."glm-5.2"]
 opencode-go = "glm-5.2"
 ollama-cloud = "glm-5.2"
-zai = "glm-5.2"
+zai-coding-plan = "glm-5.2"
 
 # ── truth source ─────────────────────────────────────────────────────────
 #

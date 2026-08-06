@@ -38,6 +38,11 @@ data:
     # to start if a declared variable is absent or empty (fail-closed): it will
     # never fall back to forwarding the client's own credential upstream.
 
+    # Each upstream is the provider's COMPLETE API root, because switchboard
+    # appends the client's path verbatim. Clients must therefore be pointed at
+    # switchboard WITHOUT a version prefix and send /chat/completions. See
+    # docs/deployment.md — this is what lets providers with different path
+    # shapes (z.ai has no /v1) share one route.
     [provider.opencode-go]
     upstream = "https://opencode.ai/zen/go/v1"
     type = "generic"

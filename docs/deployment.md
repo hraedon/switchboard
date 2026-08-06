@@ -89,6 +89,49 @@ docker run -d --name switchboard \
 - `--listen 0.0.0.0:<port>` is required in a container; the default binds
   loopback, which is unreachable from outside the namespace.
 
+## Path shape: put each provider's API root in `upstream`
+
+switchboard builds the upstream URL as `upstream` + **the client's full
+path**. It does not rewrite paths. That single fact decides how every
+provider must be configured, and getting it wrong produces 404s that look
+like routing failures.
+
+**Configure `upstream` as the provider's complete API root, and point
+clients at switchboard WITHOUT a version prefix**, so the path they send is
+just the operation:
+
+```toml
+[provider.opencode-go]
+upstream = "https://opencode.ai/zen/go/v1"      # note: /zen/go/v1, not /zen/v1
+
+[provider.ollama-cloud]
+upstream = "https://ollama.com/v1"
+
+[provider.zai-coding-plan]
+upstream = "https://api.z.ai/api/coding/paas/v4"  # no /v1 segment at all
+```
+
+Client (e.g. an opencode provider entry):
+
+```jsonc
+"options": { "baseURL": "http://switchboard:8801" }   // NOT ".../v1"
+```
+
+The client then sends `POST /chat/completions`, which appends cleanly to
+every root above — including z.ai, whose API has no `/v1` segment and which
+therefore **cannot** be reached if clients send `/v1/chat/completions`.
+
+Getting this backwards is the trap. If a client sends `/v1/...` you must
+strip `/v1` from every `upstream`, and any provider whose real root is not
+`<origin>/v1` becomes unroutable — you would be forced to leave it out of
+the route entirely. Verified on the mvmcc03 pilot: with operation-style
+paths, opencode-go, ollama-cloud and zai-coding-plan all serve from one
+route; with `/v1` client paths, zai cannot be included at all.
+
+If you ever need to mix clients that disagree about the prefix, that is when
+switchboard would need a per-provider path rewrite. It does not have one,
+and this convention removes the need for it.
+
 ## Health endpoints
 
 | path | meaning | use |
