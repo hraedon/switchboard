@@ -13,6 +13,7 @@ from switchboard.cli import (
     _resolve,
     _resolve_float,
     _validate_config,
+    _validate_config_pre_build,
 )
 
 
@@ -216,6 +217,22 @@ class TestResolvePrecedence:
         args = _serve_args()
         assert _resolve_float("queue_timeout", args, {}) == 30.0
 
+    def test_resolve_float_rejects_invalid_config_string(self) -> None:
+        args = _serve_args()
+        with pytest.raises(_ConfigError, match="queue_timeout"):
+            _resolve_float("queue_timeout", args, {"queue_timeout": "abc"})
+
+    def test_resolve_float_rejects_bool_config(self) -> None:
+        args = _serve_args()
+        with pytest.raises(_ConfigError, match="queue_timeout"):
+            _resolve_float("queue_timeout", args, {"queue_timeout": True})
+
+    def test_resolve_float_rejects_invalid_env(self, monkeypatch) -> None:
+        args = _serve_args()
+        monkeypatch.setenv("SWITCHBOARD_QUEUE_TIMEOUT", "abc")
+        with pytest.raises(_ConfigError, match="queue_timeout"):
+            _resolve_float("queue_timeout", args, {})
+
 
 class TestServeAppPrecedence:
     """End-to-end wiring: the resolved values reach the bind parameters."""
@@ -261,4 +278,93 @@ class TestServeAppPrecedence:
             tmp_path, 'admin_token = "s3cret"\n' + _SERVE_PROVIDER
         )
         app, _, _, _, _ = _build_serve_app(_serve_args(config=cfg))
+        assert app._admin_token == "s3cret"
+
+
+class TestServeKeyValidation:
+    """Config values must be validated as strictly as the equivalent flags.
+
+    A typo like ``log_level = "WARN"`` or ``queue_timeout = "abc"`` must
+    fail startup with a switchboard error naming the key (WI-3b).
+    """
+
+    def test_valid_serve_keys_pass(self) -> None:
+        cfg = _base_config()
+        cfg["log_level"] = "WARNING"
+        cfg["queue_timeout"] = 12.5
+        cfg["drain_timeout"] = 17.0
+        cfg["listen"] = "127.0.0.1:8900"
+        cfg["admin_token"] = "s3cret"
+        _validate_config_pre_build(cfg)
+
+    def test_invalid_log_level_rejected(self) -> None:
+        with pytest.raises(_ConfigError, match="log_level"):
+            _validate_config_pre_build({"log_level": "WARN"})
+
+    def test_non_string_log_level_rejected(self) -> None:
+        with pytest.raises(_ConfigError, match="log_level"):
+            _validate_config_pre_build({"log_level": 1})
+
+    def test_string_queue_timeout_rejected(self) -> None:
+        with pytest.raises(_ConfigError, match="queue_timeout"):
+            _validate_config_pre_build({"queue_timeout": "abc"})
+
+    def test_bool_queue_timeout_rejected(self) -> None:
+        with pytest.raises(_ConfigError, match="queue_timeout"):
+            _validate_config_pre_build({"queue_timeout": True})
+
+    def test_string_drain_timeout_rejected(self) -> None:
+        with pytest.raises(_ConfigError, match="drain_timeout"):
+            _validate_config_pre_build({"drain_timeout": "abc"})
+
+    def test_non_string_listen_rejected(self) -> None:
+        with pytest.raises(_ConfigError, match="listen"):
+            _validate_config_pre_build({"listen": 42})
+
+    def test_non_string_admin_token_rejected(self) -> None:
+        with pytest.raises(_ConfigError, match="admin_token"):
+            _validate_config_pre_build({"admin_token": 42})
+
+
+class TestServeKeyStartup:
+    """The invalid values fail the serve startup path, not just validation."""
+
+    def test_bad_log_level_fails_startup(self, tmp_path) -> None:
+        cfg = _write_serve_config(
+            tmp_path, 'log_level = "WARN"\n' + _SERVE_PROVIDER
+        )
+        with pytest.raises(_ConfigError, match="log_level"):
+            _build_serve_app(_serve_args(config=cfg))
+
+    def test_string_queue_timeout_fails_startup(self, tmp_path) -> None:
+        cfg = _write_serve_config(
+            tmp_path, 'queue_timeout = "abc"\n' + _SERVE_PROVIDER
+        )
+        with pytest.raises(_ConfigError, match="queue_timeout"):
+            _build_serve_app(_serve_args(config=cfg))
+
+    def test_bool_queue_timeout_fails_startup(self, tmp_path) -> None:
+        cfg = _write_serve_config(
+            tmp_path, "queue_timeout = true\n" + _SERVE_PROVIDER
+        )
+        with pytest.raises(_ConfigError, match="queue_timeout"):
+            _build_serve_app(_serve_args(config=cfg))
+
+    def test_valid_config_starts(self, tmp_path) -> None:
+        cfg = _write_serve_config(
+            tmp_path,
+            "listen = \"127.0.0.1:8899\"\n"
+            "queue_timeout = 12.5\n"
+            "drain_timeout = 17.0\n"
+            "log_level = \"WARNING\"\n"
+            'admin_token = "s3cret"\n'
+            + _SERVE_PROVIDER,
+        )
+        app, host, port, log_level, drain_timeout = _build_serve_app(
+            _serve_args(config=cfg)
+        )
+        assert (host, port) == ("127.0.0.1", 8899)
+        assert app._queue_timeout == 12.5
+        assert drain_timeout == 17.0
+        assert log_level == "warning"
         assert app._admin_token == "s3cret"

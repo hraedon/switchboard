@@ -31,6 +31,8 @@ _DEFAULTS: dict[str, Any] = {
     "route_table_store": None,
 }
 
+_LOG_LEVEL_CHOICES = ("DEBUG", "INFO", "WARNING", "ERROR")
+
 
 class _ConfigError(Exception):
     """Raised when the configuration is invalid."""
@@ -64,12 +66,34 @@ def _resolve_float(
     args: argparse.Namespace,
     config_data: dict[str, Any] | None = None,
 ) -> float:
-    """Resolve a float config value."""
-    value = _resolve(key, args, config_data)
-    try:
+    """Resolve a float config value: flag → env var → config file → default.
+
+    A present-but-invalid value raises ``_ConfigError`` naming the key
+    instead of silently substituting the default: a typo'd timeout must
+    fail startup. "Absent" (no flag, env var, or config key) still uses
+    the built-in default. Explicit type checks reject booleans, which
+    ``float(True)`` would otherwise silently turn into ``1.0``.
+    """
+    flag_value = getattr(args, key, None)
+    if flag_value is not None:
+        return float(flag_value)
+    env_key = f"{_ENV_PREFIX}{key.upper()}"
+    env_value = os.environ.get(env_key)
+    if env_value is not None:
+        try:
+            return float(env_value)
+        except ValueError:
+            raise _ConfigError(
+                f"{key}: {env_key} is not a number: {env_value!r}"
+            ) from None
+    if config_data is not None and key in config_data:
+        value = config_data[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise _ConfigError(
+                f"{key}: config value must be a number, got {value!r}"
+            )
         return float(value)
-    except (ValueError, TypeError):
-        return float(_DEFAULTS[key])
+    return float(_DEFAULTS[key])
 
 
 def _load_toml_config(path: str) -> dict[str, Any]:
@@ -107,18 +131,57 @@ def _validate_provider_config(
     return errors
 
 
+def _validate_serve_keys(config_data: dict[str, Any]) -> list[str]:
+    """Validate top-level serve keys present in the TOML config (WI-3b).
+
+    Mirrors the validation argparse applies to the equivalent CLI flag, so a
+    config typo fails startup with a switchboard error instead of surfacing
+    later as a uvicorn error or a silently substituted default.
+    """
+    errors: list[str] = []
+
+    log_level = config_data.get("log_level")
+    if log_level is not None:
+        if not isinstance(log_level, str):
+            errors.append(f"log_level must be a string, got {log_level!r}")
+        elif log_level not in _LOG_LEVEL_CHOICES:
+            errors.append(
+                "log_level must be one of "
+                + ", ".join(_LOG_LEVEL_CHOICES)
+                + f" (got {log_level!r})"
+            )
+
+    for key in ("queue_timeout", "drain_timeout"):
+        value = config_data.get(key)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float))
+        ):
+            errors.append(f"{key} must be a number, got {value!r}")
+
+    listen = config_data.get("listen")
+    if listen is not None and not isinstance(listen, str):
+        errors.append(f"listen must be a string, got {listen!r}")
+
+    admin_token = config_data.get("admin_token")
+    if admin_token is not None and not isinstance(admin_token, str):
+        errors.append(f"admin_token must be a string, got {admin_token!r}")
+
+    return errors
+
+
 def _validate_config_pre_build(
     config_data: dict[str, Any],
 ) -> None:
-    """Validate config before building provider contexts (WI-006.8).
+    """Validate config before building provider contexts (WI-006.8, WI-3b).
 
     Checks that don't need live provider contexts: empty upstreams,
-    invalid targets, duplicate names, unknown provider types, and
-    hashed-key format for file-defined routes.
+    invalid targets, duplicate names, unknown provider types, hashed-key
+    format for file-defined routes, and top-level serve keys.
     """
     import re
 
     errors: list[str] = []
+    errors.extend(_validate_serve_keys(config_data))
 
     raw_providers = config_data.get("provider", {})
     if isinstance(raw_providers, dict):
@@ -451,7 +514,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--log-level",
         default=None,
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        choices=_LOG_LEVEL_CHOICES,
     )
     serve.add_argument(
         "--queue-timeout",
