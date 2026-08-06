@@ -103,7 +103,19 @@ parallel, and a wave starts only when the previous one is merged.
    `alert=none`) throughout, because it tracks quota consumption and not
    account balance — evidence that the **reactive** signal (what the provider
    actually answered) deserves more trust than the proactive one.
-8. **Cross-lineage review before merge.** An implementation authored by
+8. **Redirect stdin when backgrounding a delegated run: `< /dev/null`.**
+   Without it, a backgrounded `opencode run` can hang before it ever creates
+   a session — no tokens, no log line, no error, indistinguishable from slow
+   work. Three runs burned 25–45 minutes each this way. The identical command
+   in the foreground started reviewing instantly, which is the cheapest way to
+   tell a hung launch from a genuinely slow model.
+
+   Corollary for anyone automating this: **process liveness is not progress.**
+   The reliable check is the session's token count in
+   `~/.local/share/opencode/opencode.db` (`SELECT title, tokens_output FROM
+   session ...`). A delegated run with zero output tokens after a minute has
+   not started, whatever `ps` says.
+9. **Cross-lineage review before merge.** An implementation authored by
    `zai/glm-5.2` must be reviewed by a different lineage (`openai/gpt-5.6-sol`
    or `opencode-go/deepseek-v4-flash`), per the estate's review gate. Reviewers
    cannot grep outside the repo, so if a review needs sluice internals, paste
