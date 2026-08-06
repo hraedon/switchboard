@@ -1,6 +1,45 @@
 # Plan 007 — Stable shared flow-control substrate
 
-Status: proposed coordinated sluice/switchboard execution plan
+Status: **partially implemented** — the coupling rules shipped and are
+enforced; the substrate extraction (snapshots, lease protocol, shared
+streaming lifecycle) did not land as a separate package
+
+Landed:
+
+- §2 decision holds: switchboard composes sluice's single gate/reconcile/
+  breaker implementation (`PermitGate`, `ReconciliationLoop`,
+  `Provider`/`TruthSource`/`get_provider`/`make_truth_source`, breaker and
+  adaptive config from `sluice.control`) rather than carrying copies, and
+  sluice remains a separate repository consumed as a library
+  (`pyproject.toml` `sluice` path source; CI installs
+  `sluice @ git+https://github.com/hraedon/sluice.git`).
+- §3 / WI-007.5 underscore-import prohibition: enforced by
+  `tests/test_import_boundary.py::test_no_underscore_imports_from_sluice`
+  (AST-walks every `from sluice import ...` and rejects `_`-prefixed names).
+  switchboard imports only public sluice admin/session helpers
+  (`send_json`, `check_admin_auth`, `mint_session`, `SESSION_COOKIE`, …) —
+  never sluice's `ProxyApp`, CLI, static assets, or mutable singleton state.
+- "Shared package imports neither application" holds: sluice has no
+  switchboard dependency.
+
+Not landed:
+
+- WI-007.3 public snapshots: no `GateSnapshot`/`ReconcileSnapshot` frozen
+  values. switchboard reads sluice's live public accessors
+  (`ctx.gate.available`, `ctx.gate.queue_depth`,
+  `ctx.reconcile.gate_closed_reason()`, `ready`, `last_fetch_ok`).
+- §4 `try_acquire`/`Lease` protocol: not added. The proxy uses
+  `PermitGate.acquire(timeout=0.0)` for non-blocking try-acquire.
+- WI-007.4 shared streaming lifecycle: not extracted. switchboard's streaming
+  core is *adapted from* sluice's `_forward()` (`src/switchboard/proxy.py`),
+  not imported — the byte-forwarding state machine still lives in both
+  products, so the acceptance criteria "both applications use the same
+  gate/reconcile/stream substrate" and "no safety-sensitive implementation is
+  independently copied" are met for gate/reconcile/breaker but **not** for the
+  streaming lifecycle.
+- WI-007.6 release discipline: the `sluice>=1.3.9,<2.0` pin exists, but there
+  is no dedicated substrate versioning/release and no minimum-version CI
+  matrix dimension.
 
 Depends on: Plan 006 dependency declaration and correctness contract
 

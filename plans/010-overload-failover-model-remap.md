@@ -1,6 +1,38 @@
 # Plan 010 — Overloaded-response failover with model remapping
 
-Status: proposed execution plan
+Status: **implemented** (Features A, B, C and the reactive backstop; Feature 0
+surfacing landed; one sluice release/pin tail remains — see WI-0b, which this
+plan already marks PARTIAL)
+
+Evidence (do not re-plan; this work is in the code and under test):
+
+- Feature 0 (proactive, sluice-surfaced low-interactivity): switchboard
+  consumes `ctx.reconcile.is_low_interactivity()` in `src/switchboard/proxy.py`
+  (terminal 503 + Retry-After derived from `service_mode_resets_at_epoch`) and
+  `snapshot_provider_state` maps it to `CLOSED` (`src/switchboard/providers.py`).
+  The sluice accessors (`ReconciliationLoop.is_low_interactivity()` /
+  `low_interactivity_retry_after()` and the `/status.json` field) exist in the
+  sibling repo but are not yet released — WI-0b's open tail is the sluice
+  v1.4.0 tag/release and the switchboard `sluice>=1.4.0` pin bump (pyproject
+  still pins `sluice>=1.3.9,<2.0`).
+- Feature A (reactive overload breaker): `switchboard/overload.py`
+  `OverloadTracker` (`record_overloaded`/`record_ok`/`is_cooling`); proxy
+  classification of `overload_statuses` (503/529) beside the existing 429
+  block (`src/switchboard/proxy.py`); `snapshot_provider_state` maps
+  `is_cooling` → `CLOSED`. Tests `tests/test_overload.py` and
+  `test_snapshot_overload_*` in `tests/test_providers.py`.
+- Feature B (model remap): `ModelMap` (`providers_for`/`alias_for`,
+  `src/switchboard/control.py`), `_rewrite_model_field` and servable-provider
+  filtering in `src/switchboard/proxy.py` / `route_decision`. Integration
+  `tests/test_integration_plan010.py::test_overload_failover_with_model_rewrite`
+  (3x503 → failover with rewritten model); no-map path stays byte-transparent
+  (`test_no_model_map_full_passthrough`).
+- Reactive backstop (usage-error reroute): `should_reroute` in
+  `src/switchboard/control.py` (commits 8e89fbf, 1402ff8), tests
+  `tests/test_usage_reroute.py`.
+- Feature C (threshold estimator): `switchboard/threshold.py` +
+  `switchboard/estimator.py` (WI-9/10), tests `tests/test_threshold.py`,
+  `tests/test_estimator.py`.
 
 Depends on: Plan 006 (categorical routing), Plan 008 (production contracts)
 

@@ -1,6 +1,55 @@
 # Plan 008 — Production routing contracts and deployment shape
 
-Status: proposed execution plan
+Status: **partially implemented** — capability contract, capability
+filtering, stickiness/failback and the failure/replay boundary shipped;
+identity-HMAC, explicit modes, versioned config, singleton lifecycle,
+credential-broker protocol and admin-plane isolation did not
+
+Landed:
+
+- §4 capability contract (WI-008.3): `ProviderCapabilities` with
+  `surfaces`/`api_family`/`streaming`/`tool_calling_profile`/`context_class`/
+  `credential_domain`/`cache_domain` in `src/switchboard/control.py`.
+  `route_decision` filters incompatible candidates before pressure/admission
+  ranking via `_satisfies_capabilities` against
+  `RouteEntry.required_capabilities` (decision reason `capability_filtered`).
+  Body-free — capabilities are never inferred from request bodies. Tests
+  `test_capability_filter_*` in `tests/test_control.py`.
+- §5 stickiness/failback (WI-008.4): `RouteAffinity` + `dwell_interval` +
+  affinity_dwell / affinity_hysteresis in `route_decision`; bounded, ephemeral
+  (per-process memory, matching §9). Tests `test_affinity_*` in
+  `tests/test_control.py`.
+- §6 failure/replay boundary: enforced by the usage-error reroute's pure
+  predicate `should_reroute` (`src/switchboard/control.py`) — never after
+  `response_started`, never when `body_replayable` is false (upload started /
+  streamed body consumed).
+- Per-provider egress credentials (partial §2.2 direction): each upstream
+  receives its own stored credential via `api_key_env` (commit 6f6591b);
+  `test_each_provider_receives_its_own_credential` in
+  `tests/test_usage_reroute.py`.
+
+Not landed:
+
+- WI-008.1 versioned config schema + `switchboard config validate` subcommand:
+  only inline serve-time validation (`_validate_config`,
+  `src/switchboard/cli.py`); no versioned schema, migrations, or standalone
+  validator.
+- §2 explicit operating modes and §2.3 mode gate: no transparent/broker mode
+  selection or startup mode validation.
+- §3 route identifiers as HMAC-SHA-256 with a rotatable route-index key:
+  `hash_route_key` (`src/switchboard/control.py`) is plain unkeyed SHA-256.
+- WI-008.6 singleton/fenced production lifecycle: no leadership lease,
+  leadership-aware readiness, or *leadership-tied* drain. Note that a
+  graceful-shutdown drain IS shipped and tested — `--drain-timeout`
+  (`cli.py`), `_draining` plus the lifespan handler that waits for every
+  gate to reach `held == 0` or the deadline (`proxy.py`), 503-with-reason
+  admission while draining, and `test_proxy_draining_returns_503`. What is
+  missing is only the singleton/fenced lifecycle wrapped around it, not
+  drain capability.
+- WI-008.7 credential-broker mode: no secret-provider protocol, rotation,
+  egress header allowlists, or redaction tests.
+- WI-008.8 admin-plane isolation: the admin plane runs on the same listener
+  behind `--admin-token`; there is no separate admin binding or Unix socket.
 
 Depends on: Plan 006; may proceed alongside later stages of Plan 007
 

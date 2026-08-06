@@ -1,6 +1,49 @@
 # Plan 006 — Routing and admission correctness recovery
 
-Status: proposed immediate execution plan
+Status: **implemented** (landed in commit b8d5178 "feat: implement plans
+001-006" plus later refinements; all eight work items shipped)
+
+Evidence (do not re-plan; this work is in the code and under test):
+
+- Categorical eligibility and ordered admission: `Availability`,
+  `SignalFreshness`, `AdmissionPlan` and `route_decision`
+  (`src/switchboard/control.py`); the proxy consumes the plan in `_admit`
+  (`src/switchboard/proxy.py`) — try every immediate candidate non-blocking,
+  a second non-blocking pass on snapshot-race loss, queue only on
+  `queue_candidate`.
+- WI-006.1 live saturation: `snapshot_provider_state`
+  (`src/switchboard/providers.py`) derives `BUSY` from `gate.available == 0`
+  or `queue_depth > 0`; test `test_snapshot_provider_state_all_permits_held_is_busy`.
+- WI-006.2 stale-fails-safe: `SignalFreshness` FRESH/DEGRADED/UNKNOWN with
+  fresh-only-for-failover; tests `test_primary_unknown_excluded_from_failover`,
+  `test_stale_fallback_not_preferred_over_busy_primary`,
+  `test_degraded_primary_can_stay`, `test_degraded_fallback_not_failover_target`.
+- WI-006.3 ordered immediate admission: `_admit` (see above); tests
+  `test_admit_immediate_failover_to_idle_fallback` (no queue wait),
+  `test_admit_race_fills_primary_tries_next`,
+  `test_admit_queue_wait_uses_remaining_budget`.
+- WI-006.4 bounded observability: `RoutingMetrics.recent_decisions` bounded
+  ring (`_RECENT_DECISIONS_MAX = 128`) with `evicted_decisions` counter
+  (`src/switchboard/proxy.py`); tests
+  `test_routing_metrics_bounded_recent_decisions`,
+  `test_routing_metrics_bounded_with_many_unique_keys`.
+- WI-006.5 sluice dependency: `pyproject.toml` pins `sluice>=1.3.9,<2.0` with
+  an explicit path source; clean wheel install proven by
+  `tests/test_wheel_install.py::test_clean_wheel_install`.
+- WI-006.6 dashboard cadence: `dashboard_poll_interval` is passed into the
+  `ReconciliationLoop` (`src/switchboard/providers.py`).
+- WI-006.7 persistence: SQLite route-table store behind `--route-table-store`
+  (`src/switchboard/route_table.py`, `src/switchboard/cli.py`); restart
+  survival proven by `test_sqlite_persistence_add_entry_survives_new_manager`,
+  `test_sqlite_persistence_remove_entry_gone_in_new_manager`.
+- WI-006.8 config validation: `_validate_config` / `_validate_provider_config`
+  (`src/switchboard/cli.py`) reject empty/invalid/unknown configuration
+  references at startup.
+- Routing-invariant property tests: `test_closed_never_in_immediate`,
+  `test_unknown_never_outranks_fresh`,
+  `test_plan_contains_only_configured_providers`, `test_same_inputs_same_plan`,
+  `test_no_provider_appears_twice_in_immediate`,
+  `test_terminal_fallback_always_primary`.
 
 Priority: release-blocking
 
