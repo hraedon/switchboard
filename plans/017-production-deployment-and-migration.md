@@ -80,7 +80,23 @@ parallel, and a wave starts only when the previous one is merged.
    nothing, which is worse than a narrow review that finishes. Allow ~2700s,
    scope each review to a single commit or work item, and tell the reviewer
    explicitly to budget its reading rather than survey the repo.
-7. **Cross-lineage review before merge.** An implementation authored by
+7. **Confirm the model answers before delegating to it.** On 2026-08-06 two
+   work items were dispatched to `zai/glm-5.2`; both produced zero output
+   tokens, and opencode retried the upstream **indefinitely** until an
+   external timeout killed them — 25 minutes each, no work, no error surfaced
+   to the caller. The provider was returning `Insufficient balance or no
+   resource package`. Send a one-line probe to a model before handing it a
+   work item, and note that a delegated run that produces nothing looks
+   identical to one that is merely slow.
+
+   Two lessons worth carrying beyond this plan. First, this is precisely the
+   failure switchboard exists to remove: a 402-class exhaustion response that
+   a client turns into an infinite retry. Second, the usage-dashboard
+   reported that same provider as entirely healthy (`throttle=none`,
+   `alert=none`) throughout, because it tracks quota consumption and not
+   account balance — evidence that the **reactive** signal (what the provider
+   actually answered) deserves more trust than the proactive one.
+8. **Cross-lineage review before merge.** An implementation authored by
    `zai/glm-5.2` must be reviewed by a different lineage (`openai/gpt-5.6-sol`
    or `opencode-go/deepseek-v4-flash`), per the estate's review gate. Reviewers
    cannot grep outside the repo, so if a review needs sluice internals, paste
