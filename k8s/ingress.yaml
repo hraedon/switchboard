@@ -9,10 +9,10 @@
 # still keep it off the public internet, but DO NOT test that assumption. Keep
 # the host on an internal-only DNS name.
 #
-# Host and TLS secret are PLACEHOLDERS (RFC 2606 .example TLD) — replace with
-# the estate's internal hostname and matching `<host>-tls` secret name before
-# apply. cert-manager will mint the secret via letsencrypt-prod-porkbun once
-# the DNS record exists.
+# The host is the estate's internal name (CNAME to ingress.k8s.hraedon.com in
+# the internal zone); cert-manager mints the TLS secret via
+# letsencrypt-prod-porkbun DNS-01, so issuance does not require the host to
+# resolve publicly.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -27,10 +27,10 @@ spec:
   ingressClassName: traefik-internal
   tls:
     - hosts:
-        - switchboard.internal.example
-      secretName: switchboard.internal.example-tls
+        - switchboard.k8s.hraedon.com
+      secretName: switchboard-k8s-hraedon-com-tls
   rules:
-    - host: switchboard.internal.example
+    - host: switchboard.k8s.hraedon.com
       http:
         paths:
           - path: /
