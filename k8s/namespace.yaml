@@ -1,0 +1,8 @@
+# switchboard gets a namespace of its own, mirroring the usage-dashboard
+# deployment convention.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: switchboard
+  labels:
+    app: switchboard

@@ -1,0 +1,42 @@
+# Internal-only ingress for switchboard.
+#
+# switchboard holds EVERY provider credential and, by design, will spend them
+# on behalf of whoever asks. It must therefore never be reachable from outside
+# the LAN. This is enforced structurally, not by convention: the `traefik-
+# internal` ingress class only binds the internal (LAN) ingress controller, and
+# cert-manager issues a real certificate for the host below — so if the host
+# placeholder is replaced with a public DNS name, the internal class should
+# still keep it off the public internet, but DO NOT test that assumption. Keep
+# the host on an internal-only DNS name.
+#
+# Host and TLS secret are PLACEHOLDERS (RFC 2606 .example TLD) — replace with
+# the estate's internal hostname and matching `<host>-tls` secret name before
+# apply. cert-manager will mint the secret via letsencrypt-prod-porkbun once
+# the DNS record exists.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: switchboard
+  namespace: switchboard
+  labels:
+    app: switchboard
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod-porkbun
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  ingressClassName: traefik-internal
+  tls:
+    - hosts:
+        - switchboard.internal.example
+      secretName: switchboard.internal.example-tls
+  rules:
+    - host: switchboard.internal.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: switchboard
+                port:
+                  name: http
