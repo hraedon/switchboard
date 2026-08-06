@@ -62,6 +62,17 @@ class ProviderContext:
     usage_base_url: str | None = None
     usage_api_key: str = ""
     usage_auth_header: str = "authorization"
+    #: Credential to present to THIS upstream, replacing whatever the client
+    #: sent. Required for cross-vendor failover: each provider issues its own
+    #: key, so forwarding the client's verbatim would 401 the moment a request
+    #: moves. Empty means passthrough (byte-identical egress preserved).
+    api_key: str = ""
+    #: Header the upstream expects the credential in. OpenAI-compatible
+    #: gateways use `authorization: Bearer <key>`; some want `x-api-key`.
+    auth_header: str = "authorization"
+    #: Prefix applied to the credential — "Bearer " for authorization,
+    #: usually empty for x-api-key.
+    auth_prefix: str = "Bearer "
 
 
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
@@ -84,6 +95,9 @@ def build_provider_context(
     poll_interval_idle: float | None = None,
     history_store: HistoryStore | None = None,
     history: History | None = None,
+    api_key: str = "",
+    auth_header_name: str = "authorization",
+    auth_prefix: str = "Bearer ",
 ) -> ProviderContext:
     """Construct a :class:`ProviderContext` using sluice's building blocks.
 
@@ -154,6 +168,9 @@ def build_provider_context(
         usage_base_url=usage_base_url,
         usage_api_key=usage_api_key,
         usage_auth_header=usage_auth_header,
+        api_key=api_key,
+        auth_header=auth_header_name,
+        auth_prefix=auth_prefix,
     )
 
 
@@ -187,6 +204,20 @@ def build_provider_contexts_from_config(
         upstream = _str_or(provider_cfg, "upstream", "")
         provider_type = _str_or(provider_cfg, "type", "generic")
         target = _int_or(provider_cfg, "target", 3)
+
+        # Upstream credential. Env indirection is the norm here so keys never
+        # land in a committed config; an inline `api_key` stays available for
+        # throwaway local runs.
+        api_key = _str_or(provider_cfg, "api_key", "")
+        api_key_env = _optional_str(provider_cfg, "api_key_env")
+        if api_key_env:
+            api_key = os.environ.get(api_key_env, "")
+        auth_header_name = _str_or(provider_cfg, "auth_header", "authorization")
+        auth_prefix = _str_or(
+            provider_cfg,
+            "auth_prefix",
+            "Bearer " if auth_header_name.lower() == "authorization" else "",
+        )
 
         usage_key = ""
         usage_key_env = _optional_str(provider_cfg, "usage_key_env")
@@ -232,6 +263,9 @@ def build_provider_contexts_from_config(
             poll_interval_idle=poll_interval_idle,
             history_store=history_store,
             history=history,
+            api_key=api_key,
+            auth_header_name=auth_header_name,
+            auth_prefix=auth_prefix,
         )
 
     return contexts

@@ -24,20 +24,28 @@ listen = "127.0.0.1:8900"
 # stop switchboard from being the thing that overloads a provider, not to
 # throttle a human.
 
+# Each provider presents its OWN credential. This is not optional for
+# cross-vendor failover: a request rerouted from opencode-go to ollama-cloud
+# carrying the zen key would be rejected, turning "out of quota" into "401".
+# Keys come from the environment so they never land in a committed file.
+
 [provider.opencode-go]
 upstream = "https://opencode.ai/zen/v1"
 type = "generic"
 target = 4
+api_key_env = "SWITCHBOARD_OPENCODE_GO_KEY"
 
 [provider.ollama-cloud]
 upstream = "https://ollama.com/v1"
 type = "generic"
 target = 4
+api_key_env = "SWITCHBOARD_OLLAMA_CLOUD_KEY"
 
 [provider.zai]
 upstream = "https://api.z.ai/api/coding/paas/v4"
 type = "generic"
 target = 2
+api_key_env = "SWITCHBOARD_ZAI_KEY"
 
 # ── routing ──────────────────────────────────────────────────────────────
 #

@@ -1302,6 +1302,8 @@ class ProxyApp:
         watcher_task = asyncio.create_task(disconnect_watcher())
         response_started = False
 
+        headers = self._apply_provider_credential(ctx, headers)
+
         try:
             if buffered_body is not None:
                 content: Any = buffered_body
@@ -1600,6 +1602,31 @@ class ProxyApp:
         if qs:
             path += "?" + qs.decode("latin-1")
         return upstream + path
+
+    @staticmethod
+    def _apply_provider_credential(
+        ctx: ProviderContext, headers: list[tuple[str, str]]
+    ) -> list[tuple[str, str]]:
+        """Present this provider's own credential instead of the client's.
+
+        Cross-vendor failover is impossible without it: every provider issues
+        its own key, so a request rerouted from one to another would arrive
+        with a credential the new upstream has never seen and be rejected —
+        turning "your provider is out of quota" into "401", which is worse
+        than the problem the reroute exists to solve.
+
+        This narrows byte-identical egress by exactly one header, and only for
+        providers that configure a key. With none configured the client's
+        headers pass through untouched, so a single-vendor deployment keeps
+        full cache-transparency.
+        """
+        if not ctx.api_key:
+            return headers
+        target = ctx.auth_header.lower()
+        value = f"{ctx.auth_prefix}{ctx.api_key}"
+        out = [(k, v) for k, v in headers if k.lower() != target]
+        out.append((ctx.auth_header, value))
+        return out
 
     def _filter_request_headers(
         self, scope_headers: list[tuple[bytes, bytes]]

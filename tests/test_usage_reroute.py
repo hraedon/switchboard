@@ -397,3 +397,60 @@ class TestRerouteSafetyGaps:
             m.get("body", b"") for m in msgs if m["type"] == "http.response.body"
         )
         assert body == upstream_body
+
+
+@pytest.mark.asyncio
+class TestPerProviderCredentials:
+    """Cross-vendor failover is only real if the new upstream gets its own key.
+
+    Every provider issues its own credential, so forwarding the client's
+    verbatim would turn "provider A is out of quota" into "provider B says
+    401" — strictly worse than the problem rerouting exists to solve.
+    """
+
+    async def test_each_provider_receives_its_own_credential(self) -> None:
+        exhausted = _responder(429)
+        healthy = _responder(200)
+        a, b = _ctx("a", exhausted), _ctx("b", healthy)
+        a.api_key, b.api_key = "key-for-a", "key-for-b"
+        await _ready(a, b)
+        _msgs, send = _sender()
+
+        scope = _scope()
+        scope["headers"] = [
+            (b"content-type", b"application/json"),
+            (b"authorization", b"Bearer client-supplied-key"),
+        ]
+        await _app({"a": a, "b": b})(scope, _receive_body(), send)
+
+        assert exhausted.seen[0].headers["authorization"] == "Bearer key-for-a"
+        assert healthy.seen[0].headers["authorization"] == "Bearer key-for-b"
+
+    async def test_no_key_configured_passes_the_client_header_through(self) -> None:
+        """Single-vendor deployments keep byte-identical egress."""
+        healthy = _responder(200)
+        a = _ctx("a", healthy)
+        await _ready(a)
+        _msgs, send = _sender()
+
+        scope = _scope()
+        scope["headers"] = [
+            (b"content-type", b"application/json"),
+            (b"authorization", b"Bearer client-supplied-key"),
+        ]
+        await _app({"a": a})(scope, _receive_body(), send)
+
+        assert (
+            healthy.seen[0].headers["authorization"] == "Bearer client-supplied-key"
+        )
+
+    async def test_alternate_auth_header_and_prefix(self) -> None:
+        healthy = _responder(200)
+        a = _ctx("a", healthy)
+        a.api_key, a.auth_header, a.auth_prefix = "raw-key", "x-api-key", ""
+        await _ready(a)
+        _msgs, send = _sender()
+
+        await _app({"a": a})(_scope(), _receive_body(), send)
+
+        assert healthy.seen[0].headers["x-api-key"] == "raw-key"

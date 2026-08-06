@@ -54,6 +54,26 @@ top.
   never modified. Neither exception applies without explicit opt-in
   configuration.)*
 
+## Per-provider credentials
+
+```toml
+[provider.ollama-cloud]
+upstream = "https://ollama.com/v1"
+api_key_env = "SWITCHBOARD_OLLAMA_CLOUD_KEY"   # inline `api_key` also accepted
+auth_header = "authorization"                   # or e.g. "x-api-key"
+auth_prefix = "Bearer "                         # defaults by header
+```
+
+Each provider presents its own credential to its upstream, replacing whatever
+the client sent. This is a prerequisite for cross-vendor failover, not a
+convenience: providers issue their own keys, so a rerouted request carrying the
+original vendor's key would be rejected — converting "out of quota" into "401",
+which is worse than the failure rerouting exists to prevent.
+
+This narrows byte-identical egress by exactly one header, and only for providers
+that configure a key. With none configured the client's headers pass through
+untouched and single-vendor cache-transparency is unchanged.
+
 ## Usage-error reroute
 
 ```toml
