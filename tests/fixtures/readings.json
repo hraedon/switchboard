@@ -1,0 +1,48 @@
+[
+  {
+    "alert": "crit",
+    "detail": "283.8M / 305M tokens (approx) \u00b7 2,273 calls",
+    "fetched_at": "2026-08-04T04:35:38Z",
+    "models": null,
+    "provider": "zai",
+    "scoped_limits": null,
+    "session_percent": 0.0,
+    "session_resets_at": null,
+    "stale": false,
+    "status": "current",
+    "throttle": "none",
+    "weekly_percent": 93.0,
+    "weekly_resets_at": "2026-08-09T04:35:38Z"
+  },
+  {
+    "alert": "none",
+    "detail": null,
+    "fetched_at": "2026-08-04T04:35:38Z",
+    "models": [
+      {
+        "name": "llama3.3:70b",
+        "requests": 842,
+        "share_percent": 64.0
+      },
+      {
+        "name": "qwen3:32b",
+        "requests": 291,
+        "share_percent": 22.0
+      },
+      {
+        "name": "deepseek-r1:32b",
+        "requests": 182,
+        "share_percent": 14.0
+      }
+    ],
+    "provider": "ollama",
+    "scoped_limits": null,
+    "session_percent": 37.0,
+    "session_resets_at": "2026-08-04T07:35:38Z",
+    "stale": false,
+    "status": "current",
+    "throttle": "none",
+    "weekly_percent": 58.0,
+    "weekly_resets_at": "2026-08-08T04:35:38Z"
+  }
+]
