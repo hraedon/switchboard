@@ -36,8 +36,17 @@ class _ConfigError(Exception):
     """Raised when the configuration is invalid."""
 
 
-def _resolve(key: str, args: argparse.Namespace) -> Any:
-    """Resolve a config value: flag → env var → default."""
+def _resolve(
+    key: str,
+    args: argparse.Namespace,
+    config_data: dict[str, Any] | None = None,
+) -> Any:
+    """Resolve a config value: flag → env var → config file → default.
+
+    A top-level key in the TOML config only applies when neither the CLI
+    flag nor the ``SWITCHBOARD_<KEY>`` env var supplied a value; argparse's
+    ``default=None`` is treated as "not supplied", never as a user choice.
+    """
     flag_value = getattr(args, key, None)
     if flag_value is not None:
         return flag_value
@@ -45,12 +54,18 @@ def _resolve(key: str, args: argparse.Namespace) -> Any:
     env_value = os.environ.get(env_key)
     if env_value is not None:
         return env_value
+    if config_data is not None and key in config_data:
+        return config_data[key]
     return _DEFAULTS.get(key)
 
 
-def _resolve_float(key: str, args: argparse.Namespace) -> float:
+def _resolve_float(
+    key: str,
+    args: argparse.Namespace,
+    config_data: dict[str, Any] | None = None,
+) -> float:
     """Resolve a float config value."""
-    value = _resolve(key, args)
+    value = _resolve(key, args, config_data)
     try:
         return float(value)
     except (ValueError, TypeError):
@@ -691,15 +706,15 @@ def _build_serve_app(
                 parsed.add(raw_status)
             reroute_statuses = frozenset(parsed)
 
-    admin_token = _resolve("admin_token", args)
+    admin_token = _resolve("admin_token", args, config_data)
 
-    queue_timeout = _resolve_float("queue_timeout", args)
-    drain_timeout = _resolve_float("drain_timeout", args)
+    queue_timeout = _resolve_float("queue_timeout", args, config_data)
+    drain_timeout = _resolve_float("drain_timeout", args, config_data)
 
-    listen = _resolve("listen", args)
+    listen = _resolve("listen", args, config_data)
     host, port = _parse_listen(str(listen))
 
-    log_level = _resolve("log_level", args)
+    log_level = _resolve("log_level", args, config_data)
 
     estimator: ThresholdEstimator | None = None
     threshold_section = config_data.get("threshold", {})

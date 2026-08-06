@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import argparse
+import os
+
 import pytest
 
-from switchboard.cli import _ConfigError, _validate_config
+from switchboard.cli import (
+    _build_serve_app,
+    _ConfigError,
+    _resolve,
+    _resolve_float,
+    _validate_config,
+)
 
 
 def _base_config() -> dict:
@@ -127,3 +136,129 @@ def test_api_key_env_missing_fails_closed(tmp_path, monkeypatch) -> None:
     }
     with pytest.raises(ValueError, match="api_key_env"):
         build_provider_contexts_from_config(config)
+def _serve_args(**overrides: object) -> argparse.Namespace:
+    """Build the argparse Namespace `_build_serve_app` expects.
+
+    Every serve flag defaults to None (i.e. "not supplied"), matching
+    `build_parser()` so an omitted flag can never beat a config value.
+    """
+    defaults: dict[str, object] = {
+        "command": "serve",
+        "listen": None,
+        "config": None,
+        "admin_token": None,
+        "log_level": None,
+        "queue_timeout": None,
+        "drain_timeout": None,
+        "route_table_store": None,
+    }
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def _write_serve_config(tmp_path: pytest.TempPathFactory, body: str) -> str:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(body)
+    return str(cfg)
+
+
+_SERVE_PROVIDER = (
+    "[provider.umans]\n"
+    'upstream = "https://api.example.com"\n'
+    "target = 1\n"
+)
+
+
+class TestResolvePrecedence:
+    """Precedence is flag → env var → config file → built-in default."""
+
+    def test_cli_flag_wins_over_config(self) -> None:
+        args = _serve_args(listen="127.0.0.1:9999")
+        assert (
+            _resolve("listen", args, {"listen": "127.0.0.1:8900"})
+            == "127.0.0.1:9999"
+        )
+
+    def test_env_var_wins_over_config(self) -> None:
+        args = _serve_args()
+        os.environ["SWITCHBOARD_LISTEN"] = "127.0.0.1:7777"
+        try:
+            assert (
+                _resolve("listen", args, {"listen": "127.0.0.1:8900"})
+                == "127.0.0.1:7777"
+            )
+        finally:
+            del os.environ["SWITCHBOARD_LISTEN"]
+
+    def test_config_used_when_no_flag_or_env(self) -> None:
+        args = _serve_args()
+        assert (
+            _resolve("listen", args, {"listen": "127.0.0.1:8900"})
+            == "127.0.0.1:8900"
+        )
+
+    def test_default_used_when_no_config_key(self) -> None:
+        args = _serve_args()
+        assert _resolve("listen", args, {}) == "127.0.0.1:8801"
+
+    def test_default_used_when_no_config_file(self) -> None:
+        args = _serve_args()
+        assert _resolve("listen", args) == "127.0.0.1:8801"
+
+    def test_resolve_float_uses_config(self) -> None:
+        args = _serve_args()
+        assert (
+            _resolve_float("queue_timeout", args, {"queue_timeout": 12.5})
+            == 12.5
+        )
+
+    def test_resolve_float_uses_default(self) -> None:
+        args = _serve_args()
+        assert _resolve_float("queue_timeout", args, {}) == 30.0
+
+
+class TestServeAppPrecedence:
+    """End-to-end wiring: the resolved values reach the bind parameters."""
+
+    def test_listen_config_only(self, tmp_path) -> None:
+        cfg = _write_serve_config(
+            tmp_path, 'listen = "127.0.0.1:8900"\n' + _SERVE_PROVIDER
+        )
+        _, host, port, _, _ = _build_serve_app(_serve_args(config=cfg))
+        assert (host, port) == ("127.0.0.1", 8900)
+
+    def test_listen_cli_flag_wins_over_config(self, tmp_path) -> None:
+        cfg = _write_serve_config(
+            tmp_path, 'listen = "127.0.0.1:8900"\n' + _SERVE_PROVIDER
+        )
+        _, host, port, _, _ = _build_serve_app(
+            _serve_args(config=cfg, listen="127.0.0.1:9999")
+        )
+        assert (host, port) == ("127.0.0.1", 9999)
+
+    def test_listen_default_when_unconfigured(self, tmp_path) -> None:
+        cfg = _write_serve_config(tmp_path, _SERVE_PROVIDER)
+        _, host, port, _, _ = _build_serve_app(_serve_args(config=cfg))
+        assert (host, port) == ("127.0.0.1", 8801)
+
+    def test_queue_and_drain_timeouts_from_config(self, tmp_path) -> None:
+        cfg = _write_serve_config(
+            tmp_path,
+            "queue_timeout = 12.5\n"
+            "drain_timeout = 17.0\n"
+            "log_level = \"WARNING\"\n"
+            + _SERVE_PROVIDER,
+        )
+        app, _, _, log_level, drain_timeout = _build_serve_app(
+            _serve_args(config=cfg)
+        )
+        assert app._queue_timeout == 12.5
+        assert drain_timeout == 17.0
+        assert log_level == "warning"
+
+    def test_admin_token_from_config(self, tmp_path) -> None:
+        cfg = _write_serve_config(
+            tmp_path, 'admin_token = "s3cret"\n' + _SERVE_PROVIDER
+        )
+        app, _, _, _, _ = _build_serve_app(_serve_args(config=cfg))
+        assert app._admin_token == "s3cret"
