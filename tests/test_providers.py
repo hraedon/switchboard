@@ -4,14 +4,11 @@ import time
 
 import httpx
 import pytest
-from sluice.control import BreakerConfig, ControllerConfig, LimitState
-from sluice.gate import PermitGate
-from sluice.providers import NullTruthSource, PolledTruthSource
-from sluice.reconcile import ReconciliationLoop
-from sluice.usage import CachedReading
 
 from switchboard.control import Availability, ProviderState, SignalFreshness
 from switchboard.dashboard import DashboardTruthSource
+from switchboard.gate import PermitGate
+from switchboard.limit import BreakerConfig, CachedReading, LimitState
 from switchboard.overload import OverloadConfig, OverloadTracker
 from switchboard.providers import (
     ProviderContext,
@@ -19,6 +16,8 @@ from switchboard.providers import (
     build_provider_contexts_from_config,
     snapshot_provider_state,
 )
+from switchboard.reconcile import ReconciliationLoop
+from switchboard.truth import NullTruthSource, PolledTruthSource
 
 
 def test_build_provider_context_creates_context_with_all_components() -> None:
@@ -111,7 +110,7 @@ async def test_snapshot_provider_state_not_ready_is_unknown() -> None:
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=3),
+        max_concurrency=3,
         breaker_config=BreakerConfig(),
     )
     ctx = ProviderContext(
@@ -140,7 +139,7 @@ async def test_snapshot_provider_state_with_capacity_available() -> None:
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=3),
+        max_concurrency=3,
         breaker_config=BreakerConfig(),
     )
     reconcile._first_poll_ok = True
@@ -171,7 +170,7 @@ async def test_snapshot_provider_state_all_permits_held_is_busy() -> None:
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=2),
+        max_concurrency=2,
         breaker_config=BreakerConfig(),
     )
     reconcile._first_poll_ok = True
@@ -206,7 +205,7 @@ async def test_snapshot_provider_state_null_truth_is_fresh() -> None:
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=2),
+        max_concurrency=2,
         breaker_config=BreakerConfig(),
     )
     reconcile._first_poll_ok = True
@@ -242,7 +241,7 @@ def _make_ready_ctx(
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=capacity),
+        max_concurrency=capacity,
         breaker_config=BreakerConfig(),
     )
     reconcile._first_poll_ok = True
