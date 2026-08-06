@@ -89,11 +89,16 @@ zai = "glm-5.2"
 
 # ── truth source ─────────────────────────────────────────────────────────
 #
-# usage-dashboard already tracks claude/claude_work/zai/ollama/codex. Providers
-# it covers get proactive pressure signals (route away BEFORE the client eats an
-# error); providers it does not cover still get the reactive [reroute] backstop
-# above, which is why the backstop is provider-neutral by design.
+# usage-dashboard already tracks claude/claude_work/zai/ollama/codex.
+# Providers it covers can get PROACTIVE pressure signals (route away BEFORE
+# the client eats an error); providers it does not cover still get the
+# reactive [reroute] backstop above, which is why that backstop is
+# provider-neutral by design.
 #
-# [dashboard]
-# url = "https://usage.internal.example"
-# api_key = "REPLACE_ME"      # Authorization: Bearer <key>
+# These keys are PER PROVIDER, not a top-level [dashboard] table — an
+# earlier draft of this file had them at the top level, where they are
+# silently ignored. Add them inside the provider they describe:
+#
+#   [provider.ollama-cloud]
+#   dashboard_url = "https://usage.internal.example"
+#   dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"

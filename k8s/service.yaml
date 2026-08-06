@@ -1,0 +1,19 @@
+# ClusterIP service for switchboard. Internal-only: there is deliberately no
+# NodePort/LoadBalancer, and the ingress (k8s/ingress.yaml) is restricted to the
+# traefik-internal class. port == targetPort so the Service adds nothing on the
+# wire.
+apiVersion: v1
+kind: Service
+metadata:
+  name: switchboard
+  namespace: switchboard
+  labels:
+    app: switchboard
+spec:
+  type: ClusterIP
+  selector:
+    app: switchboard
+  ports:
+    - name: http
+      port: 8801
+      targetPort: 8801

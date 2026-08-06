@@ -1,0 +1,117 @@
+# switchboard Deployment.
+#
+# HARD RULE — DO NOT SCALE THIS. `replicas` is pinned to 1 on purpose.
+# Affinity (per-conversation provider stickiness), route-table state, gate
+# permit accounting, and token-budget counters are all per-process in-memory.
+# Running two replicas silently splits that state across processes: a route
+# created against one pod is invisible to the other, a gate permit counted
+# twice doubles the load a provider sees, and affinity sticks a conversation to
+# a pod that then restarts. Horizontal scaling is a design pass this work item
+# does not fund — it needs shared state or a session-sticky strategy first.
+# The `replicas` field is deliberately the ONLY way to scale; scaling it is a
+# conscious, reviewed act, not a "just bump the number" reflex.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: switchboard
+  namespace: switchboard
+  labels:
+    app: switchboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: switchboard
+  template:
+    metadata:
+      labels:
+        app: switchboard
+    spec:
+      # Run as the image's unprivileged user (uid 10001) and refuse escalation.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: switchboard
+          image: ghcr.io/hraedon/switchboard:main
+          imagePullPolicy: IfNotPresent
+          # `--listen 0.0.0.0:8801` is REQUIRED: the CLI default binds loopback,
+          # which is unreachable from outside the pod's namespace. Flag wins
+          # over the config file's `listen` (which carries the same value).
+          args:
+            - --config
+            - /etc/switchboard/switchboard.toml
+            - --listen
+            - 0.0.0.0:8801
+          ports:
+            - name: http
+              containerPort: 8801
+          # Provider credentials. Each name matches an `api_key_env` in the
+          # config. The pod does NOT start until the Secret has real values:
+          # a declared-but-empty variable is a hard startup error by design.
+          env:
+            - name: SWITCHBOARD_OPENCODE_GO_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: switchboard-provider-keys
+                  key: SWITCHBOARD_OPENCODE_GO_KEY
+            - name: SWITCHBOARD_OLLAMA_CLOUD_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: switchboard-provider-keys
+                  key: SWITCHBOARD_OLLAMA_CLOUD_KEY
+            - name: SWITCHBOARD_ZAI_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: switchboard-provider-keys
+                  key: SWITCHBOARD_ZAI_KEY
+          volumeMounts:
+            - name: config
+              mountPath: /etc/switchboard/switchboard.toml
+              subPath: switchboard.toml
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # /readyz returns 503 until EVERY provider's first poll completes —
+          # a switchboard that has not heard from its providers cannot route
+          # sensibly, so that 503 is the correct readiness semantic and must
+          # not be weakened to make a rollout look faster. The generous
+          # initialDelaySeconds/failureThreshold accommodate a slow first poll
+          # (the dashboard truth source polls on a ~30s interval) without
+          # touching the endpoint.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 10
+          resources:
+            # A proxy that STREAMS but never buffers a response body: steady
+            # memory is the async connection pools and per-provider counters,
+            # not buffered payloads, so the footprint is small and bounded.
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Nothing is written at runtime: the route table is in-memory
+            # (no --route-table-store), and the config is mounted readOnly.
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: switchboard-config

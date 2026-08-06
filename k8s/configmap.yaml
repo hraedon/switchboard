@@ -1,0 +1,106 @@
+# switchboard runtime configuration, mounted read-only into the pod at
+# /etc/switchboard/switchboard.toml.
+#
+# Based on examples/agent-delegation.toml (the documented working starting
+# point). No work-domain identifiers live here: the dashboard truth-source URL
+# is a placeholder (RFC 2606 .example TLD) and provider API keys are NOT in this
+# file — they arrive from the `switchboard-provider-keys` Secret through the
+# environment variables each provider's `api_key_env` names.
+#
+# NOTE: provider upstreams below are the public endpoints this config routes
+# to; they are third-party internet hosts, not estate identifiers. Do not
+# replace them with placeholders — only the internal dashboard URL is a
+# placeholder.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: switchboard-config
+  namespace: switchboard
+  labels:
+    app: switchboard
+data:
+  switchboard.toml: |
+    # switchboard — agent-delegation routing (deployed config).
+    #
+    # The bind address lives in the Deployment's `--listen 0.0.0.0:8801` flag,
+    # which outranks this key (CLI flag > config > default). It is repeated here
+    # so the config stays correct if the flag is ever dropped; keep both off
+    # loopback — the default 127.0.0.1:8801 is unreachable from outside the pod.
+    listen = "0.0.0.0:8801"
+
+    # ── providers ────────────────────────────────────────────────────────────
+    #
+    # `target` is the concurrency the gate aims to keep in flight. Delegated
+    # reviews are long and few, so these are deliberately small.
+    #
+    # Each provider presents its OWN credential via `api_key_env`. The variables
+    # are injected from the `switchboard-provider-keys` Secret. The app refuses
+    # to start if a declared variable is absent or empty (fail-closed): it will
+    # never fall back to forwarding the client's own credential upstream.
+
+    [provider.opencode-go]
+    upstream = "https://opencode.ai/zen/v1"
+    type = "generic"
+    target = 4
+    api_key_env = "SWITCHBOARD_OPENCODE_GO_KEY"
+
+    [provider.ollama-cloud]
+    upstream = "https://ollama.com/v1"
+    type = "generic"
+    target = 4
+    api_key_env = "SWITCHBOARD_OLLAMA_CLOUD_KEY"
+
+    [provider.zai]
+    upstream = "https://api.z.ai/api/coding/paas/v4"
+    type = "generic"
+    target = 2
+    api_key_env = "SWITCHBOARD_ZAI_KEY"
+
+    # ── routing ──────────────────────────────────────────────────────────────
+    #
+    # Order matters: the first entry is the primary, the rest are failover
+    # candidates ranked by headroom at decision time.
+
+    [route.default]
+    providers = ["opencode-go", "ollama-cloud", "zai"]
+
+    # ── usage-error reroute ──────────────────────────────────────────────────
+    #
+    # On 429/402/503/529, retry once on the next eligible provider before the
+    # client ever sees a byte. One retry is the right default.
+
+    [reroute]
+    enabled = true
+    max_attempts = 1
+
+    # ── model bridge ─────────────────────────────────────────────────────────
+    #
+    # Providers label the same model differently; map the names that matter so
+    # failover does not forward a name the fallback rejects.
+
+    [model."deepseek-v4-flash"]
+    opencode-go = "deepseek-v4-flash"
+    ollama-cloud = "deepseek-v4-flash"
+
+    [model."kimi-k3"]
+    opencode-go = "kimi-k3"
+    ollama-cloud = "kimi-k3"
+
+    [model."glm-5.2"]
+    opencode-go = "glm-5.2"
+    ollama-cloud = "glm-5.2"
+    zai = "glm-5.2"
+
+    # ── truth source ─────────────────────────────────────────────────────────
+    #
+    # The usage-dashboard truth source is OPTIONAL (it needs a reachable URL and
+    # a dashboard token in the Secret, and adds proactive pressure signals).
+    # Without it, providers still get the reactive [reroute] backstop. The URL
+    # is a PLACEHOLDER — replace before enabling. Token should arrive via a
+    # dashboard_token_env Secret key, never inline here.
+    #
+    # Dashboard truth-source keys are PER PROVIDER, not a top-level
+    # [dashboard] table. Put them inside the provider they describe:
+    #   [provider.ollama-cloud]
+    #   dashboard_url = "https://usage.internal.example"
+    #   dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"
