@@ -14,6 +14,9 @@ from switchboard.admin import (
     _build_status_payload,
     handle_config_get,
     handle_healthz,
+    handle_model_map_delete,
+    handle_model_map_list,
+    handle_model_map_set,
     handle_provider_override,
     handle_readyz,
     handle_route_add,
@@ -21,6 +24,7 @@ from switchboard.admin import (
     handle_route_list,
 )
 from switchboard.control import RoutingConfig
+from switchboard.model_map import ModelMapManager
 from switchboard.providers import ProviderContext
 from switchboard.proxy import RoutingMetrics
 from switchboard.route_table import RouteTableManager
@@ -332,6 +336,224 @@ async def test_handle_route_delete_unknown_key_returns_404() -> None:
     assert status == 404
 
 
+# --- Model-map endpoint tests (WI-017/012) ---
+
+
+def _authed_scope(method: str = "POST") -> dict[str, Any]:
+    return _make_scope(
+        method=method,
+        headers=[
+            (b"content-type", b"application/json"),
+            (b"authorization", b"Bearer admin-secret"),
+            (b"sec-fetch-site", b"same-origin"),
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_list_returns_models() -> None:
+    mgr = ModelMapManager()
+    mgr.set_model(
+        "kimi", {"umans": "umans-kimi", "ollama-cloud": "kimi-ollama"}
+    )
+    providers = {"umans": _make_provider_context("umans"),
+                 "ollama-cloud": _make_provider_context("ollama-cloud")}
+    messages, send = _make_send()
+    await handle_model_map_list(send, mgr, None, providers)
+    status, body = _parse_response(messages)
+    assert status == 200
+    data = json.loads(body)
+    assert len(data["models"]) == 1
+    entry = data["models"][0]
+    assert entry["model"] == "kimi"
+    assert entry["aliases"] == {"umans": "umans-kimi", "ollama-cloud": "kimi-ollama"}
+    assert entry["servable_providers"] == ["ollama-cloud", "umans"]
+    assert data["configured_providers"] == ["ollama-cloud", "umans"]
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_set_persists_and_responds() -> None:
+    mgr = ModelMapManager()
+    providers = {"umans": _make_provider_context("umans")}
+    scope = _authed_scope()
+    body = json.dumps(
+        {"model": "kimi", "aliases": {"umans": "umans-kimi"}}
+    ).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_model_map_set(
+        send, receive, mgr, "admin-secret", scope, None, providers
+    )
+    status, resp_body = _parse_response(messages)
+    assert status == 200
+    data = json.loads(resp_body)
+    assert data["model"] == "kimi"
+    assert data["aliases"] == {"umans": "umans-kimi"}
+    assert mgr.get_model_map().alias_for("kimi", "umans") == "umans-kimi"
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_set_requires_auth() -> None:
+    mgr = ModelMapManager()
+    scope = _make_scope(
+        method="POST",
+        headers=[(b"content-type", b"application/json")],
+    )
+    receive = _make_receive(b"{}")
+    messages, send = _make_send()
+    await handle_model_map_set(
+        send, receive, mgr, "admin-secret", scope
+    )
+    status, _ = _parse_response(messages)
+    assert status == 403
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_set_no_admin_token_returns_405() -> None:
+    mgr = ModelMapManager()
+    scope = _make_scope(method="POST")
+    receive = _make_receive(b"{}")
+    messages, send = _make_send()
+    await handle_model_map_set(send, receive, mgr, None, scope)
+    status, _ = _parse_response(messages)
+    assert status == 405
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_set_rejects_unknown_provider() -> None:
+    mgr = ModelMapManager()
+    providers = {"umans": _make_provider_context("umans")}
+    scope = _authed_scope()
+    body = json.dumps(
+        {"model": "kimi", "aliases": {"umans": "ok", "typo-prov": "bad"}}
+    ).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_model_map_set(
+        send, receive, mgr, "admin-secret", scope, None, providers
+    )
+    status, resp_body = _parse_response(messages)
+    assert status == 400
+    data = json.loads(resp_body)
+    assert "typo-prov" in data["error"]
+    # Nothing was written.
+    assert "kimi" not in mgr.get_model_map()
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_set_invalid_json_returns_400() -> None:
+    mgr = ModelMapManager()
+    scope = _authed_scope()
+    receive = _make_receive(b"not json")
+    messages, send = _make_send()
+    await handle_model_map_set(send, receive, mgr, "admin-secret", scope)
+    status, _ = _parse_response(messages)
+    assert status == 400
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_set_missing_model_returns_400() -> None:
+    mgr = ModelMapManager()
+    scope = _authed_scope()
+    body = json.dumps({"aliases": {"umans": "u"}}).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_model_map_set(send, receive, mgr, "admin-secret", scope)
+    status, _ = _parse_response(messages)
+    assert status == 400
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_set_missing_aliases_returns_400() -> None:
+    mgr = ModelMapManager()
+    scope = _authed_scope()
+    body = json.dumps({"model": "kimi"}).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_model_map_set(send, receive, mgr, "admin-secret", scope)
+    status, _ = _parse_response(messages)
+    assert status == 400
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_set_wrong_content_type_returns_415() -> None:
+    mgr = ModelMapManager()
+    scope = _make_scope(
+        method="POST",
+        headers=[
+            (b"content-type", b"text/plain"),
+            (b"authorization", b"Bearer admin-secret"),
+            (b"sec-fetch-site", b"same-origin"),
+        ],
+    )
+    receive = _make_receive(b"{}")
+    messages, send = _make_send()
+    await handle_model_map_set(send, receive, mgr, "admin-secret", scope)
+    status, _ = _parse_response(messages)
+    assert status == 415
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_delete_removes_entry() -> None:
+    mgr = ModelMapManager()
+    mgr.set_model("kimi", {"umans": "u"})
+    scope = _make_scope(
+        method="DELETE",
+        headers=[
+            (b"authorization", b"Bearer admin-secret"),
+            (b"sec-fetch-site", b"same-origin"),
+        ],
+    )
+    messages, send = _make_send()
+    await handle_model_map_delete(
+        send, mgr, "admin-secret", scope, "kimi"
+    )
+    status, _ = _parse_response(messages)
+    assert status == 200
+    assert "kimi" not in mgr.get_model_map()
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_delete_requires_auth() -> None:
+    mgr = ModelMapManager()
+    mgr.set_model("kimi", {"umans": "u"})
+    scope = _make_scope(method="DELETE")
+    messages, send = _make_send()
+    await handle_model_map_delete(
+        send, mgr, "admin-secret", scope, "kimi"
+    )
+    status, _ = _parse_response(messages)
+    assert status == 403
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_delete_no_admin_token_returns_405() -> None:
+    mgr = ModelMapManager()
+    scope = _make_scope(method="DELETE")
+    messages, send = _make_send()
+    await handle_model_map_delete(send, mgr, None, scope, "kimi")
+    status, _ = _parse_response(messages)
+    assert status == 405
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_delete_unknown_model_returns_404() -> None:
+    mgr = ModelMapManager()
+    scope = _make_scope(
+        method="DELETE",
+        headers=[
+            (b"authorization", b"Bearer admin-secret"),
+            (b"sec-fetch-site", b"same-origin"),
+        ],
+    )
+    messages, send = _make_send()
+    await handle_model_map_delete(
+        send, mgr, "admin-secret", scope, "nonexistent"
+    )
+    status, _ = _parse_response(messages)
+    assert status == 404
+
+
 @pytest.mark.asyncio
 async def test_handle_config_get_returns_routing_config() -> None:
     config = RoutingConfig(failover_threshold_seconds=15, failover_margin=8)
@@ -392,6 +614,28 @@ def test_build_status_payload_with_failover() -> None:
     metrics.record_decision("key1", "fallback", "primary")
     payload = _build_status_payload(providers, mgr, metrics)
     assert payload["routing_metrics"]["failovers"] == 1
+
+
+def test_build_status_payload_includes_model_map() -> None:
+    ctx = _make_provider_context()
+    providers = {"test": ctx}
+    mgr = RouteTableManager(default_providers=("test",))
+    mmgr = ModelMapManager()
+    mmgr.set_model("kimi", {"test": "test-kimi"})
+    metrics = RoutingMetrics()
+    payload = _build_status_payload(
+        providers, mgr, metrics, model_map_mgr=mmgr
+    )
+    assert payload["model_map"] == {"kimi": {"test": "test-kimi"}}
+
+
+def test_build_status_payload_omits_model_map_when_none() -> None:
+    ctx = _make_provider_context()
+    providers = {"test": ctx}
+    mgr = RouteTableManager(default_providers=("test",))
+    metrics = RoutingMetrics()
+    payload = _build_status_payload(providers, mgr, metrics)
+    assert "model_map" not in payload
 
 
 def test_build_status_payload_none_build_sha() -> None:
