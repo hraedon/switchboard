@@ -1273,14 +1273,20 @@ def _masked_toml_section(section: dict[str, Any]) -> dict[str, Any]:
         k: section[k] for k in _TOML_SECTION_SAFE_KEYS if k in section
     }
     api_key = section.get("api_key")
-    if isinstance(api_key, str) and api_key:
+    # Precedence must match the construction path (providers.py): a set
+    # api_key_env OVERRIDES an inline api_key, so the mask must call that
+    # section "env" or the GUI pre-fills the mode the runtime is not using
+    # (cycle-2 review, finding 2). _tombstone_fields_from_toml agrees.
+    if section.get("api_key_env"):
+        out["key_mode"] = "env"
+        out["api_key_set"] = False
+        out["api_key_hint"] = ""
+    elif isinstance(api_key, str) and api_key:
         out["key_mode"] = "stored"
         out["api_key_set"] = True
         out["api_key_hint"] = api_key[-4:]
     else:
-        out["key_mode"] = (
-            "env" if section.get("api_key_env") else "passthrough"
-        )
+        out["key_mode"] = "passthrough"
         out["api_key_set"] = False
         out["api_key_hint"] = ""
     return out
@@ -1303,12 +1309,15 @@ def _restore_fields(
         "account": masked["account"],
         "enabled": masked["enabled"],
     }
-    if "api_key" in section:
-        fields["key_mode"] = "stored"
-        fields["api_key_stored"] = section["api_key"]
-    elif "api_key_env" in section:
+    # Store-sourced sections carry exactly one credential key (the row's
+    # key_mode picks it), so the branch order is unreachable in practice —
+    # kept env-first anyway to match the construction path's precedence.
+    if "api_key_env" in section:
         fields["key_mode"] = "env"
         fields["api_key_env"] = section["api_key_env"]
+    elif "api_key" in section:
+        fields["key_mode"] = "stored"
+        fields["api_key_stored"] = section["api_key"]
     else:
         fields["key_mode"] = "passthrough"
     for key in (

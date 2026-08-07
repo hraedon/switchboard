@@ -402,7 +402,14 @@ async def test_removal_during_admission_queue_wait_is_graceful(
 
     messages, send = _make_send()
     task = asyncio.create_task(app(_make_scope(), _make_receive(), send))
-    await asyncio.sleep(0.1)  # request is now waiting on the queue path
+    # Deterministic sync: wait for the request to be queued on the gate
+    # rather than sleeping a fixed interval (cycle-2 review, finding 3).
+    for _ in range(200):
+        if ctx.gate.queue_depth == 1:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("request never reached the queue wait")
 
     assert await mgr.remove("alpha") is True  # map swapped; drain gated
     await ctx.gate.release()  # waiter acquires on the removed ctx's gate
@@ -425,3 +432,84 @@ async def test_removal_during_admission_queue_wait_is_graceful(
     await asyncio.wait_for(mgr.shutdown(), timeout=5.0)
     assert ctx.gate.held == 0
     assert ctx.http_client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_replace_during_admission_queue_wait_releases_right_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The replace variant of the admission race: a permit acquired on the
+    OLD context during the queue-wait must be released on the OLD gate —
+    releasing on the new one leaves the old drain wedged and corrupts the
+    new gate's accounting (cycle-2 review, finding 4)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=_Stream([b'{"ok": true}']),
+            headers={"content-type": "application/json"},
+        )
+
+    old = _make_ctx(
+        "alpha",
+        capacity=1,
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), timeout=None
+        ),
+    )
+    new = _make_ctx(
+        "alpha",
+        capacity=1,
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), timeout=None
+        ),
+    )
+    await _ready(old)
+    await _ready(new)
+    app = ProxyApp(
+        providers={"alpha": old},
+        route_table=RouteTableManager(default_providers=("alpha",)),
+        routing_config=RoutingConfig(),
+        queue_timeout=5.0,
+    )
+    mgr = app.provider_manager
+
+    resume_drain = asyncio.Event()
+    orig_drain = mgr._drain_and_close
+
+    async def slow_drain(name: str, dctx: Any) -> None:
+        await resume_drain.wait()
+        await orig_drain(name, dctx)
+
+    monkeypatch.setattr(mgr, "_drain_and_close", slow_drain)
+
+    assert await old.gate.acquire(timeout=0.5)
+
+    messages, send = _make_send()
+    task = asyncio.create_task(app(_make_scope(), _make_receive(), send))
+    for _ in range(200):
+        if old.gate.queue_depth == 1:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("request never reached the queue wait")
+
+    await mgr.replace("alpha", new)  # map now serves the NEW context
+    await old.gate.release()  # waiter acquires on the OLD gate
+    await asyncio.wait_for(task, timeout=5.0)
+
+    status = next(
+        m["status"] for m in messages if m["type"] == "http.response.start"
+    )
+    assert status == 200
+
+    # The release must have landed on the OLD gate (it granted the permit):
+    # old drains to zero, and the NEW gate's accounting is untouched.
+    assert old.gate.held == 0
+    assert new.gate.held == 0
+    resume_drain.set()
+    await asyncio.wait_for(mgr.shutdown(), timeout=5.0)
+    assert old.http_client.is_closed
+    assert not new.http_client.is_closed
+    await mgr.remove("alpha")
+    await mgr.shutdown()

@@ -692,15 +692,21 @@ def _build_serve_app(
                 f"default route references unknown provider: {name}"
             )
 
+    route_table.load_from_config(config_data, overwrite=store_path is None)
+
     # A tombstoned name in the declared default would just be dead weight in
     # every routing decision (admission skips it) — drop it and say so, so
     # the operator sees the default that actually fires (wave 0+1 review,
-    # finding 6).
+    # finding 6). MUST run after load_from_config: that call re-sets the
+    # default from the TOML unconditionally and would clobber the filter
+    # (cycle-2 review, finding 1). Filter the route table's own view, which
+    # includes whatever load_from_config just installed.
+    declared_default = tuple(route_table.default_providers)
     live_default = tuple(
-        name for name in default_providers if name not in tombstoned_providers
+        name for name in declared_default if name not in tombstoned_providers
     )
-    if live_default != tuple(default_providers):
-        dropped = [n for n in default_providers if n in tombstoned_providers]
+    if live_default != declared_default:
+        dropped = [n for n in declared_default if n in tombstoned_providers]
         log.warning(
             "default route: dropping tombstoned provider(s) %s — effective "
             "default is %s",
@@ -714,8 +720,6 @@ def _build_serve_app(
             )
         default_providers = live_default
         route_table.set_default_providers(default_providers)
-
-    route_table.load_from_config(config_data, overwrite=store_path is None)
 
     routing_config = RoutingConfig()
     routing_section = config_data.get("routing", {})
