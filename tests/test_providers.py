@@ -465,3 +465,51 @@ async def test_snapshot_quota_resets_in_none_when_reading_stale() -> None:
     state = snapshot_provider_state("zai", ctx, now=0.0)
     assert state.quota_resets_in is None
     await ctx.http_client.aclose()
+
+
+def test_history_ring_warmed_from_store_on_startup(tmp_path) -> None:
+    """A restart must not lose the trend surface: the ring is warmed from
+    the SQLite store at construction (drop-sluice review, finding 2)."""
+    from switchboard.history import HistoryEntry, SQLiteHistoryStore
+
+    store_path = str(tmp_path / "hist")
+    prior_store = SQLiteHistoryStore(f"{store_path}.prov_a.history")
+    for i in range(3):
+        prior_store.append(
+            HistoryEntry(
+                timestamp=1000.0 + i,
+                concurrent_sessions=0,
+                local_in_flight=0,
+                effective_permits=3,
+                limit=4,
+                hard_cap=8,
+                band="normal",
+                breaker="closed",
+                priority_low=False,
+                usage_age=0.0,
+                stale=False,
+                recent_429s=0,
+                total_429s=0,
+                queue_depth=0,
+            )
+        )
+    prior_store.close()
+
+    contexts = build_provider_contexts_from_config(
+        {
+            "provider": {
+                "prov_a": {
+                    "upstream": "https://a.example.com",
+                    "type": "generic",
+                    "target": 2,
+                },
+            },
+        },
+        history_store_path=store_path,
+    )
+    ring = contexts["prov_a"].reconcile.history
+    assert ring is not None
+    entries = ring.to_dict_list(limit=10)
+    assert len(entries) == 3
+    assert entries[0]["ts"] == 1000.0
+    assert entries[-1]["ts"] == 1002.0

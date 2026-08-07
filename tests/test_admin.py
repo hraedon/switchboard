@@ -30,14 +30,16 @@ from switchboard.route_table import RouteTableManager
 from switchboard.truth import NullTruthSource
 
 
-def _make_provider_context(name: str = "test") -> ProviderContext:
+def _make_provider_context(
+    name: str = "test", provider_type: str = "generic"
+) -> ProviderContext:
     gate = PermitGate(initial_capacity=0)
-    truth = NullTruthSource(provider="generic")
+    truth = NullTruthSource(provider=provider_type)
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
         max_concurrency=1,
-        provider_type="generic",
+        provider_type=provider_type,
         breaker_config=BreakerConfig(),
     )
     return ProviderContext(
@@ -679,14 +681,16 @@ def _make_override_scope(
     }
 
 
-def _make_ready_provider(name: str = "test") -> ProviderContext:
+def _make_ready_provider(
+    name: str = "test", provider_type: str = "generic"
+) -> ProviderContext:
     from switchboard.limit import CachedReading, LimitState
 
-    ctx = _make_provider_context(name)
+    ctx = _make_provider_context(name, provider_type=provider_type)
     ctx.reconcile._first_poll_ok = True
     ctx.reconcile._last_reading_cached = CachedReading(
         reading=LimitState(
-            provider="generic", age_seconds=0.0, limit=4, hard_cap=8
+            provider=provider_type, age_seconds=0.0, limit=4, hard_cap=8
         ),
         fetched_at_monotonic=0.0,
         ok=True,
@@ -724,6 +728,70 @@ async def test_override_apply_rejects_zero() -> None:
     )
     status, _ = _parse_response(messages)
     assert status == 400
+
+
+@pytest.mark.asyncio
+async def test_override_generic_accepts_above_placeholder_caps() -> None:
+    """Non-umans readings carry placeholder limit/hard_cap defaults the
+    runtime never enforces — the override endpoint must not bound against
+    them (drop-sluice review, blocking finding 1)."""
+    ctx = _make_ready_provider("test", provider_type="generic")
+    providers = {"test": ctx}
+    body = json.dumps({"target": 12}).encode()
+    scope = _make_override_scope("POST", body)
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_provider_override(
+        send, receive, providers, _ADMIN_TOKEN, scope,
+        "test", "POST", None,
+    )
+    status, resp_body = _parse_response(messages)
+    assert status == 200
+    data = json.loads(resp_body)
+    assert data["applied"] is True
+    assert "warning" not in data
+    assert ctx.reconcile.max_concurrency == 12
+
+
+@pytest.mark.asyncio
+async def test_override_umans_rejects_above_hard_cap() -> None:
+    """On the polled umans path limit/hard_cap are real provider limits,
+    so the Plan 011 §4 bound applies: above hard_cap is a 400."""
+    ctx = _make_ready_provider("test", provider_type="umans")
+    providers = {"test": ctx}
+    body = json.dumps({"target": 10}).encode()
+    scope = _make_override_scope("POST", body)
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_provider_override(
+        send, receive, providers, _ADMIN_TOKEN, scope,
+        "test", "POST", None,
+    )
+    status, resp_body = _parse_response(messages)
+    assert status == 400
+    assert b"hard_cap" in resp_body
+
+
+@pytest.mark.asyncio
+async def test_override_umans_warns_between_limit_and_hard_cap() -> None:
+    """limit < target <= hard_cap is accept-with-warning on umans:
+    requests above the limit run at low priority."""
+    ctx = _make_ready_provider("test", provider_type="umans")
+    providers = {"test": ctx}
+    body = json.dumps({"target": 6}).encode()
+    scope = _make_override_scope("POST", body)
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_provider_override(
+        send, receive, providers, _ADMIN_TOKEN, scope,
+        "test", "POST", None,
+    )
+    status, resp_body = _parse_response(messages)
+    assert status == 200
+    data = json.loads(resp_body)
+    assert data["applied"] is True
+    assert "above limit" in data["warning"]
+    assert ctx.reconcile.max_concurrency == 6
 
 
 @pytest.mark.asyncio

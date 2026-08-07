@@ -207,26 +207,30 @@ class ReconciliationLoop:
             raise ValueError(
                 "usage reading stale; override unavailable until fresh reading"
             )
-        # Bounds from Plan 011 §4 (restored from sluice's
-        # validate_target_override during the Plan 018 vendoring):
-        # a zero-permit target is a deploy decision, not a runtime
-        # override, and a target above hard_cap configures a value the
-        # provider will punish. Above `limit` is accept-with-warning —
-        # requests over the limit run at low priority, sometimes wanted.
-        reading = cached.reading
+        # A zero-permit target is a deploy decision, not a runtime
+        # override — rejected for every provider class.
         if value < 1:
             raise ValueError(f"target must be >= 1, got {value}")
-        if value > reading.hard_cap:
-            raise ValueError(
-                f"target {value} exceeds hard_cap {reading.hard_cap} — "
-                "the provider will reject requests above this"
-            )
+        # The Plan 011 §4 bounds (reject above hard_cap, warn above
+        # limit) only mean anything on the polled umans path, where the
+        # reading's limit/hard_cap are real provider concurrency limits.
+        # For header/generic/dashboard providers those fields sit at
+        # placeholder defaults the runtime itself never enforces, so
+        # bounding against them would reject values the loop would
+        # happily grant (drop-sluice review, blocking finding 1).
         warning: str | None = None
-        if value > reading.limit:
-            warning = (
-                f"target {value} is above limit {reading.limit} — "
-                "requests above the limit run at low priority"
-            )
+        if self._provider_type == "umans":
+            reading = cached.reading
+            if value > reading.hard_cap:
+                raise ValueError(
+                    f"target {value} exceeds hard_cap {reading.hard_cap} — "
+                    "the provider will reject requests above this"
+                )
+            if value > reading.limit:
+                warning = (
+                    f"target {value} is above limit {reading.limit} — "
+                    "requests above the limit run at low priority"
+                )
         self._max_concurrency = value
         self._overrides["max_concurrency"] = {
             "value": value,
@@ -354,15 +358,6 @@ class ReconciliationLoop:
 
         cached = await self._truth.fetch(now_monotonic=now_mono)
         age = now_mono - cached.fetched_at_monotonic
-        reading = CachedReading(
-            reading=LimitState(**{
-                k: v
-                for k, v in cached.reading.__dict__.items()
-                if k != "age_seconds"
-            }),
-            fetched_at_monotonic=cached.fetched_at_monotonic,
-            ok=cached.ok,
-        )
         reading = CachedReading(
             reading=LimitState(
                 **{

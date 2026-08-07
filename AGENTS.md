@@ -12,10 +12,11 @@ gates and decides which upstream provider receives each request.
   pressure estimates, route table entries. No I/O, no async, no httpx, no model
   calls. It must be unit-testable with no network. An import-boundary test
   enforces that `switchboard.control` imports nothing outside the stdlib.
-- **Thin shell around the core — and around sluice's core.** The async proxy
-  (`switchboard.proxy`), the dashboard client (`switchboard.dashboard`), and the
-  CLI (`switchboard.cli`) import `switchboard.control` and `sluice.control`,
-  never the reverse. The shell does I/O; the core decides.
+- **Thin shell around the cores.** The async proxy (`switchboard.proxy`),
+  the dashboard client (`switchboard.dashboard`), and the CLI
+  (`switchboard.cli`) import the pure cores (`switchboard.control`,
+  `switchboard.limit`), never the reverse. The shell does I/O; the core
+  decides.
 - **Inert in-path — per provider.** switchboard forwards live traffic to the
   selected upstream. It **never reads, logs, stores, or rewrites request/response
   bodies.** It routes and streams bytes through untouched. Same guarantee as
@@ -124,23 +125,29 @@ docs/routing-model.md      # the design spine — read this first
 plans/                     # numbered implementation plans
 ```
 
-## Relationship to sluice
+## Relationship to sluice (historical)
 
-switchboard imports from sluice as a library:
+switchboard no longer depends on sluice — Plan 018 vendored the flow-control
+core it actually used into switchboard-owned modules and deleted the
+dependency:
 
-- `sluice.control` — `LimitState`, `ControllerConfig`, `effective_permits`,
-  `BreakerConfig`, `BreakerSnapshot`, breaker state machine functions,
-  `AdaptiveConfig`, `AdaptiveSnapshot`, `adaptive_effective_permits`
-- `sluice.gate` — `PermitGate`
-- `sluice.reconcile` — `ReconciliationLoop`
-- `sluice.providers` — `TruthSource` protocol, `PolledTruthSource`,
+- `switchboard.limit` — `LimitState`, `CachedReading`, `BreakerConfig`,
+  breaker state machine, `RETRY_AFTER_SHORT`
+- `switchboard.gate` — `PermitGate` (simplified: no reserve/cooldown)
+- `switchboard.reconcile` — `ReconciliationLoop` (static
+  `max_concurrency` + header tightening; sluice's adaptive controller was
+  umans-specific and was not ported)
+- `switchboard.truth` — `TruthSource` protocol, `PolledTruthSource`,
   `HeaderTruthSource`, `NullTruthSource`, `Provider`, `get_provider`,
   `make_truth_source`
+- `switchboard.history` — per-tick `HistoryEntry` time series: in-memory
+  ring + per-provider SQLite store (the substrate for usage-based triage)
+- `switchboard.session` / `switchboard.utils` — admin session + ASGI helpers
 
-switchboard does **not** modify these. It composes multiple instances and adds
-a routing layer on top. If sluice's core needs a change to support
-multi-provider, the change goes into sluice (with its own tests) and
-switchboard consumes the new version.
+Do NOT reintroduce a sluice import: the public PyPI package of that name is
+an unrelated project, so a revived import would resolve to a stranger's
+code. `tests/test_import_boundary.py` fails on any `sluice` import in src or
+tests, and CI asserts the package is absent from the published image.
 
 ## Don't
 

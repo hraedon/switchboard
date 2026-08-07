@@ -254,6 +254,11 @@ def build_provider_contexts_from_config(
             store_file = f"{history_store_path}.{_safe_filename(name)}.history"
             history_store = SQLiteHistoryStore(store_file)
             history = HistoryRing(maxlen=2880)
+            # Warm the ring from the store so the trend surface has data
+            # immediately after a restart — otherwise it stays empty for
+            # hours while the ring refills at poll cadence.
+            for entry in history_store.load_recent(2880):
+                history.append(entry)
 
         contexts[name] = build_provider_context(
             name=name,
