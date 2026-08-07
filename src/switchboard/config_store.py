@@ -242,6 +242,11 @@ class ConfigStoreManager:
         _validate_row(row)
 
         if self._db is not None:
+            # INSERT OR REPLACE is DELETE-then-INSERT, not UPDATE: row
+            # identity is not preserved. Harmless today (no foreign keys,
+            # no triggers; created_at is carried over manually above) — a
+            # future REFERENCES/trigger on this table must switch to
+            # ON CONFLICT DO UPDATE first.
             placeholders = ", ".join("?" for _ in _COLUMNS)
             self._db.execute(
                 f"INSERT OR REPLACE INTO provider_config "

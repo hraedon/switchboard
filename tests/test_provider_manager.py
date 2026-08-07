@@ -351,3 +351,77 @@ async def test_no_admission_after_removal() -> None:
     assert status == 200
     assert served_by == ["beta"]
     await app.provider_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_removal_during_admission_queue_wait_is_graceful(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wave 0+1 review, blocking finding 1: a request whose admission
+    queue-wait acquires a permit in the swap->resize window (provider
+    removed while it waited) must be served through the context its permit
+    was acquired on — never a fresh map lookup (KeyError) — and its release
+    must land on that same gate so the drain completes."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=_Stream([b'{"ok": true}']),
+            headers={"content-type": "application/json"},
+        )
+
+    ctx = _make_ctx(
+        "alpha",
+        capacity=1,
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), timeout=None
+        ),
+    )
+    await _ready(ctx)
+    app = ProxyApp(
+        providers={"alpha": ctx},
+        route_table=RouteTableManager(default_providers=("alpha",)),
+        routing_config=RoutingConfig(),
+        queue_timeout=5.0,
+    )
+    mgr = app.provider_manager
+
+    # Hold the drain's first step (gate.resize(0)) back so the queued
+    # waiter deterministically wins the swap->resize window.
+    resume_drain = asyncio.Event()
+    orig_drain = mgr._drain_and_close
+
+    async def slow_drain(name: str, dctx: Any) -> None:
+        await resume_drain.wait()
+        await orig_drain(name, dctx)
+
+    monkeypatch.setattr(mgr, "_drain_and_close", slow_drain)
+
+    # Occupy the only permit so the request queues in _admit.
+    assert await ctx.gate.acquire(timeout=0.5)
+
+    messages, send = _make_send()
+    task = asyncio.create_task(app(_make_scope(), _make_receive(), send))
+    await asyncio.sleep(0.1)  # request is now waiting on the queue path
+
+    assert await mgr.remove("alpha") is True  # map swapped; drain gated
+    await ctx.gate.release()  # waiter acquires on the removed ctx's gate
+    await asyncio.wait_for(task, timeout=5.0)
+
+    status = next(
+        m["status"] for m in messages if m["type"] == "http.response.start"
+    )
+    body = b"".join(
+        m.get("body", b"")
+        for m in messages
+        if m["type"] == "http.response.body"
+    )
+    assert status == 200
+    assert body == b'{"ok": true}'
+
+    # The permit released on the RIGHT gate: the drain must complete
+    # without hitting its timeout path.
+    resume_drain.set()
+    await asyncio.wait_for(mgr.shutdown(), timeout=5.0)
+    assert ctx.gate.held == 0
+    assert ctx.http_client.is_closed

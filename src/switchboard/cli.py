@@ -692,6 +692,29 @@ def _build_serve_app(
                 f"default route references unknown provider: {name}"
             )
 
+    # A tombstoned name in the declared default would just be dead weight in
+    # every routing decision (admission skips it) — drop it and say so, so
+    # the operator sees the default that actually fires (wave 0+1 review,
+    # finding 6).
+    live_default = tuple(
+        name for name in default_providers if name not in tombstoned_providers
+    )
+    if live_default != tuple(default_providers):
+        dropped = [n for n in default_providers if n in tombstoned_providers]
+        log.warning(
+            "default route: dropping tombstoned provider(s) %s — effective "
+            "default is %s",
+            ", ".join(dropped),
+            list(live_default),
+        )
+        if not live_default:
+            raise _ConfigError(
+                "default route has no live providers — every declared "
+                "provider is disabled in the config store"
+            )
+        default_providers = live_default
+        route_table.set_default_providers(default_providers)
+
     route_table.load_from_config(config_data, overwrite=store_path is None)
 
     routing_config = RoutingConfig()

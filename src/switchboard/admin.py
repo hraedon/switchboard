@@ -1242,6 +1242,50 @@ async def _dry_build_error(
     return None
 
 
+#: TOML [provider.*] keys safe to serialize on read surfaces. Everything
+#: else is dropped — echo-all-minus-api_key would forward operator typos
+#: of credential-shaped keys (e.g. `usage_key`) straight to the browser.
+_TOML_SECTION_SAFE_KEYS = (
+    "upstream",
+    "type",
+    "target",
+    "api_key_env",
+    "auth_header",
+    "auth_prefix",
+    "dashboard_url",
+    "dashboard_token_env",
+    "usage_key_env",
+    "poll_interval_idle",
+    "dashboard_poll_interval",
+    "dashboard_stale_ttl",
+)
+
+
+def _masked_toml_section(section: dict[str, Any]) -> dict[str, Any]:
+    """Whitelist-mask a TOML provider section for a read surface.
+
+    Adds the derived ``key_mode``/``api_key_set``/``api_key_hint`` trio so
+    the GUI can pre-fill an edit form for a TOML-only provider — without it
+    a defaulted key_mode on first PUT silently drops the credential (wave
+    0+1 review, finding 3).
+    """
+    out: dict[str, Any] = {
+        k: section[k] for k in _TOML_SECTION_SAFE_KEYS if k in section
+    }
+    api_key = section.get("api_key")
+    if isinstance(api_key, str) and api_key:
+        out["key_mode"] = "stored"
+        out["api_key_set"] = True
+        out["api_key_hint"] = api_key[-4:]
+    else:
+        out["key_mode"] = (
+            "env" if section.get("api_key_env") else "passthrough"
+        )
+        out["api_key_set"] = False
+        out["api_key_hint"] = ""
+    return out
+
+
 def _restore_fields(
     section: dict[str, object], masked: dict[str, object]
 ) -> dict[str, object]:
@@ -1361,6 +1405,7 @@ async def handle_providers_list(
     providers: dict[str, ProviderContext],
     config_store: ConfigStoreManager,
     cors_allow_origin: str | None = None,
+    toml_provider_sections: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """GET /admin/providers — live providers joined with config-store rows.
 
@@ -1381,6 +1426,12 @@ async def handle_providers_list(
         else:
             entry["upstream"] = ctx.upstream_url
             entry["source"] = "toml"
+            # Same masked detail the effective view gives, so the GUI can
+            # pre-fill an edit form instead of guessing at key_mode
+            # (finding 3: a guessed key_mode drops the credential on PUT).
+            section = (toml_provider_sections or {}).get(name)
+            if section is not None:
+                entry.update(_masked_toml_section(section))
         entry["live"] = {
             "ready": ctx.reconcile.ready,
             "gate_closed_reason": ctx.reconcile.gate_closed_reason(),
@@ -1554,6 +1605,18 @@ async def handle_provider_create(
                 send, 400, {"error": str(exc)}, extra_headers=cors,
             )
             return
+        except Exception:
+            # Not a validation shape (sqlite3.Error/OSError from history
+            # wiring, ...): still undo the create — the row would fail the
+            # next boot — and answer an honest 500.
+            log.exception("provider create failed post-persist for %s", name)
+            config_store.remove(name)
+            await send_json(
+                send, 500,
+                {"error": "provider create failed; row removed"},
+                extra_headers=cors,
+            )
+            return
         try:
             await provider_manager.add(name, built[name])
         except ValueError:
@@ -1562,6 +1625,16 @@ async def handle_provider_create(
             await send_json(
                 send, 409,
                 {"error": f"provider '{name}' already exists"},
+                extra_headers=cors,
+            )
+            return
+        except Exception:
+            log.exception("provider registration failed for %s", name)
+            await _discard_contexts(built)
+            config_store.remove(name)
+            await send_json(
+                send, 500,
+                {"error": "provider registration failed; row removed"},
                 extra_headers=cors,
             )
             return
@@ -1690,6 +1763,7 @@ async def handle_provider_update(
     except ValueError as exc:
         # Roll back: restore the captured previous row, or remove the row
         # this update just created for a TOML-only provider.
+        rollback_failed = False
         try:
             if prev_section is not None and prev_masked is not None:
                 config_store.upsert(
@@ -1698,11 +1772,18 @@ async def handle_provider_update(
             else:
                 config_store.remove(prov_name)
         except (ValueError, sqlite3.Error):
+            rollback_failed = True
             log.error(
                 "provider update rollback failed for %s", prov_name,
                 exc_info=True,
             )
-        await send_json(send, 400, {"error": str(exc)}, extra_headers=cors)
+        err_body: dict[str, Any] = {"error": str(exc)}
+        if rollback_failed:
+            # The store now holds the row that failed to build; the next
+            # boot will warn/skip it, but the operator must know it is
+            # dirty rather than discover it later.
+            err_body["rollback_failed"] = True
+        await send_json(send, 400, err_body, extra_headers=cors)
         return
 
     masked = config_store.get(prov_name)
@@ -1928,18 +2009,9 @@ async def handle_config_effective(
     for name in toml_provider_names:
         if name in store_names:
             continue
-        section = dict(toml_provider_sections.get(name, {}))
-        api_key = section.pop("api_key", None)
-        entry: dict[str, Any] = dict(section)
-        entry["name"] = name
-        entry["source"] = "toml"
-        entry["enabled"] = True
-        if isinstance(api_key, str) and api_key:
-            entry["api_key_set"] = True
-            entry["api_key_hint"] = api_key[-4:]
-        else:
-            entry["api_key_set"] = False
-            entry["api_key_hint"] = ""
+        section = toml_provider_sections.get(name, {})
+        entry: dict[str, Any] = {"name": name, "source": "toml", "enabled": True}
+        entry.update(_masked_toml_section(section))
         entries.append(entry)
     entries.sort(key=lambda e: str(e["name"]))
     await send_json(

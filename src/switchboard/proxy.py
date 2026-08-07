@@ -683,6 +683,7 @@ class ProxyApp:
                 await handle_providers_list(
                     send, self._providers, self._config_store,
                     self._cors_allow_origin,
+                    toml_provider_sections=self._toml_provider_sections,
                 )
                 return
             if method == "POST":
@@ -713,13 +714,15 @@ class ProxyApp:
             path.startswith("/admin/providers/")
             and path.endswith("/override")
         ):
+            from urllib.parse import unquote
+
             from switchboard.admin import (
                 handle_provider_override,
             )
 
             parts = path.split("/")
             if len(parts) == 5 and parts[4] == "override":
-                prov_name = parts[3]
+                prov_name = unquote(parts[3])
                 await handle_provider_override(
                     send, receive, self._providers,
                     self._admin_token, scope, prov_name,
@@ -728,18 +731,20 @@ class ProxyApp:
                 return
 
         if path.startswith("/admin/providers/"):
+            from urllib.parse import unquote
+
             parts = path.split("/")
             if len(parts) == 5 and parts[4] == "test":
                 if method == "POST":
                     await handle_provider_test(
                         send, self._providers, self._admin_token,
-                        scope, parts[3], self._cors_allow_origin,
+                        scope, unquote(parts[3]), self._cors_allow_origin,
                     )
                     return
                 await send_text(send, 405, "Method not allowed")
                 return
             if len(parts) == 4 and parts[3]:
-                prov_name = parts[3]
+                prov_name = unquote(parts[3])
                 if method == "PUT":
                     await handle_provider_update(
                         send, receive, self._provider_manager,
@@ -997,9 +1002,9 @@ class ProxyApp:
             primary_healthy_since=self._provider_healthy_since.get(primary),
         )
 
-        acquired_provider: str | None = None
+        admitted: tuple[str, ProviderContext] | None = None
         try:
-            acquired_provider = await self._admit(
+            admitted = await self._admit(
                 plan, receive=receive, body_buffered=buffered_body is not None,
             )
         except Exception:
@@ -1015,7 +1020,7 @@ class ProxyApp:
             )
             return
 
-        if acquired_provider is None:
+        if admitted is None:
             retry_after = RETRY_AFTER_SHORT
             reason = "no_capacity"
             ctx = self._providers.get(plan.terminal_fallback)
@@ -1059,9 +1064,16 @@ class ProxyApp:
             )
             return
 
+        # From here on, the provider identity is the (name, ctx) pair the
+        # permit was acquired on — never a fresh map lookup. The map is
+        # copy-on-swap and may have changed during the admission awaits;
+        # re-indexing it here KeyErrors on a removed provider and, worse,
+        # releases the WRONG gate on a replaced one (wave 0+1 review,
+        # blocking finding 1).
+        acquired_provider, acquired_ctx = admitted
+
         if self._draining:
-            ctx = self._providers[acquired_provider]
-            await ctx.gate.release()
+            await acquired_ctx.gate.release()
             await send_json(
                 send, 503,
                 {
@@ -1103,7 +1115,7 @@ class ProxyApp:
         reroutes_done = 0
 
         while True:
-            ctx = self._providers[acquired_provider]
+            ctx = acquired_ctx
             ctx.reconcile.record_request_forwarded()
             tried.add(acquired_provider)
 
@@ -1204,18 +1216,19 @@ class ProxyApp:
                 await self._send_usage_error(send, probe)
                 return
 
-            next_provider = await self._admit(
+            next_admitted = await self._admit(
                 plan,
                 receive=receive,
                 body_buffered=True,
                 exclude=frozenset(tried),
             )
-            if next_provider is None:
+            if next_admitted is None:
                 # Nobody else could take it: surface the upstream's own
                 # status so the client's backoff still sees the truth.
                 self._record_usage_give_up(tried, tried_statuses)
                 await self._send_usage_error(send, probe)
                 return
+            next_provider, next_ctx = next_admitted
             log.info(
                 "rerouting after usage error: %s -> %s (status=%s)",
                 acquired_provider,
@@ -1225,6 +1238,7 @@ class ProxyApp:
             self._metrics.record_usage_reroute(acquired_provider, next_provider)
             reroutes_done += 1
             acquired_provider = next_provider
+            acquired_ctx = next_ctx
             # Affinity is NOT written here. A pin must record who actually
             # served, not who was merely selected: cancellation, a forwarding
             # failure, or another usage error would otherwise leave the
@@ -1313,7 +1327,7 @@ class ProxyApp:
         receive: Receive | None = None,
         body_buffered: bool = False,
         exclude: frozenset[str] = frozenset(),
-    ) -> str | None:
+    ) -> tuple[str, ProviderContext] | None:
         """Plan-driven admission (Plan 006 §4).
 
         1. Try each immediate candidate with a non-blocking gate acquire.
@@ -1326,7 +1340,13 @@ class ProxyApp:
            queue wait doesn't burn the full timeout.  When the body is NOT
            buffered, the disconnect watcher would steal body events from
            ``_forward``'s ``body_stream``, so the plain acquire is used.
-        4. Return the acquired provider name, or None.
+        4. Return the ``(name, context)`` pair the permit was acquired on,
+           or None. Returning the CONTEXT and not just the name is
+           load-bearing: the provider map is copy-on-swap and may have
+           changed during the queue-wait awaits above — the caller must
+           forward through, and release on, the exact context whose gate
+           granted the permit, never a fresh map lookup (wave 0+1 review,
+           blocking finding 1).
         """
         admit_start = time.monotonic()
 
@@ -1338,7 +1358,7 @@ class ProxyApp:
                 continue
             acquired = await ctx.gate.acquire(timeout=0.0)
             if acquired:
-                return name
+                return name, ctx
 
         for name in plan.immediate_candidates:
             if name in exclude:
@@ -1353,7 +1373,7 @@ class ProxyApp:
                 continue
             acquired = await ctx.gate.acquire(timeout=0.0)
             if acquired:
-                return name
+                return name, ctx
 
         if plan.queue_candidate is not None and plan.queue_candidate not in exclude:
             elapsed = time.monotonic() - admit_start
@@ -1376,7 +1396,7 @@ class ProxyApp:
                             await ctx.gate.release()
                         raise
                     if acquired:
-                        return plan.queue_candidate
+                        return plan.queue_candidate, ctx
 
         return None
 
