@@ -694,7 +694,13 @@ def _build_serve_app(
         if rc_kwargs:
             routing_config = RoutingConfig(**rc_kwargs)
 
-    model_map_mgr = ModelMapManager(db=route_table.db)
+    # valid_providers guards SQLite-loaded aliases against providers that
+    # were since removed from the config — without it a stale row makes its
+    # model route nowhere, silently (WI-12b).
+    model_map_mgr = ModelMapManager(
+        db=route_table.db,
+        valid_providers=frozenset(providers),
+    )
     model_map_mgr.load_from_config(
         config_data, overwrite=store_path is None
     )

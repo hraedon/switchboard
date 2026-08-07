@@ -15,6 +15,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import sqlite3
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -972,7 +973,17 @@ async def handle_model_map_set(
             return
 
     aliases = {str(k): str(v) for k, v in aliases_raw.items()}
-    model_map_mgr.set_model(model_name, aliases)
+    # The store writes DB-first (WI-12b): a failure here means nothing was
+    # saved, so answer 500 rather than claim success the store never made.
+    try:
+        model_map_mgr.set_model(model_name, aliases)
+    except sqlite3.Error as exc:
+        log.error("model-map set failed for %s: %s", model_name, exc)
+        await send_json(
+            send, 500, {"error": "model map store write failed"},
+            extra_headers=cors,
+        )
+        return
 
     log.info(
         "model-map set: %s -> %d alias(es)",
@@ -1013,7 +1024,17 @@ async def handle_model_map_delete(
         )
         return
 
-    removed = model_map_mgr.remove_model(model_name)
+    # Mirrors the set handler: the store deletes DB-first, so a failure
+    # means the entry is still live and 500 is the honest answer.
+    try:
+        removed = model_map_mgr.remove_model(model_name)
+    except sqlite3.Error as exc:
+        log.error("model-map delete failed for %s: %s", model_name, exc)
+        await send_json(
+            send, 500, {"error": "model map store write failed"},
+            extra_headers=cors,
+        )
+        return
     if not removed:
         await send_json(
             send, 404, {"error": "model not found"}, extra_headers=cors,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from typing import Any
 
 import httpx
@@ -494,6 +495,51 @@ async def test_handle_model_map_set_wrong_content_type_returns_415() -> None:
     await handle_model_map_set(send, receive, mgr, "admin-secret", scope)
     status, _ = _parse_response(messages)
     assert status == 415
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_set_store_failure_returns_500_json() -> None:
+    """A store write failure must surface as a JSON 500, never as success
+    (WI-12b: the old memory-first order made the handler report a save a
+    restart would revert)."""
+    db = sqlite3.connect(":memory:")
+    mgr = ModelMapManager(db=db)
+    db.close()  # subsequent writes raise sqlite3.ProgrammingError
+    providers = {"umans": _make_provider_context("umans")}
+    scope = _authed_scope()
+    body = json.dumps(
+        {"model": "kimi", "aliases": {"umans": "umans-kimi"}}
+    ).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_model_map_set(
+        send, receive, mgr, "admin-secret", scope, None, providers
+    )
+    status, resp_body = _parse_response(messages)
+    assert status == 500
+    data = json.loads(resp_body)
+    assert "error" in data
+    # Memory was not mutated: the handler's failure report is honest.
+    assert "kimi" not in mgr.get_model_map()
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_delete_store_failure_returns_500_json() -> None:
+    db = sqlite3.connect(":memory:")
+    mgr = ModelMapManager(db=db)
+    mgr.set_model("kimi", {"umans": "umans-kimi"})
+    db.close()
+    scope = _authed_scope(method="DELETE")
+    messages, send = _make_send()
+    await handle_model_map_delete(
+        send, mgr, "admin-secret", scope, "kimi"
+    )
+    status, resp_body = _parse_response(messages)
+    assert status == 500
+    data = json.loads(resp_body)
+    assert "error" in data
+    # The entry survives — memory still agrees with the (unreachable) store.
+    assert mgr.get_model_map().alias_for("kimi", "umans") == "umans-kimi"
 
 
 @pytest.mark.asyncio
