@@ -80,6 +80,7 @@ from switchboard.estimator import ThresholdEstimator
 from switchboard.limit import RETRY_AFTER_SHORT
 from switchboard.model_map import ModelMapManager
 from switchboard.overload import OverloadConfig, OverloadTracker
+from switchboard.provider_manager import ProviderManager
 from switchboard.providers import ProviderContext, snapshot_provider_state
 from switchboard.route_table import RouteTableManager
 from switchboard.session import (
@@ -374,7 +375,9 @@ class ProxyApp:
         reroute_statuses: frozenset[int] | None = None,
         reroute_max_attempts: int = 0,
     ) -> None:
-        self._providers = providers
+        self._provider_manager = ProviderManager(
+            providers, drain_timeout=drain_timeout
+        )
         self._route_table = route_table
         self._routing_config = routing_config or RoutingConfig()
         self._admin_token = admin_token
@@ -410,6 +413,21 @@ class ProxyApp:
         self._draining = False
         self._affinity: OrderedDict[str, RouteAffinity] = OrderedDict()
         self._provider_healthy_since: dict[str, float] = {}
+
+    @property
+    def _providers(self) -> dict[str, ProviderContext]:
+        """Snapshot of the live provider map (owned by the manager).
+
+        Copy-on-swap semantics: this reference is replaced, never mutated,
+        so any admission/status path that grabs it works on a consistent
+        view even while providers are added or removed mid-request.
+        """
+        return self._provider_manager.providers
+
+    @property
+    def provider_manager(self) -> ProviderManager:
+        """Runtime provider lifecycle (Plan 020 WI-2); admin handlers use this."""
+        return self._provider_manager
 
     @property
     def metrics(self) -> RoutingMetrics:
@@ -709,6 +727,10 @@ class ProxyApp:
                     await ctx.truth_source.close()
                 for ctx in self._providers.values():
                     await ctx.http_client.aclose()
+                # Contexts removed/replaced at runtime drain on their own
+                # tasks; settle them so exit never abandons a half-closed
+                # context (Plan 020 WI-2).
+                await self._provider_manager.shutdown()
                 self._route_table.close()
                 if self._budget_tracker is not None:
                     self._budget_tracker.prune_all(now=time.monotonic())
