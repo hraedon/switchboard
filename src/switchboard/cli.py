@@ -209,12 +209,32 @@ def _validate_config_pre_build(
 def _validate_config(
     config_data: dict[str, Any],
     providers: dict[str, Any],
+    *,
+    tombstoned: frozenset[str] = frozenset(),
 ) -> None:
     """Validate all configuration references (WI-006.8).
 
     Raises ``_ConfigError`` on the first validation failure.
+
+    ``tombstoned`` names providers the config store has disabled
+    (Plan 020 D1). A TOML reference to one of those is a deliberate
+    operator action, not a typo, and must not brick the next boot —
+    it degrades to a warning, and the routing core already skips
+    candidates with no live state. A name in neither set stays a
+    hard error: that IS the typo case validation exists for.
     """
     errors: list[str] = []
+    warnings: list[str] = []
+
+    def _check_ref(name: object, message: str) -> None:
+        if not isinstance(name, str):
+            return
+        if name in providers:
+            return
+        if name in tombstoned:
+            warnings.append(f"{message} (disabled in the config store)")
+        else:
+            errors.append(message)
 
     raw_providers = config_data.get("provider", {})
     if isinstance(raw_providers, dict):
@@ -237,9 +257,10 @@ def _validate_config(
                         errors.append(
                             f"default route: provider '{p}' must be a string"
                         )
-                    elif p not in providers:
-                        errors.append(
-                            f"default route references unknown provider: '{p}'"
+                    else:
+                        _check_ref(
+                            p,
+                            f"default route references unknown provider: '{p}'",
                         )
 
         for section_name, section_data in route_section.items():
@@ -254,10 +275,11 @@ def _validate_config(
                         errors.append(
                             f"route '{section_name}': provider must be a string"
                         )
-                    elif p not in providers:
-                        errors.append(
+                    else:
+                        _check_ref(
+                            p,
                             f"route '{section_name}' references unknown "
-                            f"provider: '{p}'"
+                            f"provider: '{p}'",
                         )
 
     routing_section = config_data.get("routing", {})
@@ -381,9 +403,10 @@ def _validate_config(
                     f"usage_24h_budget.'{prov_name}': cap_tokens must be > 0"
                 )
             if prov_name not in providers:
-                errors.append(
+                _check_ref(
+                    prov_name,
                     f"usage_24h_budget.'{prov_name}': "
-                    f"references unknown provider"
+                    f"references unknown provider",
                 )
 
     token_budget_section = config_data.get("token_budget", {})
@@ -430,8 +453,9 @@ def _validate_config(
                     f"soft_threshold must be in (0.0, 1.0]"
                 )
             if prov_name not in providers:
-                errors.append(
-                    f"token_budget.'{prov_name}': references unknown provider"
+                _check_ref(
+                    prov_name,
+                    f"token_budget.'{prov_name}': references unknown provider",
                 )
 
     model_section = config_data.get("model", {})
@@ -448,8 +472,10 @@ def _validate_config(
                         f"model '{model_name}': alias for '{provider_name}' must be a string"
                     )
                 if provider_name not in providers:
-                    errors.append(
-                        f"model '{model_name}': references unknown provider '{provider_name}'"
+                    _check_ref(
+                        provider_name,
+                        f"model '{model_name}': references unknown provider "
+                        f"'{provider_name}'",
                     )
 
     overload_section = config_data.get("overload", {})
@@ -483,10 +509,13 @@ def _validate_config(
             if not isinstance(tp, str):
                 errors.append("threshold.provider must be a string")
             elif tp not in providers:
-                errors.append(
-                    f"threshold.provider references unknown provider: '{tp}'"
+                _check_ref(
+                    tp,
+                    f"threshold.provider references unknown provider: '{tp}'",
                 )
 
+    for warning in warnings:
+        log.warning("config: %s", warning)
     if errors:
         raise _ConfigError("; ".join(errors))
 
@@ -629,6 +658,11 @@ def _build_serve_app(
     # NOTE: `effective` sections carry raw credentials (construction path
     # only) — they are never serialized.
     effective = config_store.effective_providers(config_data)
+    tombstoned_providers = frozenset(
+        str(row["name"])
+        for row in config_store.list_providers()
+        if not row["enabled"]
+    )
 
     providers = build_provider_contexts_from_config(
         {"provider": effective},
@@ -640,7 +674,9 @@ def _build_serve_app(
         )
 
     try:
-        _validate_config(config_data, providers)
+        _validate_config(
+            config_data, providers, tombstoned=tombstoned_providers
+        )
     except _ConfigError:
         for ctx in providers.values():
             ctx.reconcile._stopped = True
@@ -651,7 +687,7 @@ def _build_serve_app(
         route_table.set_default_providers(default_providers)
 
     for name in default_providers:
-        if name not in providers:
+        if name not in providers and name not in tombstoned_providers:
             raise _ConfigError(
                 f"default route references unknown provider: {name}"
             )

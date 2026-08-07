@@ -438,3 +438,55 @@ class TestConfigStoreBootMerge:
         assert set(app._providers) == {"umans"}
         # The store row won: upstream comes from the row, not the TOML.
         assert app._providers["umans"].upstream_url == "http://127.0.0.1:9009"
+
+
+def test_tombstoned_provider_reference_warns_not_bricks(
+    tmp_path, caplog
+) -> None:
+    """A GUI-tombstoned provider referenced by TOML routes/models must not
+    make the config unbootable — deliberate operator action degrades to a
+    warning; a genuinely unknown name stays a hard error (WI-3/4 review
+    open question 1)."""
+    import logging
+
+    import httpx
+
+    from switchboard.cli import _ConfigError, _validate_config
+    from switchboard.gate import PermitGate
+    from switchboard.limit import BreakerConfig
+    from switchboard.providers import ProviderContext
+    from switchboard.reconcile import ReconciliationLoop
+    from switchboard.truth import NullTruthSource
+
+    gate = PermitGate(initial_capacity=0)
+    truth = NullTruthSource(provider="generic")
+    ctx = ProviderContext(
+        name="alive",
+        upstream_url="https://a.example.com",
+        gate=gate,
+        reconcile=ReconciliationLoop(
+            truth_source=truth,
+            gate=gate,
+            max_concurrency=1,
+            provider_type="generic",
+            breaker_config=BreakerConfig(),
+        ),
+        truth_source=truth,
+        http_client=httpx.AsyncClient(),
+    )
+    config = {
+        "route": {"default": {"providers": ["alive", "buried"]}},
+        "model": {"m": {"alive": "m", "buried": "m-alias"}},
+    }
+
+    with caplog.at_level(logging.WARNING, "switchboard.cli"):
+        _validate_config(
+            config, {"alive": ctx}, tombstoned=frozenset({"buried"})
+        )
+    assert any("buried" in r.message for r in caplog.records)
+    assert any("disabled in the config store" in r.message for r in caplog.records)
+
+    import pytest as _pytest
+
+    with _pytest.raises(_ConfigError):
+        _validate_config(config, {"alive": ctx}, tombstoned=frozenset())
