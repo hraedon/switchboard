@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "agent-notes orient --path /projects/switchboard"
+            "command": "agent-notes orient"
           }
         ]
       }
