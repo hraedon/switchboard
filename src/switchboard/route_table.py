@@ -183,6 +183,13 @@ class RouteTableManager:
         """
         self._default_providers = providers
         if not persist:
+            # The flag tracks the provenance of the CURRENT value, so an
+            # in-memory replacement clears it: what is live is now a derived
+            # value, not the row on disk. Only `load_from_config` reads it and
+            # only before this point in the boot merge, so this is hygiene
+            # rather than a fix — but a flag that outlives the value it
+            # describes is exactly the kind of thing a later caller trusts.
+            self._default_from_store = False
             return
         self._default_from_store = True
         if self._db is not None:

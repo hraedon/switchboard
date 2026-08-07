@@ -246,6 +246,15 @@ Carried forward deliberately, not forgotten:
   Tighten estate-wide in Wave 2 (all modern browsers send
   `Sec-Fetch-Site`; the permissive branch exists for curl workflows —
   decide whether to keep it for token-authed requests only).
+
+  Still open, and now inherited by `PUT /admin/routes/default` as well
+  (WI-8a review, GLM). Deliberately NOT fixed there: it is pre-existing
+  and estate-wide, so fixing it inside one WI would change the auth
+  posture of every mutating endpoint under cover of a routing change.
+  The count of endpoints riding on it grows with each Wave 2 panel —
+  the longer this waits, the larger the blast radius of the eventual
+  fix, which argues for taking it as its own WI early in Wave 2 rather
+  than as a rider on the last one.
 - **First PUT of a TOML-only provider** (finding 3, residual): the list
   now exposes `key_mode`/`api_key_set` so the GUI can pre-fill, but the
   API itself still accepts a full-row PUT that changes key_mode without

@@ -253,6 +253,27 @@ def test_corrupt_stored_default_does_not_brick_boot(tmp_path, bad_value) -> None
     mgr.close()
 
 
+def test_in_memory_set_clears_the_provenance_flag(tmp_path) -> None:
+    """The flag describes the CURRENT value, so mutating it in memory clears
+    it — otherwise the boot merge leaves behind a flag claiming the live
+    default came from the store after it has already been filtered."""
+    store = str(tmp_path / "routes.db")
+
+    mgr = RouteTableManager(sqlite_path=store)
+    mgr.set_default_providers(("ollama", "umans"), persist=True)
+    assert mgr.default_from_store is True
+
+    # What the boot merge does after filtering an unknown/tombstoned name.
+    mgr.set_default_providers(("ollama",))
+    assert mgr.default_from_store is False
+    mgr.close()
+
+    # The disk row is untouched by the in-memory narrowing.
+    reopened = RouteTableManager(sqlite_path=store)
+    assert reopened.default_providers == ("ollama", "umans")
+    reopened.close()
+
+
 def test_memory_only_manager_accepts_persist(tmp_path) -> None:
     """No store configured: the write applies live and is simply not durable."""
     mgr = RouteTableManager(default_providers=("umans",))
