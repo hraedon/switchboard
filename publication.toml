@@ -32,4 +32,4 @@ author_email = ["plm@hraedon.com"]
 # public: the repo has been cleared by a publication review. The CI identifier
 # gate fails closed on a missing denylist secret once this is set, because a
 # public repo with an unconfigured gate is a silent pass.
-visibility = "private-until-review"
+visibility = "public"
