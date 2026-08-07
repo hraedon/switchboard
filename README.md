@@ -7,13 +7,13 @@ healthy one and back as conditions change.
 
 ## Why it exists
 
-sluice is a single-upstream concurrency governor: one provider, one gate, one
-reconcile loop. Its design principles (inert in-path, cache-transparency, no
-model routing) are load-bearing and enforced by tests. Multi-provider routing
-fundamentally changes those assumptions, so switchboard is a separate project
-that **imports sluice's pure core** (`sluice.control`, `sluice.gate`,
-`sluice.reconcile`, the `TruthSource` protocol) and builds a routing shell on
-top.
+switchboard began as a routing shell over sluice's single-upstream
+concurrency core. It is now **standalone**: Plan 018 dropped the dependency
+and absorbed the pure core it needed, so the only runtime dependencies are
+`httpx` and `uvicorn`. `switchboard.control`, `.gate`, and `.reconcile` are
+switchboard's own, and `switchboard.overload` deliberately diverges from
+sluice's breaker — routing *away* to another provider is inherently
+multi-provider, which a single-upstream breaker cannot express.
 
 ## What it does
 
@@ -31,8 +31,8 @@ top.
   request on another eligible provider *before any byte reaches the client*,
   so a delegated agent gets an answer instead of an error or an endless
   client-side retry loop. Opt-in via `[reroute]`; see below
-- **Streams** request/response bytes through untouched (same streaming +
-  disconnect-cancellation + phantom-prevention logic as sluice)
+- **Streams** request/response bytes through untouched, with
+  disconnect-cancellation and phantom-prevention
 - Consumes the **usage-dashboard** `/readings` API as a truth source for
   providers that have no native usage endpoint (e.g. ollama)
 
@@ -110,22 +110,58 @@ carries the upstream's status and `Retry-After`. Reroutes are counted in `/statu
 `switchboard_usage_reroutes_from_total{provider=...}` — the operational
 question being "who is running out".
 
+## The default route
+
+The default route is where a request goes when no route key matches it — in
+practice, most traffic. It is declared in TOML:
+
+```toml
+[route.default]
+providers = ["umans", "ollama"]   # preference order
+```
+
+and can be changed at runtime, from the dashboard or the API:
+
+```
+PUT /admin/routes/default    {"providers": ["ollama", "umans"]}
+```
+
+This matters more than it looks. The model map only *filters* a route's
+candidate providers — it never adds to them — so **a provider that no route
+names is never selected**, however it was configured. Before the default route
+became editable, adding a provider through the admin API had no effect on
+traffic until someone edited the TOML and restarted.
+
+Precedence follows the config store's rule: a default set through the API is
+persisted and **outranks the TOML default** on the next boot, so a change made
+in the GUI is not silently undone by a restart. `GET /admin/routes` reports
+the default in effect, and the boot log prints it as `default_route:`.
+
+Two deliberate asymmetries in how bad input is handled:
+
+- **A TOML default naming an unknown provider is a fatal config error.** The
+  operator has an editor and a loud failure is the fastest way to a typo.
+- **A stored default naming a provider the config no longer defines is a
+  warning**, and the unknown names are dropped. Being fatal here would let a
+  GUI edit make the process unbootable — and an unbootable process cannot be
+  fixed from the GUI, leaving hand-editing SQLite as the only way back in.
+
+If every provider in the default is disabled, startup fails rather than
+running with a default that routes nowhere.
+
 ## Design principles
 
 - **Deterministic, stdlib-only routing core.** The routing decision is a pure
-  function over provider states. No I/O, no async, no clock. Pass time and
-  observations in as arguments.
-- **Thin shell around sluice's core.** switchboard imports `sluice.control`,
-  `sluice.gate`, `sluice.reconcile`, and the `TruthSource` protocol. It adds
-  multi-provider composition and routing; it does not modify the core.
+  function over provider states: no I/O, no async, no clock — time and
+  observations are passed in as arguments. `switchboard.control` is
+  import-boundary tested to keep it that way; composition lives above it.
 - **Fail safe.** When all providers are pressured, route to the configured
   default and let its gate handle the rejection. Never route to a provider
   whose gate is closed without checking the alternatives.
-- **Streaming is sacred.** Same as sluice: never buffer a full response body;
-  proxy bytes as they arrive. A change that breaks token streaming is a
-  regression.
-- **Cache-transparency per-provider.** The request sluice egresses to each
-  upstream must be byte-for-byte what the client sent. Routing selects *which*
+- **Streaming is sacred.** Never buffer a full response body; proxy bytes as
+  they arrive. A change that breaks token streaming is a regression.
+- **Cache-transparency per-provider.** The request switchboard egresses to
+  each upstream must be byte-for-byte what the client sent. Routing selects *which*
   upstream; it does not reshape the request. *(Exception: when a `[model]` map
   is configured, the fallback path MAY rewrite the `model` field for a provider
   that expects a different name — that path is explicitly not byte-transparent.
@@ -140,7 +176,8 @@ question being "who is running out".
 - Overloaded-response breaker (503/529 → cooldown → failover)
 - Model-aware failover with per-provider model rewriting (`[model]` map)
 - usage-dashboard integration as an ollama truth source
-- Admin dashboard for route table CRUD
+- Admin dashboard for route table CRUD, including runtime editing of the
+  default route
 - Metrics per-provider and per-client
 
 **Out (for now):**
@@ -148,7 +185,6 @@ question being "who is running out".
 - Per-client weighting or fair queuing beyond FIFO per provider
 
 **Non-goals:**
-- Replacing sluice for single-provider use cases
 - Building a general-purpose API gateway
 - Prompt logging, response caching, or content inspection
 
@@ -156,6 +192,5 @@ question being "who is running out".
 
 | Tool | Role |
 |---|---|
-| **sluice** | Single-upstream concurrency governor. switchboard imports its core. |
-| **usage-dashboard** | Multi-provider usage monitor running in k8s. switchboard consumes its `/readings` API for ollama usage data. |
+| **usage-dashboard** | Multi-provider usage monitor running in k8s. switchboard consumes its `/readings` API as a truth source for providers with no native usage endpoint. |
 | **opencode** | A client of switchboard. Points its `baseURL` at switchboard; switchboard handles routing transparently. |

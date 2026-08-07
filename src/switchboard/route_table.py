@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any
 
 from switchboard.control import RouteEntry, RouteTable
+
+log = logging.getLogger("switchboard.route_table")
 
 
 class RouteTableManager:
@@ -22,6 +25,10 @@ class RouteTableManager:
     ) -> None:
         self._entries: dict[str, RouteEntry] = {}
         self._default_providers: tuple[str, ...] = default_providers
+        #: True when :attr:`_default_providers` came from the store rather
+        #: than from TOML or the constructor. Drives the D1 precedence rule
+        #: in :meth:`load_from_config`.
+        self._default_from_store: bool = False
         self._sqlite_path: str | None = sqlite_path
         self._db: sqlite3.Connection | None = None
 
@@ -34,6 +41,15 @@ class RouteTableManager:
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS routes "
                 "(key TEXT PRIMARY KEY, providers TEXT, created_at REAL)"
+            )
+            # The default route is a single row in its own table rather than a
+            # sentinel key in `routes`: `routes` is keyed by hashed API key and
+            # its rows are enumerated by list_entries(), so a sentinel would
+            # surface in the GUI route list as a phantom keyed route.
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS route_default "
+                "(id INTEGER PRIMARY KEY CHECK (id = 1), "
+                "providers TEXT, updated_at REAL)"
             )
             self._db.commit()
             self._load_from_db()
@@ -49,6 +65,40 @@ class RouteTableManager:
                 key=key,
                 providers=tuple(providers_list),
             )
+
+        row = db.execute(
+            "SELECT providers FROM route_default WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return
+        try:
+            stored_default = json.loads(row[0])
+        except (TypeError, json.JSONDecodeError):
+            # A corrupt row must not brick boot — the TOML/constructor default
+            # stands and the operator can rewrite it through the API.
+            log.warning(
+                "route table: default route row is not valid JSON; "
+                "ignoring it and keeping the config-declared default"
+            )
+            return
+        if not isinstance(stored_default, list) or not all(
+            isinstance(p, str) for p in stored_default
+        ):
+            log.warning(
+                "route table: default route row is not a list of strings; "
+                "ignoring it and keeping the config-declared default"
+            )
+            return
+        if not stored_default:
+            # An empty persisted default would route nothing anywhere. Treat
+            # it as absent rather than as an instruction to black-hole traffic.
+            log.warning(
+                "route table: persisted default route is empty; "
+                "keeping the config-declared default"
+            )
+            return
+        self._default_providers = tuple(stored_default)
+        self._default_from_store = True
 
     def lookup(self, hashed_key: str) -> tuple[str, ...]:
         """Return ordered provider list for a hashed key, or default."""
@@ -103,14 +153,45 @@ class RouteTableManager:
         """The default provider list for unregistered route keys."""
         return self._default_providers
 
-    def set_default_providers(self, providers: tuple[str, ...]) -> None:
-        """Replace the default provider list (in-memory; never persisted).
+    @property
+    def default_from_store(self) -> bool:
+        """True when the live default route was loaded from the store.
 
-        Exists for the boot merge (Plan 020 WI-4): the config store shares
-        this manager's SQLite connection, so the table must be constructed
-        before the effective provider set — the fallback default — is known.
+        Lets the boot merge tell an operator-set default (which must survive
+        a restart) apart from one derived from TOML or from the all-providers
+        fallback.
+        """
+        return self._default_from_store
+
+    def set_default_providers(
+        self, providers: tuple[str, ...], *, persist: bool = False
+    ) -> None:
+        """Replace the default provider list.
+
+        Without ``persist`` this is an in-memory change only. That is the
+        boot-merge path (Plan 020 WI-4): the config store shares this
+        manager's SQLite connection, so the table must be constructed before
+        the effective provider set — the fallback default — is known, and the
+        derived values computed there (the all-providers fallback, the
+        tombstone filter) are *conclusions about this boot*, not operator
+        intent. Persisting them would freeze a transient condition: re-enable
+        a tombstoned provider and the filtered default would still be on disk.
+
+        ``persist=True`` is the operator path (Plan 020 WI-8) — a default set
+        through the admin API is intent, and must survive a restart. It then
+        takes precedence over the TOML default, per D1's store-wins rule.
         """
         self._default_providers = providers
+        if not persist:
+            return
+        self._default_from_store = True
+        if self._db is not None:
+            self._db.execute(
+                "INSERT OR REPLACE INTO route_default "
+                "(id, providers, updated_at) VALUES (1, ?, ?)",
+                (json.dumps(list(providers)), time.time()),
+            )
+            self._db.commit()
 
     def get_route_table(self) -> RouteTable:
         """Return a frozen RouteTable snapshot for the pure routing function."""
@@ -135,6 +216,12 @@ class RouteTableManager:
         When ``overwrite`` is False (the default), file entries seed only
         absent keys — persisted runtime entries are preserved (WI-006.7).
         When True, file entries override persisted entries.
+
+        The default route follows the same rule (Plan 020 WI-8): a default
+        persisted by an operator through the admin API outranks the TOML
+        default, so that editing it in the GUI is not silently undone by the
+        next restart. ``overwrite=True`` — which the boot merge passes when
+        there is no store at all — restores TOML-wins.
         """
         route_section = config.get("route", {})
         if not isinstance(route_section, dict):
@@ -143,7 +230,9 @@ class RouteTableManager:
         default = route_section.get("default", {})
         if isinstance(default, dict):
             providers = default.get("providers")
-            if isinstance(providers, list):
+            if isinstance(providers, list) and (
+                overwrite or not self._default_from_store
+            ):
                 self._default_providers = tuple(providers)
 
         for section_name, section_data in route_section.items():
