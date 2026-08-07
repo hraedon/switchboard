@@ -173,6 +173,12 @@ are so Plans 015/016 behavior is unchanged.
   errors from the 400 responses).
 - **WI-8**: Routing panel: route-table CRUD (exists) + strategy selector
   and pace knobs (burn rate, flap margin) once Wave 4 lands the config.
+  MUST include runtime editing of the DEFAULT route: the Wave 1 live
+  smoke proved a GUI-created provider serves only once a route names it
+  (the model map filters a route's candidates, it never adds to them),
+  and today the default route is boot-only — so "add provider" in the
+  GUI is a dead end until this lands. Persist the default in the store
+  alongside keyed routes.
 
 **Wave 3 — statistics (#2)**
 - **WI-9**: Speed sampling per D4 (TTFB, duration, tokens/sec) into
