@@ -572,6 +572,7 @@ def _build_serve_app(
     args: argparse.Namespace,
 ) -> tuple[Any, str, int, str, float]:
     """Build the ProxyApp + bind params from CLI args, env, and config file."""
+    from switchboard.config_store import ConfigStoreManager
     from switchboard.control import RoutingConfig
     from switchboard.estimator import ThresholdEstimator
     from switchboard.model_map import ModelMapManager
@@ -591,8 +592,46 @@ def _build_serve_app(
 
     store_path = _resolve_route_table_store(args, config_data)
 
+    # Boot merge (Plan 020 WI-4, D1): the config store shares the route
+    # table's SQLite connection, so the route table is built FIRST — seeded
+    # with the config-declared default route only; the fallback default
+    # (all providers) is not known until the store has overlaid the TOML.
+    default_providers: tuple[str, ...] = ()
+    route_section = config_data.get("route", {})
+    if isinstance(route_section, dict):
+        default_cfg = route_section.get("default", {})
+        if isinstance(default_cfg, dict):
+            providers_list = default_cfg.get("providers")
+            if isinstance(providers_list, list):
+                default_providers = tuple(providers_list)
+
+    try:
+        route_table = RouteTableManager(
+            default_providers=default_providers,
+            sqlite_path=store_path,
+        )
+    except Exception as exc:
+        raise _ConfigError(
+            f"failed to open route table store: {exc}"
+        ) from exc
+
+    # Matches the route table's dual mode: no store path = memory-only
+    # (the admin provider endpoints work, but their writes don't survive
+    # a restart).
+    if route_table.db is not None:
+        config_store = ConfigStoreManager(db=route_table.db)
+    else:
+        config_store = ConfigStoreManager()
+
+    # D1 precedence: a store row replaces its TOML section wholesale, and a
+    # disabled row (tombstone) removes the TOML provider from the effective
+    # set. The strict TOML validation above already ran on the raw file.
+    # NOTE: `effective` sections carry raw credentials (construction path
+    # only) — they are never serialized.
+    effective = config_store.effective_providers(config_data)
+
     providers = build_provider_contexts_from_config(
-        config_data,
+        {"provider": effective},
         history_store_path=store_path,
     )
     if not providers:
@@ -607,33 +646,15 @@ def _build_serve_app(
             ctx.reconcile._stopped = True
         raise
 
-    default_providers: tuple[str, ...] = ()
-    route_section = config_data.get("route", {})
-    if isinstance(route_section, dict):
-        default_cfg = route_section.get("default", {})
-        if isinstance(default_cfg, dict):
-            providers_list = default_cfg.get("providers")
-            if isinstance(providers_list, list):
-                default_providers = tuple(providers_list)
-
     if not default_providers:
         default_providers = tuple(providers.keys())
+        route_table.set_default_providers(default_providers)
 
     for name in default_providers:
         if name not in providers:
             raise _ConfigError(
                 f"default route references unknown provider: {name}"
             )
-
-    try:
-        route_table = RouteTableManager(
-            default_providers=default_providers,
-            sqlite_path=store_path,
-        )
-    except Exception as exc:
-        raise _ConfigError(
-            f"failed to open route table store: {exc}"
-        ) from exc
 
     route_table.load_from_config(config_data, overwrite=store_path is None)
 
@@ -699,7 +720,7 @@ def _build_serve_app(
     # model route nowhere, silently (WI-12b).
     model_map_mgr = ModelMapManager(
         db=route_table.db,
-        valid_providers=frozenset(providers),
+        valid_providers=frozenset(effective),
     )
     model_map_mgr.load_from_config(
         config_data, overwrite=store_path is None
@@ -842,6 +863,16 @@ def _build_serve_app(
                 cap_tokens=cap_tokens,
             )
 
+    # Boot TOML sections, threaded to the admin layer for the D1 tombstone
+    # and /admin/config/effective paths. They may carry an inline api_key;
+    # every serialization surface masks them.
+    raw_provider_tables = config_data.get("provider")
+    toml_provider_sections: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_provider_tables, dict):
+        for prov_name, prov_section in raw_provider_tables.items():
+            if isinstance(prov_section, dict):
+                toml_provider_sections[str(prov_name)] = dict(prov_section)
+
     app = ProxyApp(
         providers=providers,
         route_table=route_table,
@@ -857,11 +888,26 @@ def _build_serve_app(
         estimator=estimator,
         budget_tracker=budget_tracker,
         usage_history_tracker=usage_history_tracker,
+        config_store=config_store,
+        toml_provider_names=frozenset(toml_provider_sections),
+        toml_provider_sections=toml_provider_sections,
     )
+
+    store_backed = {
+        str(row["name"])
+        for row in config_store.list_providers()
+        if row["enabled"]
+    }
+    n_store = sum(1 for name in providers if name in store_backed)
 
     log.info("switchboard %s starting", __version__)
     log.info("  listen:            %s:%d", host, port)
-    log.info("  providers:         %s", ", ".join(providers.keys()))
+    log.info(
+        "  providers:         %s (%d from TOML, %d from store)",
+        ", ".join(providers.keys()),
+        len(providers) - n_store,
+        n_store,
+    )
     log.info("  default_route:     %s", " -> ".join(default_providers))
     log.info("  queue_timeout:     %.1fs", queue_timeout)
     log.info("  drain_timeout:     %.1fs", drain_timeout)

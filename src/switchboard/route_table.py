@@ -103,6 +103,15 @@ class RouteTableManager:
         """The default provider list for unregistered route keys."""
         return self._default_providers
 
+    def set_default_providers(self, providers: tuple[str, ...]) -> None:
+        """Replace the default provider list (in-memory; never persisted).
+
+        Exists for the boot merge (Plan 020 WI-4): the config store shares
+        this manager's SQLite connection, so the table must be constructed
+        before the effective provider set — the fallback default — is known.
+        """
+        self._default_providers = providers
+
     def get_route_table(self) -> RouteTable:
         """Return a frozen RouteTable snapshot for the pure routing function."""
         return RouteTable(
