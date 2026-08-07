@@ -460,3 +460,29 @@ def test_sqlite_file_is_chmodded_0600(tmp_path: Path) -> None:
     mgr = ConfigStoreManager(sqlite_path=str(db_file))
     assert (db_file.stat().st_mode & 0o777) == 0o600
     mgr.close()
+
+
+def test_usage_key_env_round_trips_and_reaches_section(tmp_path) -> None:
+    """usage_key_env survives store round-trip and lands in the TOML-shaped
+    section so a store-managed umans provider keeps its usage-history key
+    (WI-1 review finding 4)."""
+    mgr = ConfigStoreManager(sqlite_path=str(tmp_path / "cfg.sqlite"))
+    mgr.upsert(
+        "umans-a",
+        {
+            "upstream": "https://api.code.umans.ai",
+            "provider_type": "umans",
+            "target": 3,
+            "key_mode": "env",
+            "api_key_env": "UMANS_KEY",
+            "usage_key_env": "UMANS_USAGE_KEY",
+        },
+    )
+    assert mgr.get("umans-a")["usage_key_env"] == "UMANS_USAGE_KEY"
+    section = mgr.to_provider_section("umans-a")
+    assert section["usage_key_env"] == "UMANS_USAGE_KEY"
+    mgr.close()
+
+    reloaded = ConfigStoreManager(sqlite_path=str(tmp_path / "cfg.sqlite"))
+    assert reloaded.get("umans-a")["usage_key_env"] == "UMANS_USAGE_KEY"
+    reloaded.close()

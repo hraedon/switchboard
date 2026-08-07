@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS provider_config (
     auth_prefix TEXT,
     dashboard_url TEXT,
     dashboard_token_env TEXT,
+    usage_key_env TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
@@ -82,6 +83,7 @@ _COLUMNS = (
     "auth_prefix",
     "dashboard_url",
     "dashboard_token_env",
+    "usage_key_env",
     "enabled",
     "created_at",
     "updated_at",
@@ -108,6 +110,7 @@ class _ProviderRow:
     auth_prefix: str | None = None
     dashboard_url: str | None = None
     dashboard_token_env: str | None = None
+    usage_key_env: str | None = None
     enabled: int = 1
     created_at: float = 0.0
     updated_at: float = 0.0
@@ -200,9 +203,10 @@ class ConfigStoreManager:
                     auth_prefix=_opt_str(raw[9]),
                     dashboard_url=_opt_str(raw[10]),
                     dashboard_token_env=_opt_str(raw[11]),
-                    enabled=1 if raw[12] else 0,
-                    created_at=float(raw[13]),
-                    updated_at=float(raw[14]),
+                    usage_key_env=_opt_str(raw[12]),
+                    enabled=1 if raw[13] else 0,
+                    created_at=float(raw[14]),
+                    updated_at=float(raw[15]),
                 )
                 _validate_row(row)
             except (ValueError, TypeError, IndexError):
@@ -255,6 +259,7 @@ class ConfigStoreManager:
                     row.auth_prefix,
                     row.dashboard_url,
                     row.dashboard_token_env,
+                    row.usage_key_env,
                     row.enabled,
                     row.created_at,
                     row.updated_at,
@@ -304,6 +309,7 @@ class ConfigStoreManager:
             auth_prefix=_opt_str_field(fields, "auth_prefix"),
             dashboard_url=_opt_str_field(fields, "dashboard_url"),
             dashboard_token_env=_opt_str_field(fields, "dashboard_token_env"),
+            usage_key_env=_opt_str_field(fields, "usage_key_env"),
             enabled=1 if enabled_raw else 0,
             created_at=existing.created_at if existing is not None else now,
             updated_at=now,
@@ -400,6 +406,8 @@ class ConfigStoreManager:
             section["dashboard_url"] = row.dashboard_url
         if row.dashboard_token_env is not None:
             section["dashboard_token_env"] = row.dashboard_token_env
+        if row.usage_key_env is not None:
+            section["usage_key_env"] = row.usage_key_env
         return section
 
     def effective_providers(
@@ -467,6 +475,7 @@ def _masked(row: _ProviderRow) -> dict[str, object]:
         "auth_prefix": row.auth_prefix,
         "dashboard_url": row.dashboard_url,
         "dashboard_token_env": row.dashboard_token_env,
+        "usage_key_env": row.usage_key_env,
         "enabled": bool(row.enabled),
         "created_at": row.created_at,
         "updated_at": row.updated_at,
