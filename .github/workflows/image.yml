@@ -35,10 +35,6 @@ jobs:
         with:
           python-version: "3.13"
       - run: uv venv
-      # Same sibling requirement as ci.yml: pyproject pins sluice by path, and
-      # a CLI override does not beat a pyproject source.
-      - name: Check out sluice as a sibling (pyproject pins it by path)
-        run: git clone --depth 1 https://github.com/hraedon/sluice.git ../sluice
       # pip is installed deliberately: test_wheel_install shells out to
       # `python -m pip wheel` to prove a clean install works, and a uv-created
       # venv has no pip. Without it that test fails everywhere, which is how it
@@ -57,18 +53,6 @@ jobs:
         with:
           persist-credentials: false
 
-      # Must live INSIDE the workspace: actions/checkout rejects a `path`
-      # outside GITHUB_WORKSPACE, so the sibling layout used locally cannot
-      # be reproduced literally here. The Dockerfile does not care — a named
-      # build context can point anywhere — so the workflow adapts to the
-      # runner rather than the Dockerfile adapting to CI.
-      - name: Check out sluice (public sibling dependency)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: hraedon/sluice
-          path: _sluice
-          persist-credentials: false
-
       - name: Set up BuildKit
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
@@ -85,7 +69,6 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          build-contexts: sluice=${{ github.workspace }}/_sluice
           load: true
           push: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
           tags: |
@@ -102,13 +85,16 @@ jobs:
           echo "installed version:      ${actual}"
           test "${expected}" = "${actual}"
 
-          # sluice has the same public-namesake collision (ours 1.3.9 vs an
-          # unrelated public 0.3.1) and today escapes it only by version
-          # coincidence plus the by-file install. Assert it symmetrically
-          # rather than relying on that coincidence holding.
-          sluice_version=$(docker run --rm --entrypoint python3 "$IMAGE" -c "import importlib.metadata as m; print(m.distribution('sluice').version)")
-          echo "installed sluice:       ${sluice_version}"
-          case "${sluice_version}" in
-            1.*) ;;
-            *) echo "::error::sluice ${sluice_version} is not our 1.x package"; exit 1 ;;
-          esac
+          # Plan 018 removed the sluice dependency. The public PyPI `sluice`
+          # (an unrelated project) must never reappear in this image — its
+          # presence would mean a dependency regression or a supply-chain
+          # surprise, so assert absence rather than assuming it.
+          docker run --rm --entrypoint python3 "$IMAGE" -c "
+          import importlib.metadata as m
+          try:
+              v = m.distribution('sluice').version
+          except m.PackageNotFoundError:
+              print('sluice: absent, as required')
+          else:
+              raise SystemExit(f'sluice {v} is installed but the dependency was removed in Plan 018')
+          "
