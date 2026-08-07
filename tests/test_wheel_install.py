@@ -1,24 +1,23 @@
-"""Clean wheel install test — Plan 006 §6.
+"""Clean wheel install test — Plan 006 §6, simplified by Plan 018.
 
 Verifies that switchboard can be built as a wheel and installed into a
-fresh virtual environment without relying on the editable install or
-sibling source directories.  The test builds wheels for both switchboard
-and sluice (sluice is not yet on PyPI at the required version), creates a
-clean venv, installs both, and smoke-tests import, ``--version``, and
-``build_parser()``.
+fresh virtual environment without relying on the editable install: builds
+the wheel, creates a clean venv, installs it, and smoke-tests import,
+``--version``, and ``build_parser()``.
+
+Since Plan 018 removed the private ``sluice`` dependency, the install must
+also NOT pull in anything named ``sluice`` — the public PyPI package of
+that name is an unrelated project, so its appearance here would mean a
+dependency regression or a supply-chain surprise.
 """
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_SLUICE_SOURCE_DIR = Path(os.environ.get("SLUICE_SOURCE_DIR", str(_PROJECT_ROOT.parent / "sluice")))
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -28,13 +27,10 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 
 def test_clean_wheel_install(tmp_path: Path) -> None:
     """Build a wheel, install in a clean venv, smoke-test the package."""
-    if not _SLUICE_SOURCE_DIR.is_dir():
-        pytest.skip(f"sluice source not found at {_SLUICE_SOURCE_DIR}")
-
     wheel_dir = tmp_path / "wheels"
     wheel_dir.mkdir()
 
-    # --- Build wheels -------------------------------------------------------
+    # --- Build the wheel ----------------------------------------------------
     _run(
         [
             sys.executable,
@@ -47,23 +43,9 @@ def test_clean_wheel_install(tmp_path: Path) -> None:
             str(wheel_dir),
         ],
     )
-    _run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "wheel",
-            str(_SLUICE_SOURCE_DIR),
-            "--no-deps",
-            "-w",
-            str(wheel_dir),
-        ],
-    )
 
     sb_wheels = sorted(wheel_dir.glob("switchboard-*.whl"))
-    sluice_wheels = sorted(wheel_dir.glob("sluice-*.whl"))
     assert len(sb_wheels) == 1, f"expected 1 switchboard wheel, found {sb_wheels}"
-    assert len(sluice_wheels) == 1, f"expected 1 sluice wheel, found {sluice_wheels}"
 
     # --- Create clean venv -------------------------------------------------
     venv_dir = tmp_path / "venv"
@@ -72,10 +54,8 @@ def test_clean_wheel_install(tmp_path: Path) -> None:
     venv_python = venv_dir / "bin" / "python"
     venv_bin = venv_dir / "bin"
 
-    # --- Install both wheels (pip resolves cross-deps + pulls httpx/uvicorn) -
-    _run(
-        [str(venv_python), "-m", "pip", "install", str(sb_wheels[0]), str(sluice_wheels[0])],
-    )
+    # --- Install the wheel (pip pulls httpx/uvicorn from the index) ---------
+    _run([str(venv_python), "-m", "pip", "install", str(sb_wheels[0])])
 
     # --- 1. import switchboard ---------------------------------------------
     result = _run(
@@ -94,4 +74,25 @@ def test_clean_wheel_install(tmp_path: Path) -> None:
             "-c",
             "from switchboard.cli import build_parser; p = build_parser(); assert p is not None",
         ],
+    )
+
+    # --- 4. nothing named sluice came along --------------------------------
+    result = _run(
+        [
+            str(venv_python),
+            "-c",
+            (
+                "import importlib.metadata as m\n"
+                "try:\n"
+                "    v = m.distribution('sluice').version\n"
+                "except m.PackageNotFoundError:\n"
+                "    print('absent')\n"
+                "else:\n"
+                "    print(v)\n"
+            ),
+        ],
+    )
+    assert result.stdout.strip() == "absent", (
+        "the sluice dependency was removed in Plan 018, but "
+        f"sluice {result.stdout.strip()} arrived in a clean install"
     )

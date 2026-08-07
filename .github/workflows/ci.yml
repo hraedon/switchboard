@@ -33,12 +33,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv venv
-      # pyproject pins sluice to a SIBLING path so local work can test against
-      # a local sluice. uv honours that source, and a CLI override does not
-      # beat it — so the sibling has to exist here too. actions/checkout
-      # refuses a path outside the workspace, hence a plain clone.
-      - name: Check out sluice as a sibling (pyproject pins it by path)
-        run: git clone --depth 1 https://github.com/hraedon/sluice.git ../sluice
       # pip is installed deliberately: test_wheel_install shells out to
       # `python -m pip wheel` to prove a clean install works, and a uv-created
       # venv has no pip.

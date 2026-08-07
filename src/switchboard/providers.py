@@ -1,8 +1,9 @@
 """Provider context: gate + reconcile + truth source per upstream.
 
-Each :class:`ProviderContext` bundles the sluice building blocks
-(:class:`~sluice.gate.PermitGate`, :class:`~sluice.reconcile.ReconciliationLoop`,
-:class:`~sluice.providers.TruthSource`) for one upstream provider, plus an
+Each :class:`ProviderContext` bundles the vendored building blocks
+(:class:`~switchboard.gate.PermitGate`,
+:class:`~switchboard.reconcile.ReconciliationLoop`,
+:class:`~switchboard.truth.TruthSource`) for one upstream provider, plus an
 :class:`httpx.AsyncClient` for forwarding.  The factory functions construct
 these from a provider type and optional TOML config;
 :func:`snapshot_provider_state` bridges the live shell state into the pure
@@ -17,27 +18,21 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import httpx
-from sluice.control import (
-    AdaptiveConfig,
-    BreakerConfig,
-    ControllerConfig,
-)
-from sluice.gate import PermitGate
-from sluice.providers import (
+
+from switchboard.control import Availability, ProviderState, SignalFreshness
+from switchboard.dashboard import DashboardTruthSource
+from switchboard.gate import PermitGate
+from switchboard.limit import BreakerConfig
+from switchboard.reconcile import ReconciliationLoop
+from switchboard.truth import (
     Provider,
     TruthSource,
     get_provider,
     make_truth_source,
 )
-from sluice.reconcile import ReconciliationLoop
-
-from switchboard.control import Availability, ProviderState, SignalFreshness
-from switchboard.dashboard import DashboardTruthSource
 
 if TYPE_CHECKING:
-    from sluice.history import History
-    from sluice.history_store import HistoryStore
-
+    from switchboard.history import History, HistoryStore
     from switchboard.overload import OverloadTracker
     from switchboard.token_budget import TokenBudgetTracker
     from switchboard.usage_history import UsageHistoryTracker
@@ -99,14 +94,14 @@ def build_provider_context(
     auth_header_name: str = "authorization",
     auth_prefix: str | None = None,
 ) -> ProviderContext:
-    """Construct a :class:`ProviderContext` using sluice's building blocks.
+    """Construct a :class:`ProviderContext` from the vendored building blocks.
 
-    Resolves the provider type via :func:`sluice.providers.get_provider`,
-    constructs the appropriate :class:`~sluice.providers.TruthSource` via
-    :func:`sluice.providers.make_truth_source`, creates a
-    :class:`~sluice.gate.PermitGate` (initial capacity 0 — the reconcile
-    loop resizes it), and wires a :class:`~sluice.reconcile.ReconciliationLoop`
-    with the controller strategy matching the provider type.
+    Resolves the provider type via :func:`switchboard.truth.get_provider`,
+    constructs the appropriate :class:`~switchboard.truth.TruthSource` via
+    :func:`switchboard.truth.make_truth_source`, creates a
+    :class:`~switchboard.gate.PermitGate` (initial capacity 0 — the reconcile
+    loop resizes it), and wires a :class:`~switchboard.reconcile.ReconciliationLoop`
+    sized by the provider's target concurrency.
     """
     provider: Provider = get_provider(provider_type)
 
@@ -129,21 +124,14 @@ def build_provider_context(
 
     gate = PermitGate(initial_capacity=0)
 
-    controller_config = ControllerConfig(target=target)
-    breaker_config = BreakerConfig()
-
-    adaptive_config: AdaptiveConfig | None = None
-    if provider.controller == "adaptive":
-        adaptive_config = AdaptiveConfig(target=target)
-
     reconcile = ReconciliationLoop(
         truth_source=truth_source,
         gate=gate,
-        controller_config=controller_config,
-        breaker_config=breaker_config,
+        max_concurrency=target,
         poll_interval=poll_interval,
-        controller=provider.controller,
-        adaptive_config=adaptive_config,
+        breaker_config=BreakerConfig(),
+        provider_type=provider_type,
+        fresh_ttl=fresh_ttl,
         poll_interval_idle=poll_interval_idle,
         history=history,
         history_store=history_store,
@@ -193,9 +181,9 @@ def build_provider_contexts_from_config(
     :func:`build_provider_context` for each provider.
 
     When ``history_store_path`` is provided, each provider gets a per-provider
-    :class:`~sluice.history_store.SQLiteHistoryStore` (separate file per
+    :class:`~switchboard.history.SQLiteHistoryStore` (separate file per
     provider to avoid table-name conflicts) and a bounded in-memory
-    :class:`~sluice.history.History` ring — giving trend analysis that
+    :class:`~switchboard.history.History` ring — giving trend analysis that
     survives restarts (Plan 012 WI-2).
     """
     raw_providers = config.get("provider")
@@ -260,12 +248,17 @@ def build_provider_contexts_from_config(
         history_store: HistoryStore | None = None
         history: History | None = None
         if history_store_path:
-            from sluice.history import History as HistoryRing
-            from sluice.history_store import SQLiteHistoryStore
+            from switchboard.history import History as HistoryRing
+            from switchboard.history import SQLiteHistoryStore
 
             store_file = f"{history_store_path}.{_safe_filename(name)}.history"
             history_store = SQLiteHistoryStore(store_file)
             history = HistoryRing(maxlen=2880)
+            # Warm the ring from the store so the trend surface has data
+            # immediately after a restart — otherwise it stays empty for
+            # hours while the ring refills at poll cadence.
+            for entry in history_store.load_recent(2880):
+                history.append(entry)
 
         contexts[name] = build_provider_context(
             name=name,
@@ -307,7 +300,7 @@ def snapshot_provider_state(
     live state (Plan 006 §3, extended by Plan 010):
 
     * **Availability**:
-      - ``CLOSED`` if sluice reports low-interactivity (Plan 010 Feature 0,
+      - ``CLOSED`` if the reconcile loop reports low-interactivity (Plan 010 Feature 0,
         proactive), or the overload tracker is cooling (Plan 010 Feature A,
         reactive), or gate_closed_reason is boxed or breaker.
       - ``UNKNOWN`` if not ready (first poll not complete).
@@ -384,9 +377,9 @@ def snapshot_provider_state(
             )
         bre = limit_state.bucket_reset_epoch
         if bre is not None and bre > 0:
-            remaining = bre - _time.time()
-            if remaining > 0:
-                quota_resets_in = remaining
+            reset_in = bre - _time.time()
+            if reset_in > 0:
+                quota_resets_in = reset_in
 
     # Token-budget utilization (Plan 012 Feature B).
     token_utilization: float | None = None

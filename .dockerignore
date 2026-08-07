@@ -1,6 +1,5 @@
-# The build context is THIS repository only; sluice arrives through a named
-# BuildKit context (see Dockerfile). These patterns keep local state and
-# anything credential-shaped out of the image and off the daemon.
+# The build context is THIS repository only. These patterns keep local state
+# and anything credential-shaped out of the image and off the daemon.
 .git
 .venv
 **/__pycache__
@@ -14,6 +13,3 @@ samples
 secrets*
 *.key
 *.pem
-
-# CI checks sluice out here; it reaches the build as a named context.
-_sluice

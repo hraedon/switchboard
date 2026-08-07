@@ -14,15 +14,15 @@ import time
 from typing import Any
 
 import httpx
-from sluice.control import BreakerConfig, ControllerConfig
-from sluice.gate import PermitGate
-from sluice.providers import NullTruthSource
-from sluice.reconcile import ReconciliationLoop
 
 from switchboard.admin import handle_threshold_events, send_prometheus
 from switchboard.estimator import ThresholdEstimator
+from switchboard.gate import PermitGate
+from switchboard.limit import BreakerConfig
 from switchboard.providers import ProviderContext
 from switchboard.proxy import RoutingMetrics
+from switchboard.reconcile import ReconciliationLoop
+from switchboard.truth import NullTruthSource
 from switchboard.usage_history import PenaltyTokenSummary, UsageHistoryTracker
 
 
@@ -33,7 +33,7 @@ def _make_ctx(name: str = "umans") -> ProviderContext:
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=3),
+        max_concurrency=3,
         breaker_config=BreakerConfig(),
     )
     reconcile._first_poll_ok = True

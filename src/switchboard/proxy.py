@@ -32,6 +32,7 @@ import contextlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import time
 from collections import OrderedDict, deque
@@ -41,18 +42,6 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
-from sluice.admin import (
-    check_admin_auth,
-    cors_extra_headers,
-    is_admin_auth_value,
-    send_json,
-    send_text,
-)
-from sluice.reconcile import RETRY_AFTER_SHORT
-from sluice.session import (
-    SESSION_COOKIE,
-    LoginThrottle,
-)
 
 from switchboard.admin import (
     handle_config_get,
@@ -88,13 +77,25 @@ from switchboard.control import (
     should_reroute,
 )
 from switchboard.estimator import ThresholdEstimator
+from switchboard.limit import RETRY_AFTER_SHORT
 from switchboard.model_map import ModelMapManager
 from switchboard.overload import OverloadConfig, OverloadTracker
 from switchboard.providers import ProviderContext, snapshot_provider_state
 from switchboard.route_table import RouteTableManager
+from switchboard.session import (
+    SESSION_COOKIE,
+    LoginThrottle,
+)
 from switchboard.token_budget import TokenBudgetTracker
 from switchboard.usage_history import UsageHistoryTracker
 from switchboard.usage_observer import UsageObserver
+from switchboard.utils import (
+    check_admin_auth,
+    cors_extra_headers,
+    is_admin_auth_value,
+    send_json,
+    send_text,
+)
 
 log = logging.getLogger("switchboard.proxy")
 
@@ -1168,7 +1169,13 @@ class ProxyApp:
         Retry-After, keeping the client's backoff honest.
         """
         status = probe.status or 503
-        retry_after = probe.retry_after
+        # Retry-After is integer seconds on the wire (RFC 7231); round a
+        # fractional upstream value up so the client never retries early.
+        retry_after = (
+            math.ceil(probe.retry_after)
+            if probe.retry_after is not None
+            else RETRY_AFTER_SHORT
+        )
         await send_json(
             send,
             status,
@@ -1176,13 +1183,9 @@ class ProxyApp:
                 "error": "all eligible providers returned a usage error",
                 "reason": "usage_error_exhausted",
                 "upstream_status": status,
-                "retry_after": retry_after
-                if retry_after is not None
-                else RETRY_AFTER_SHORT,
+                "retry_after": retry_after,
             },
-            retry_after=(
-                retry_after if retry_after is not None else RETRY_AFTER_SHORT
-            ),
+            retry_after=retry_after,
         )
 
     async def _admit(
@@ -1538,7 +1541,9 @@ class ProxyApp:
                     self._overload_tracker.record_ok(ctx.name)
 
                 ctx.reconcile.record_response_headers(
-                    dict(response.headers), response.status_code
+                    dict(response.headers),
+                    response.status_code,
+                    now_monotonic=time.monotonic(),
                 )
 
                 # Usage-error reroute (Plan 010, reactive half). Nothing has

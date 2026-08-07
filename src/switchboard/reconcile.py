@@ -17,7 +17,10 @@ Absorbed from sluice.reconcile (Plan 017). Key simplifications:
   multi-provider routing won't route traffic to a CLOSED provider
   (review finding 14).
 - Stale data never widens the gate (review finding 13).
-- No history store, no phantom estimate, no singleton guard.
+- No phantom estimate, no singleton guard.
+- History recording restored (Plan 018 WI-2a): optional in-memory ring +
+  SQLite store via switchboard.history, generalized from sluice — see
+  switchboard/history.py for the field keep/drop decisions.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from collections.abc import Callable
 from typing import Any
 
 from switchboard.gate import PermitGate
+from switchboard.history import History, HistoryEntry, HistoryStore
 from switchboard.limit import (
     RETRY_AFTER_SHORT,
     BreakerConfig,
@@ -49,6 +53,8 @@ _RETRY_AFTER_STALE_CAP = 300
 _RETRY_AFTER_SATURATION_FLOOR = 5
 _RETRY_AFTER_SATURATION_CAP = 60
 _RETRY_AFTER_LOW_INTERACTIVITY_FLOOR = 5
+_PRUNE_INTERVAL_TICKS = 60
+_DEFAULT_HISTORY_TTL = 604800.0  # 7 days
 
 _OVERRIDE_WHITELIST = frozenset({"max_concurrency", "target"})
 
@@ -74,6 +80,23 @@ def _is_low_interactivity(reading: LimitState, *, now: float) -> bool:
         and reading.service_mode_resets_at_epoch is not None
         and now < reading.service_mode_resets_at_epoch
     )
+
+
+def _classify_penalty_band(reading: LimitState, *, now: float) -> str:
+    """Honest penalty band for history entries (pure).
+
+    switchboard has no controller band classifier; this derives the band
+    from the same reading checks the loop already performs each tick.
+    sluice's transient "reject" band (observed above hard_cap) is not
+    classified — the static loop has no concept for it.
+    """
+    if _is_hard_boxed(reading, now=now):
+        return "boxed"
+    if _is_low_interactivity(reading, now=now):
+        return LOW_INTERACTIVITY
+    if reading.priority_low:
+        return "low"
+    return "normal"
 
 
 def _saturation_retry_after(
@@ -113,6 +136,9 @@ class ReconciliationLoop:
         wall_clock: Callable[[], float] = time.time,
         poll_interval_idle: float | None = None,
         rng: Callable[[], float] = random.random,
+        history: History | None = None,
+        history_store: HistoryStore | None = None,
+        history_ttl: float = _DEFAULT_HISTORY_TTL,
     ) -> None:
         self._truth = truth_source
         self._gate = gate
@@ -128,6 +154,10 @@ class ReconciliationLoop:
         self._idle = False
         self._poll_now: asyncio.Event | None = None
         self._rng = rng
+        self._history = history
+        self._history_store = history_store
+        self._history_ttl = history_ttl
+        self._tick_count = 0
 
         self._breaker = BreakerSnapshot(
             state=BreakerState.CLOSED,
@@ -177,14 +207,41 @@ class ReconciliationLoop:
             raise ValueError(
                 "usage reading stale; override unavailable until fresh reading"
             )
-        if value < 0:
-            raise ValueError("max_concurrency must be >= 0")
+        # A zero-permit target is a deploy decision, not a runtime
+        # override — rejected for every provider class.
+        if value < 1:
+            raise ValueError(f"target must be >= 1, got {value}")
+        # The Plan 011 §4 bounds (reject above hard_cap, warn above
+        # limit) only mean anything on the polled umans path, where the
+        # reading's limit/hard_cap are real provider concurrency limits.
+        # For header/generic/dashboard providers those fields sit at
+        # placeholder defaults the runtime itself never enforces, so
+        # bounding against them would reject values the loop would
+        # happily grant (drop-sluice review, blocking finding 1).
+        # NOTE: the discriminator is the CONFIG type string, not the
+        # truth-source class — a config declaring type = "umans" with a
+        # dashboard_url gets dashboard truth but keeps these bounds,
+        # which is self-consistent because that config's tick also
+        # enforces the reading's limit.
+        warning: str | None = None
+        if self._provider_type == "umans":
+            reading = cached.reading
+            if value > reading.hard_cap:
+                raise ValueError(
+                    f"target {value} exceeds hard_cap {reading.hard_cap} — "
+                    "the provider will reject requests above this"
+                )
+            if value > reading.limit:
+                warning = (
+                    f"target {value} is above limit {reading.limit} — "
+                    "requests above the limit run at low priority"
+                )
         self._max_concurrency = value
         self._overrides["max_concurrency"] = {
             "value": value,
             "since": self._wall(),
         }
-        return None
+        return warning
 
     def clear_override(self, field: str) -> None:
         """Revert a runtime override to its boot value."""
@@ -307,15 +364,6 @@ class ReconciliationLoop:
         cached = await self._truth.fetch(now_monotonic=now_mono)
         age = now_mono - cached.fetched_at_monotonic
         reading = CachedReading(
-            reading=LimitState(**{
-                k: v
-                for k, v in cached.reading.__dict__.items()
-                if k != "age_seconds"
-            }),
-            fetched_at_monotonic=cached.fetched_at_monotonic,
-            ok=cached.ok,
-        )
-        reading = CachedReading(
             reading=LimitState(
                 **{
                     **cached.reading.__dict__,
@@ -400,6 +448,98 @@ class ReconciliationLoop:
             and not _is_hard_boxed(reading.reading, now=now_wall)
         )
 
+        # Record this tick's state for trend analysis.  The entry is frozen
+        # at capture time so the history forms an immutable time series.
+        # Recorded when either the in-memory ring or the persistent store is
+        # configured.  Fields the static loop does not track (503 counts,
+        # queue timeouts, request-window reconciliation) stay None — see
+        # switchboard/history.py for the generalization decisions.
+        if self._history is not None or self._history_store is not None:
+            r = reading.reading
+            entry = HistoryEntry(
+                timestamp=now_wall,
+                concurrent_sessions=r.concurrent_sessions if cached.ok else None,
+                local_in_flight=self._gate.held,
+                effective_permits=permits,
+                limit=r.limit if cached.ok else None,
+                hard_cap=r.hard_cap if cached.ok else None,
+                band=_classify_penalty_band(r, now=now_wall),
+                breaker=self._breaker.state.value,
+                priority_low=r.priority_low,
+                usage_age=age,
+                stale=not cached.ok,
+                recent_429s=len(self._recent_429s),
+                total_429s=self._total_429s,
+                queue_depth=self._gate.queue_depth,
+                rate_limit_429s=self._total_rate_limit_429s,
+                low_interactivity=_is_low_interactivity(r, now=now_wall),
+                requests_in_window=r.requests_in_window if cached.ok else None,
+                requests_limit=r.requests_limit if cached.ok else None,
+                requests_remaining=r.requests_remaining if cached.ok else None,
+                throughput=self._last_throughput,
+            )
+            if self._history is not None:
+                self._history.append(entry)
+            if self._history_store is not None:
+                self._history_store.append(entry)
+
+    def _record_failed_tick(self) -> None:
+        """Record a fail-safe history entry when tick() raises.
+
+        Uses the last-known state (which may be stale) and marks
+        ``effective_permits=0``, ``stale=True``, ``tick_failed=True`` so the
+        trend shows the gap rather than silently skipping it.
+        """
+        if self._history is None and self._history_store is None:
+            return
+        now_wall = self._wall()
+        reading = (
+            self._last_reading_cached.reading
+            if self._last_reading_cached is not None
+            else None
+        )
+        entry = HistoryEntry(
+            timestamp=now_wall,
+            concurrent_sessions=(
+                reading.concurrent_sessions if reading else None
+            ),
+            local_in_flight=self._gate.held,
+            effective_permits=0,
+            limit=reading.limit if reading else None,
+            hard_cap=reading.hard_cap if reading else None,
+            band=(
+                _classify_penalty_band(reading, now=now_wall)
+                if reading
+                else "normal"
+            ),
+            breaker=self._breaker.state.value,
+            priority_low=reading.priority_low if reading else False,
+            usage_age=self._last_age,
+            stale=True,
+            recent_429s=len(self._recent_429s),
+            total_429s=self._total_429s,
+            queue_depth=self._gate.queue_depth,
+            rate_limit_429s=self._total_rate_limit_429s,
+            low_interactivity=(
+                _is_low_interactivity(reading, now=now_wall)
+                if reading
+                else False
+            ),
+            requests_in_window=(
+                reading.requests_in_window if reading else None
+            ),
+            requests_limit=reading.requests_limit if reading else None,
+            requests_remaining=(
+                reading.requests_remaining if reading else None
+            ),
+            throughput=0,
+            tick_failed=True,
+        )
+        if self._history is not None:
+            self._history.append(entry)
+        if self._history_store is not None:
+            self._history_store.append(entry)
+
     def _compute_polled_permits(
         self,
         reading: CachedReading,
@@ -478,6 +618,19 @@ class ReconciliationLoop:
         while True:
             try:
                 await self.tick()
+                self._tick_count += 1
+                if (
+                    self._history_store is not None
+                    and self._tick_count % _PRUNE_INTERVAL_TICKS == 0
+                ):
+                    try:
+                        self._history_store.prune(
+                            ttl_seconds=self._history_ttl, now=self._wall()
+                        )
+                    except Exception:
+                        log.warning(
+                            "history store prune failed", exc_info=True
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -489,6 +642,11 @@ class ReconciliationLoop:
                     await self._gate.resize(0)
                 except Exception:
                     log.critical("failed to close gate after tick exception")
+                if self._history is not None or self._history_store is not None:
+                    try:
+                        self._record_failed_tick()
+                    except Exception:
+                        log.warning("_record_failed_tick failed", exc_info=True)
             interval = self._effective_poll_interval()
             self._poll_now.clear()
             with contextlib.suppress(TimeoutError):
@@ -519,6 +677,8 @@ class ReconciliationLoop:
                 await self._task
             self._task = None
         await self._truth.close()
+        if self._history_store is not None:
+            self._history_store.close()
 
     @property
     def ready(self) -> bool:
@@ -748,8 +908,14 @@ class ReconciliationLoop:
         return None
 
     @property
-    def history(self) -> Any:
-        return None
+    def history(self) -> History | None:
+        """The history ring buffer, if configured."""
+        return self._history
+
+    @property
+    def history_store(self) -> HistoryStore | None:
+        """The optional SQLite persistence store, if configured."""
+        return self._history_store
 
     @property
     def recent_429_count(self) -> int:

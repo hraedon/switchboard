@@ -3,7 +3,7 @@ table + model map), and dashboard.
 
 Stateless functions that receive the proxy's state as arguments. Shared
 utilities (``send_json``, ``send_text``, ``check_admin_auth``) are borrowed
-from :mod:`sluice.admin` to avoid duplication. Switchboard-specific handlers
+from :mod:`switchboard.utils` to avoid duplication. Switchboard-specific handlers
 build multi-provider status payloads and manage route table CRUD.
 """
 
@@ -21,7 +21,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs
 
-from sluice.admin import (
+from switchboard import __version__
+from switchboard.session import (
+    SESSION_COOKIE,
+    LoginThrottle,
+    mint_session,
+)
+from switchboard.utils import (
     build_set_cookie,
     check_admin_auth,
     check_csrf,
@@ -30,13 +36,6 @@ from sluice.admin import (
     send_json,
     send_text,
 )
-from sluice.session import (
-    SESSION_COOKIE,
-    LoginThrottle,
-    mint_session,
-)
-
-from switchboard import __version__
 
 if TYPE_CHECKING:
     from switchboard.estimator import ThresholdEstimator
@@ -1057,8 +1056,11 @@ async def handle_provider_override(
     """POST/DELETE /admin/providers/<name>/override — runtime target override.
 
     POST body: ``{"target": <int>}`` — applies a runtime target override to
-    the named provider's reconcile loop (Plan 012 WI-3).  The reconcile loop
-    validates against the provider's hard_cap.  DELETE reverts to boot value.
+    the named provider's reconcile loop (Plan 012 WI-3).  For umans-type
+    providers the loop validates against the reading's real limit/hard_cap;
+    other provider classes accept any target >= 1 (their readings carry
+    placeholder caps the runtime does not enforce).  DELETE reverts to the
+    boot value.
     """
     cors = cors_extra_headers(cors_allow_origin, None)
     if not admin_token:

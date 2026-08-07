@@ -19,18 +19,17 @@ from typing import Any
 
 import httpx
 import pytest
-from sluice.control import BreakerConfig, ControllerConfig, LimitState
-from sluice.gate import PermitGate
-from sluice.providers import NullTruthSource
-from sluice.reconcile import ReconciliationLoop
-from sluice.usage import CachedReading
 
 from switchboard.budget import TokenBudgetConfig
 from switchboard.control import RoutingConfig
+from switchboard.gate import PermitGate
+from switchboard.limit import BreakerConfig, CachedReading, LimitState
 from switchboard.providers import ProviderContext
 from switchboard.proxy import ProxyApp
+from switchboard.reconcile import ReconciliationLoop
 from switchboard.route_table import RouteTableManager
 from switchboard.token_budget import TokenBudgetTracker
+from switchboard.truth import NullTruthSource
 
 
 def _make_scope(
@@ -99,7 +98,8 @@ def _make_mocked_ctx(
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=capacity),
+        max_concurrency=capacity,
+        provider_type="generic",
         breaker_config=BreakerConfig(),
     )
     reconcile._first_poll_ok = True

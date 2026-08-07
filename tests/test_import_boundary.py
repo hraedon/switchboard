@@ -3,8 +3,8 @@
 Enforces:
 - control.py imports stdlib only (no I/O, no clock, no network)
 - shell modules import control one-way (control never imports shell)
-- no switchboard module imports underscore-prefixed symbols from sluice
-  (Plan 007 §5: eliminate all cross-package underscore imports)
+- no module imports sluice at all (Plan 018 removed the dependency; the
+  public PyPI package of that name is an unrelated project)
 """
 
 from __future__ import annotations
@@ -90,19 +90,19 @@ def _collect_sluice_imports(src_dir: Path) -> list[tuple[str, str, int]]:
     return results
 
 
-def test_no_underscore_imports_from_sluice() -> None:
-    """Plan 007 §5: no switchboard module may import an underscore-prefixed
-    symbol from sluice.  Underscore-prefixed names are private API and could
-    change without notice."""
-    src = Path(__file__).resolve().parent.parent / "src" / "switchboard"
-    imports = _collect_sluice_imports(src)
+def test_no_sluice_imports_at_all() -> None:
+    """Plan 018 removed the sluice dependency entirely. Any import of a
+    sluice.* module — in src or tests — is a regression: the public PyPI
+    package of that name is an unrelated project, so a reintroduced import
+    would resolve to a stranger's code."""
+    root = Path(__file__).resolve().parent.parent
     offenders = [
         f"{rel}:{line} imports '{name}' from sluice"
-        for rel, name, line in imports
-        if name.startswith("_")
+        for tree_dir in (root / "src" / "switchboard", root / "tests")
+        for rel, name, line in _collect_sluice_imports(tree_dir)
     ]
     assert not offenders, (
-        "switchboard imports underscore-prefixed (private) symbols from sluice:\n"
+        "sluice was removed in Plan 018 but is imported again:\n"
         + "\n".join(offenders)
     )
 

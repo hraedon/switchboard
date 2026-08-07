@@ -4,14 +4,11 @@ import time
 
 import httpx
 import pytest
-from sluice.control import BreakerConfig, ControllerConfig, LimitState
-from sluice.gate import PermitGate
-from sluice.providers import NullTruthSource, PolledTruthSource
-from sluice.reconcile import ReconciliationLoop
-from sluice.usage import CachedReading
 
 from switchboard.control import Availability, ProviderState, SignalFreshness
 from switchboard.dashboard import DashboardTruthSource
+from switchboard.gate import PermitGate
+from switchboard.limit import BreakerConfig, CachedReading, LimitState
 from switchboard.overload import OverloadConfig, OverloadTracker
 from switchboard.providers import (
     ProviderContext,
@@ -19,6 +16,8 @@ from switchboard.providers import (
     build_provider_contexts_from_config,
     snapshot_provider_state,
 )
+from switchboard.reconcile import ReconciliationLoop
+from switchboard.truth import NullTruthSource, PolledTruthSource
 
 
 def test_build_provider_context_creates_context_with_all_components() -> None:
@@ -111,7 +110,7 @@ async def test_snapshot_provider_state_not_ready_is_unknown() -> None:
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=3),
+        max_concurrency=3,
         breaker_config=BreakerConfig(),
     )
     ctx = ProviderContext(
@@ -140,7 +139,7 @@ async def test_snapshot_provider_state_with_capacity_available() -> None:
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=3),
+        max_concurrency=3,
         breaker_config=BreakerConfig(),
     )
     reconcile._first_poll_ok = True
@@ -171,7 +170,7 @@ async def test_snapshot_provider_state_all_permits_held_is_busy() -> None:
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=2),
+        max_concurrency=2,
         breaker_config=BreakerConfig(),
     )
     reconcile._first_poll_ok = True
@@ -206,7 +205,7 @@ async def test_snapshot_provider_state_null_truth_is_fresh() -> None:
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=2),
+        max_concurrency=2,
         breaker_config=BreakerConfig(),
     )
     reconcile._first_poll_ok = True
@@ -242,7 +241,7 @@ def _make_ready_ctx(
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=capacity),
+        max_concurrency=capacity,
         breaker_config=BreakerConfig(),
     )
     reconcile._first_poll_ok = True
@@ -466,3 +465,75 @@ async def test_snapshot_quota_resets_in_none_when_reading_stale() -> None:
     state = snapshot_provider_state("zai", ctx, now=0.0)
     assert state.quota_resets_in is None
     await ctx.http_client.aclose()
+
+
+def test_history_ring_warmed_from_store_on_startup(tmp_path) -> None:
+    """A restart must not lose the trend surface: the ring is warmed from
+    the SQLite store at construction (drop-sluice review, finding 2)."""
+    from switchboard.history import HistoryEntry, SQLiteHistoryStore
+
+    store_path = str(tmp_path / "hist")
+    prior_store = SQLiteHistoryStore(f"{store_path}.prov_a.history")
+    for i in range(3):
+        prior_store.append(
+            HistoryEntry(
+                timestamp=1000.0 + i,
+                concurrent_sessions=0,
+                local_in_flight=0,
+                effective_permits=3,
+                limit=4,
+                hard_cap=8,
+                band="normal",
+                breaker="closed",
+                priority_low=False,
+                usage_age=0.0,
+                stale=False,
+                recent_429s=0,
+                total_429s=0,
+                queue_depth=0,
+            )
+        )
+    prior_store.close()
+
+    contexts = build_provider_contexts_from_config(
+        {
+            "provider": {
+                "prov_a": {
+                    "upstream": "https://a.example.com",
+                    "type": "generic",
+                    "target": 2,
+                },
+            },
+        },
+        history_store_path=store_path,
+    )
+    ring = contexts["prov_a"].reconcile.history
+    assert ring is not None
+    entries = ring.to_dict_list(limit=10)
+    assert len(entries) == 3
+    assert entries[0]["ts"] == 1000.0
+    assert entries[-1]["ts"] == 1002.0
+
+
+def test_history_ring_warmup_survives_corrupt_store(tmp_path) -> None:
+    """A corrupt store file degrades to an empty ring — never a startup
+    crash (drop-sluice review cycle 2, finding 1/5)."""
+    store_path = str(tmp_path / "hist")
+    corrupt = tmp_path / "hist.prov_a.history"
+    corrupt.write_bytes(b"this is not a sqlite database")
+
+    contexts = build_provider_contexts_from_config(
+        {
+            "provider": {
+                "prov_a": {
+                    "upstream": "https://a.example.com",
+                    "type": "generic",
+                    "target": 2,
+                },
+            },
+        },
+        history_store_path=store_path,
+    )
+    ring = contexts["prov_a"].reconcile.history
+    assert ring is not None
+    assert ring.to_dict_list(limit=10) == []

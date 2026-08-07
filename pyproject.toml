@@ -10,7 +10,6 @@ requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27",
     "uvicorn>=0.30",
-    "sluice>=1.3.9,<2.0",
 ]
 
 [project.optional-dependencies]
@@ -39,19 +38,7 @@ strict = true
 python_version = "3.12"
 packages = ["src/switchboard"]
 
-[[tool.mypy.overrides]]
-module = "sluice.*"
-ignore_missing_imports = true
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 
-[tool.uv.sources]
-# sluice is a PRIVATE package. The public PyPI name `sluice` belongs to an
-# unrelated project (0.3.1 as of 2026-08), so a bare version spec must never be
-# allowed to resolve from the index: today it fails closed (no public 1.3.9+),
-# but a future public release would silently install a stranger's code. Pin the
-# source explicitly. Both deployment hosts keep sluice as a sibling checkout
-# (mvmcc03 ~/projects/personal/sluice, mvmcc02 /projects/sluice).
-sluice = { path = "../sluice", editable = true }

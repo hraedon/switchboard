@@ -1,6 +1,33 @@
 # Plan 018 — Reconcile the rescued sluice removal onto main
 
-Status: proposed execution plan (authored 2026-08-06)
+Status: steps 1–3 COMPLETE on `feat/018-2-drop-sluice` (2026-08-06);
+awaiting cross-lineage review before merge.
+
+Execution notes (2026-08-06, this branch):
+
+- Step 2 order deviated deliberately: dashboard → admin → **proxy** →
+  providers(+tests). proxy.py turned out to be a pure import swap (the
+  stale branch's 182-line proxy diff was post-fork deletions, not
+  portable changes), and taking it third closed the session-cookie
+  split the admin switch opened.
+- The history machinery was **generalized, not deleted** (owner
+  decision): `switchboard/history.py` vendors the ring + SQLite store,
+  and the vendored reconcile loop records per-tick entries again — the
+  substrate for future usage-based triage. New store files are
+  required; sluice-era DBs are not migrated (fail-safe, per-append
+  warnings).
+- Real defects surfaced and fixed along the way: the dashboard truth
+  source read a `timestamp` key the readings API never serves (every
+  reading parsed stale); a float flowed into the integer-seconds
+  Retry-After header; `apply_override` had lost sluice's Plan 011 §4
+  target bounds; `record_response_headers` needed its `now_monotonic`
+  to be supplied by the caller.
+- §4 verification: reroute + credential stripping + giveup metrics +
+  strict config validation + model-map all confirmed present (the
+  stale branch would have deleted several — semantic port, not patch,
+  was the right call). The permit-ownership fix is gate-agnostic and
+  the vendored gate is cancellation-safe for `_acquire_with_disconnect`'s
+  race pattern.
 
 Depends on: nothing. Blocks: Plan 019 (the drop-sluice + multi-account work
 itself), which cannot land until this reconciliation is done.

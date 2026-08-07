@@ -8,16 +8,15 @@ from collections.abc import Callable
 from typing import Any
 
 import httpx
-from sluice.control import BreakerConfig, ControllerConfig, LimitState
-from sluice.gate import PermitGate
-from sluice.providers import NullTruthSource
-from sluice.reconcile import ReconciliationLoop
-from sluice.usage import CachedReading
 
 from switchboard.estimator import ThresholdEstimator
+from switchboard.gate import PermitGate
+from switchboard.limit import BreakerConfig, CachedReading, LimitState
 from switchboard.providers import ProviderContext
 from switchboard.proxy import RoutingMetrics
+from switchboard.reconcile import ReconciliationLoop
 from switchboard.route_table import RouteTableManager
+from switchboard.truth import NullTruthSource
 
 _WALL_NOW = 1_000_000.0
 _FUTURE_RESET = _WALL_NOW + 3600.0
@@ -45,7 +44,7 @@ def _make_ctx_with_reading(
     kwargs: dict[str, Any] = dict(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=3),
+        max_concurrency=3,
         breaker_config=BreakerConfig(),
     )
     if wall_clock is not None:
@@ -85,7 +84,7 @@ def _make_ctx_no_reading() -> ProviderContext:
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=3),
+        max_concurrency=3,
         breaker_config=BreakerConfig(),
     )
     reconcile._first_poll_ok = True
