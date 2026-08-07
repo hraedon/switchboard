@@ -1,0 +1,26 @@
+# Persistent state for switchboard (Plan 020 WI-5).
+#
+# Holds the SQLite store (route table, model map, provider config) and the
+# per-provider history databases. Everything else about the pod is stateless
+# and the root filesystem stays read-only; this volume is the ONLY writable
+# mount, and losing it loses runtime-created config — not correctness.
+#
+# Longhorn (replicated) rather than local-path: the store now carries
+# GUI-created provider configuration, which must survive a node failure,
+# not just a pod restart. Single ReadWriteOnce claim — the Deployment is
+# pinned to replicas: 1 (see deployment.yaml's HARD RULE header), so no
+# multi-attach is possible.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: switchboard-state
+  namespace: switchboard
+  labels:
+    app: switchboard
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Gi
