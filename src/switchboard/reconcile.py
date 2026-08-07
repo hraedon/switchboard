@@ -218,6 +218,11 @@ class ReconciliationLoop:
         # placeholder defaults the runtime itself never enforces, so
         # bounding against them would reject values the loop would
         # happily grant (drop-sluice review, blocking finding 1).
+        # NOTE: the discriminator is the CONFIG type string, not the
+        # truth-source class — a config declaring type = "umans" with a
+        # dashboard_url gets dashboard truth but keeps these bounds,
+        # which is self-consistent because that config's tick also
+        # enforces the reading's limit.
         warning: str | None = None
         if self._provider_type == "umans":
             reading = cached.reading

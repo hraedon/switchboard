@@ -839,3 +839,25 @@ async def test_override_delete_reverts() -> None:
     )
     status, _ = _parse_response(messages)
     assert status == 200
+
+
+@pytest.mark.asyncio
+async def test_override_umans_at_hard_cap_boundary_accepted() -> None:
+    """target == hard_cap is the boundary: accepted (with the above-limit
+    warning), only strictly-above is rejected."""
+    ctx = _make_ready_provider("test", provider_type="umans")
+    providers = {"test": ctx}
+    body = json.dumps({"target": 8}).encode()
+    scope = _make_override_scope("POST", body)
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_provider_override(
+        send, receive, providers, _ADMIN_TOKEN, scope,
+        "test", "POST", None,
+    )
+    status, resp_body = _parse_response(messages)
+    assert status == 200
+    data = json.loads(resp_body)
+    assert data["applied"] is True
+    assert "above limit" in data["warning"]
+    assert ctx.reconcile.max_concurrency == 8

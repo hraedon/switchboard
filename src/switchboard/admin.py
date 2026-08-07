@@ -1056,8 +1056,11 @@ async def handle_provider_override(
     """POST/DELETE /admin/providers/<name>/override — runtime target override.
 
     POST body: ``{"target": <int>}`` — applies a runtime target override to
-    the named provider's reconcile loop (Plan 012 WI-3).  The reconcile loop
-    validates against the provider's hard_cap.  DELETE reverts to boot value.
+    the named provider's reconcile loop (Plan 012 WI-3).  For umans-type
+    providers the loop validates against the reading's real limit/hard_cap;
+    other provider classes accept any target >= 1 (their readings carry
+    placeholder caps the runtime does not enforce).  DELETE reverts to the
+    boot value.
     """
     cors = cors_extra_headers(cors_allow_origin, None)
     if not admin_token:

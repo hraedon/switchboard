@@ -513,3 +513,27 @@ def test_history_ring_warmed_from_store_on_startup(tmp_path) -> None:
     assert len(entries) == 3
     assert entries[0]["ts"] == 1000.0
     assert entries[-1]["ts"] == 1002.0
+
+
+def test_history_ring_warmup_survives_corrupt_store(tmp_path) -> None:
+    """A corrupt store file degrades to an empty ring — never a startup
+    crash (drop-sluice review cycle 2, finding 1/5)."""
+    store_path = str(tmp_path / "hist")
+    corrupt = tmp_path / "hist.prov_a.history"
+    corrupt.write_bytes(b"this is not a sqlite database")
+
+    contexts = build_provider_contexts_from_config(
+        {
+            "provider": {
+                "prov_a": {
+                    "upstream": "https://a.example.com",
+                    "type": "generic",
+                    "target": 2,
+                },
+            },
+        },
+        history_store_path=store_path,
+    )
+    ring = contexts["prov_a"].reconcile.history
+    assert ring is not None
+    assert ring.to_dict_list(limit=10) == []

@@ -355,43 +355,46 @@ class SQLiteHistoryStore:
         conn = self._conn
         if conn is None or limit <= 0:
             return []
+        # The whole body is guarded, reconstruction included: this runs on
+        # the startup warm-up path, and the module's contract is that a bad
+        # store degrades to "no history", never a crash.
         try:
             cur = conn.execute(_SELECT, (limit,))
             rows = cur.fetchall()
+            rows.reverse()
+            return [
+                HistoryEntry(
+                    timestamp=row[0],
+                    concurrent_sessions=row[1],
+                    local_in_flight=row[2],
+                    effective_permits=row[3],
+                    limit=row[4],
+                    hard_cap=row[5],
+                    band=row[6],
+                    breaker=row[7],
+                    priority_low=bool(row[8]),
+                    usage_age=row[9],
+                    stale=bool(row[10]),
+                    recent_429s=row[11],
+                    total_429s=row[12],
+                    rate_limit_429s=row[13] if row[13] is not None else 0,
+                    total_503s=row[14],
+                    low_interactivity=bool(row[15]),
+                    queue_depth=row[16],
+                    queue_timeouts=row[17],
+                    tick_failed=bool(row[18]),
+                    requests_in_window=row[19],
+                    requests_limit=row[20],
+                    requests_remaining=row[21],
+                    local_requests_in_window=row[22],
+                    request_window_delta=row[23],
+                    throughput=row[24] if row[24] is not None else 0,
+                )
+                for row in rows
+            ]
         except Exception:
             log.warning("history store load_recent failed", exc_info=True)
             return []
-        rows.reverse()
-        return [
-            HistoryEntry(
-                timestamp=row[0],
-                concurrent_sessions=row[1],
-                local_in_flight=row[2],
-                effective_permits=row[3],
-                limit=row[4],
-                hard_cap=row[5],
-                band=row[6],
-                breaker=row[7],
-                priority_low=bool(row[8]),
-                usage_age=row[9],
-                stale=bool(row[10]),
-                recent_429s=row[11],
-                total_429s=row[12],
-                rate_limit_429s=row[13] if row[13] is not None else 0,
-                total_503s=row[14],
-                low_interactivity=bool(row[15]),
-                queue_depth=row[16],
-                queue_timeouts=row[17],
-                tick_failed=bool(row[18]),
-                requests_in_window=row[19],
-                requests_limit=row[20],
-                requests_remaining=row[21],
-                local_requests_in_window=row[22],
-                request_window_delta=row[23],
-                throughput=row[24] if row[24] is not None else 0,
-            )
-            for row in rows
-        ]
 
     def prune(self, *, ttl_seconds: float, now: float) -> int:
         conn = self._conn

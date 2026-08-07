@@ -104,8 +104,15 @@ gates and decides which upstream provider receives each request.
 ```
 src/switchboard/
   control.py       # PURE routing core: route table, pressure comparison, routing decision
+  limit.py         # PURE flow-control core: LimitState, breaker state machine (vendored, Plan 018)
   proxy.py         # async multi-provider reverse proxy shell (streaming, routing, both routes)
   providers.py     # provider context: gate + reconcile + truth_source per upstream
+  gate.py          # resizeable async permit gate with hold sampling (vendored, Plan 018)
+  reconcile.py     # per-provider reconciliation loop: truth → permits (vendored, Plan 018)
+  truth.py         # TruthSource protocol + polled/header/null sources (vendored, Plan 018)
+  history.py       # per-tick HistoryEntry ring + SQLite store (vendored, Plan 018)
+  session.py       # admin session cookies + login throttle (vendored, Plan 018)
+  utils.py         # ASGI helpers: send_json/send_text, auth, CORS (vendored, Plan 018)
   dashboard.py     # usage-dashboard /readings client → TruthSource for ollama
   route_table.py   # route table: API-key → provider mapping, CRUD, persistence
   overload.py      # per-provider overloaded-response breaker (Plan 010 Feature A)
