@@ -1541,7 +1541,9 @@ class ProxyApp:
                     self._overload_tracker.record_ok(ctx.name)
 
                 ctx.reconcile.record_response_headers(
-                    dict(response.headers), response.status_code
+                    dict(response.headers),
+                    response.status_code,
+                    now_monotonic=time.monotonic(),
                 )
 
                 # Usage-error reroute (Plan 010, reactive half). Nothing has

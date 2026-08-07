@@ -5,10 +5,6 @@ from typing import Any
 
 import httpx
 import pytest
-from sluice.control import BreakerConfig, ControllerConfig
-from sluice.gate import PermitGate
-from sluice.providers import NullTruthSource
-from sluice.reconcile import ReconciliationLoop
 
 from switchboard.admin import (
     _build_status_payload,
@@ -24,10 +20,14 @@ from switchboard.admin import (
     handle_route_list,
 )
 from switchboard.control import RoutingConfig
+from switchboard.gate import PermitGate
+from switchboard.limit import BreakerConfig
 from switchboard.model_map import ModelMapManager
 from switchboard.providers import ProviderContext
 from switchboard.proxy import RoutingMetrics
+from switchboard.reconcile import ReconciliationLoop
 from switchboard.route_table import RouteTableManager
+from switchboard.truth import NullTruthSource
 
 
 def _make_provider_context(name: str = "test") -> ProviderContext:
@@ -36,7 +36,8 @@ def _make_provider_context(name: str = "test") -> ProviderContext:
     reconcile = ReconciliationLoop(
         truth_source=truth,
         gate=gate,
-        controller_config=ControllerConfig(target=1),
+        max_concurrency=1,
+        provider_type="generic",
         breaker_config=BreakerConfig(),
     )
     return ProviderContext(
@@ -679,14 +680,14 @@ def _make_override_scope(
 
 
 def _make_ready_provider(name: str = "test") -> ProviderContext:
-    from sluice.usage import CachedReading
+    from switchboard.limit import CachedReading, LimitState
 
     ctx = _make_provider_context(name)
     ctx.reconcile._first_poll_ok = True
     ctx.reconcile._last_reading_cached = CachedReading(
-        reading=__import__(
-            "sluice.control", fromlist=["LimitState"]
-        ).LimitState(provider="generic", age_seconds=0.0, limit=4, hard_cap=8),
+        reading=LimitState(
+            provider="generic", age_seconds=0.0, limit=4, hard_cap=8
+        ),
         fetched_at_monotonic=0.0,
         ok=True,
     )

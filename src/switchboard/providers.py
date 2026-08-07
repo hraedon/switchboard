@@ -372,9 +372,9 @@ def snapshot_provider_state(
             )
         bre = limit_state.bucket_reset_epoch
         if bre is not None and bre > 0:
-            remaining = bre - _time.time()
-            if remaining > 0:
-                quota_resets_in = remaining
+            reset_in = bre - _time.time()
+            if reset_in > 0:
+                quota_resets_in = reset_in
 
     # Token-budget utilization (Plan 012 Feature B).
     token_utilization: float | None = None
