@@ -44,6 +44,7 @@ from typing import Any
 import httpx
 
 from switchboard.admin import (
+    handle_config_effective,
     handle_config_get,
     handle_healthz,
     handle_login_get,
@@ -52,6 +53,11 @@ from switchboard.admin import (
     handle_model_map_delete,
     handle_model_map_list,
     handle_model_map_set,
+    handle_provider_create,
+    handle_provider_delete,
+    handle_provider_test,
+    handle_provider_update,
+    handle_providers_list,
     handle_readyz,
     handle_route_add,
     handle_route_delete,
@@ -64,6 +70,7 @@ from switchboard.admin import (
     send_status_json,
     serve_static,
 )
+from switchboard.config_store import ConfigStoreManager
 from switchboard.control import (
     DEFAULT_REROUTE_STATUSES,
     AdmissionPlan,
@@ -374,10 +381,23 @@ class ProxyApp:
         usage_history_tracker: UsageHistoryTracker | None = None,
         reroute_statuses: frozenset[int] | None = None,
         reroute_max_attempts: int = 0,
+        config_store: ConfigStoreManager | None = None,
+        toml_provider_names: frozenset[str] | None = None,
+        toml_provider_sections: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self._provider_manager = ProviderManager(
             providers, drain_timeout=drain_timeout
         )
+        # Provider config store (Plan 020 WI-3/4). A memory-only store when
+        # the caller passes none keeps the admin endpoints functional (their
+        # writes simply don't survive a restart). The boot TOML sections are
+        # kept for the tombstone/effective-config paths ONLY — they may hold
+        # an inline api_key, and every serialization path masks them.
+        self._config_store = (
+            config_store if config_store is not None else ConfigStoreManager()
+        )
+        self._toml_provider_names = toml_provider_names or frozenset()
+        self._toml_provider_sections = toml_provider_sections or {}
         self._route_table = route_table
         self._routing_config = routing_config or RoutingConfig()
         self._admin_token = admin_token
@@ -459,13 +479,14 @@ class ProxyApp:
             and (
                 path in (
                     "/", "/status.json", "/metrics",
-                    "/admin/routes", "/admin/config", "/admin/model-map",
+                    "/admin/routes", "/admin/config",
+                    "/admin/config/effective",
+                    "/admin/model-map", "/admin/providers",
                     "/admin/threshold-events", "/admin/usage-history",
                     "/login", "/logout",
                 )
                 or (
                     path.startswith("/admin/providers/")
-                    and path.endswith("/override")
                 )
                 or (
                     path.startswith("/admin/model-map/")
@@ -631,6 +652,49 @@ class ProxyApp:
             )
             return
 
+        if path == "/admin/config/effective" and method == "GET":
+            authed = check_admin_auth(scope, self._admin_token)
+            if not authed and self._admin_token:
+                await send_json(
+                    send, 401, {"error": "unauthorized"},
+                    extra_headers=cors_extra_headers(
+                        self._cors_allow_origin, None
+                    ),
+                )
+                return
+            await handle_config_effective(
+                send, self._config_store,
+                self._toml_provider_names, self._toml_provider_sections,
+                self._cors_allow_origin,
+            )
+            return
+
+        if path == "/admin/providers":
+            if method == "GET":
+                authed = check_admin_auth(scope, self._admin_token)
+                if not authed and self._admin_token:
+                    await send_json(
+                        send, 401, {"error": "unauthorized"},
+                        extra_headers=cors_extra_headers(
+                            self._cors_allow_origin, None
+                        ),
+                    )
+                    return
+                await handle_providers_list(
+                    send, self._providers, self._config_store,
+                    self._cors_allow_origin,
+                )
+                return
+            if method == "POST":
+                await handle_provider_create(
+                    send, receive, self._provider_manager,
+                    self._config_store, self._admin_token, scope,
+                    self._cors_allow_origin,
+                )
+                return
+            await send_text(send, 405, "Method not allowed")
+            return
+
         if path == "/admin/usage-history" and method == "GET":
             await handle_usage_history(
                 send, scope, self._admin_token, self._providers,
@@ -661,6 +725,38 @@ class ProxyApp:
                     self._admin_token, scope, prov_name,
                     method, self._cors_allow_origin,
                 )
+                return
+
+        if path.startswith("/admin/providers/"):
+            parts = path.split("/")
+            if len(parts) == 5 and parts[4] == "test":
+                if method == "POST":
+                    await handle_provider_test(
+                        send, self._providers, self._admin_token,
+                        scope, parts[3], self._cors_allow_origin,
+                    )
+                    return
+                await send_text(send, 405, "Method not allowed")
+                return
+            if len(parts) == 4 and parts[3]:
+                prov_name = parts[3]
+                if method == "PUT":
+                    await handle_provider_update(
+                        send, receive, self._provider_manager,
+                        self._config_store, self._admin_token, scope,
+                        prov_name, self._cors_allow_origin,
+                    )
+                    return
+                if method == "DELETE":
+                    await handle_provider_delete(
+                        send, self._provider_manager, self._config_store,
+                        self._admin_token, scope, prov_name,
+                        self._toml_provider_names,
+                        self._toml_provider_sections,
+                        self._cors_allow_origin,
+                    )
+                    return
+                await send_text(send, 405, "Method not allowed")
                 return
 
         await self._proxy_request(scope, receive, send)

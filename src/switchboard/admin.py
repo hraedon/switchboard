@@ -22,7 +22,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs
 
+import httpx
+
 from switchboard import __version__
+from switchboard.config_store import ConfigStoreManager
 from switchboard.session import (
     SESSION_COOKIE,
     LoginThrottle,
@@ -41,6 +44,7 @@ from switchboard.utils import (
 if TYPE_CHECKING:
     from switchboard.estimator import ThresholdEstimator
     from switchboard.model_map import ModelMapManager
+    from switchboard.provider_manager import ProviderManager
     from switchboard.providers import ProviderContext
     from switchboard.proxy import RoutingMetrics
     from switchboard.route_table import RouteTableManager
@@ -1175,6 +1179,776 @@ async def handle_provider_override(
     if warning:
         response["warning"] = warning
     await send_json(send, 200, response, extra_headers=cors)
+
+
+# ---------------------------------------------------------------------------
+# Provider CRUD + reachability test + effective config (Plan 020 WI-3/WI-4)
+# ---------------------------------------------------------------------------
+
+#: Body fields accepted by the provider create/update endpoints — exactly the
+#: config store's upsert fields (``name`` travels separately). Unknown body
+#: keys are ignored rather than rejected, matching TOML's tolerance.
+_PROVIDER_BODY_FIELDS = (
+    "account",
+    "upstream",
+    "provider_type",
+    "target",
+    "key_mode",
+    "api_key_env",
+    "api_key_stored",
+    "auth_header",
+    "auth_prefix",
+    "dashboard_url",
+    "dashboard_token_env",
+    "usage_key_env",
+    "enabled",
+)
+
+
+def _provider_fields_from_body(data: dict[str, Any]) -> dict[str, object]:
+    """Whitelist the store's upsert fields out of a request body."""
+    return {k: data[k] for k in _PROVIDER_BODY_FIELDS if k in data}
+
+
+async def _discard_contexts(contexts: dict[str, ProviderContext]) -> None:
+    """Close throwaway contexts from a dry build (never started)."""
+    for ctx in contexts.values():
+        with contextlib.suppress(Exception):
+            await ctx.truth_source.close()
+        with contextlib.suppress(Exception):
+            await ctx.http_client.aclose()
+
+
+async def _dry_build_error(
+    name: str, section: dict[str, object]
+) -> str | None:
+    """Build (and discard) a context from a TOML-shaped section.
+
+    Returns the construction path's error message, or None when the section
+    builds cleanly. This is the create/update guard: a section the
+    construction path would refuse — e.g. an unset ``api_key_env`` — must
+    answer 400 *now* instead of poisoning the store and failing the next
+    boot.
+    """
+    from switchboard.providers import build_provider_contexts_from_config
+
+    try:
+        built = build_provider_contexts_from_config(
+            {"provider": {name: section}}
+        )
+    except ValueError as exc:
+        return str(exc)
+    await _discard_contexts(built)
+    return None
+
+
+def _restore_fields(
+    section: dict[str, object], masked: dict[str, object]
+) -> dict[str, object]:
+    """Rebuild upsert fields from a construction-path section + masked row.
+
+    PUT-rollback only. ``get`` masks the stored credential, so the pre-write
+    capture must come from ``to_provider_section`` (raw); ``account`` and
+    ``enabled`` are recovered from the masked dict because the section does
+    not carry them. Never serialized — feeds ``upsert`` directly.
+    """
+    fields: dict[str, object] = {
+        "upstream": section["upstream"],
+        "provider_type": section["type"],
+        "target": section["target"],
+        "account": masked["account"],
+        "enabled": masked["enabled"],
+    }
+    if "api_key" in section:
+        fields["key_mode"] = "stored"
+        fields["api_key_stored"] = section["api_key"]
+    elif "api_key_env" in section:
+        fields["key_mode"] = "env"
+        fields["api_key_env"] = section["api_key_env"]
+    else:
+        fields["key_mode"] = "passthrough"
+    for key in (
+        "auth_header",
+        "auth_prefix",
+        "dashboard_url",
+        "dashboard_token_env",
+        "usage_key_env",
+    ):
+        if key in section:
+            fields[key] = section[key]
+    return fields
+
+
+def _tombstone_fields_from_masked(
+    masked: dict[str, object],
+) -> dict[str, object]:
+    """Upsert fields reproducing a store row, WITHOUT touching its credential.
+
+    Deliberately built from the MASKED dict: ``api_key_stored`` is omitted,
+    and the store's write-only key semantics keep the existing credential on
+    re-upsert of an existing ``key_mode='stored'`` row — a tombstone never
+    needs the raw key.
+    """
+    fields: dict[str, object] = {}
+    for key in (
+        "account",
+        "upstream",
+        "provider_type",
+        "target",
+        "key_mode",
+        "api_key_env",
+        "auth_header",
+        "auth_prefix",
+        "dashboard_url",
+        "dashboard_token_env",
+        "usage_key_env",
+    ):
+        value = masked.get(key)
+        if value is not None:
+            fields[key] = value
+    return fields
+
+
+def _tombstone_fields_from_toml(
+    section: dict[str, Any],
+) -> dict[str, object]:
+    """Synthesize store upsert fields from a boot TOML ``[provider.*]`` table.
+
+    Needed when a TOML-only provider is deleted: D1 tombstones are store
+    rows, so the section is copied into row shape (defaults mirror
+    :func:`switchboard.providers.build_provider_contexts_from_config`:
+    ``type='generic'``, ``target=3``). ``api_key_env`` wins over an inline
+    ``api_key``, matching the construction path's precedence.
+    """
+    fields: dict[str, object] = {
+        "upstream": section.get("upstream", ""),
+        "provider_type": (
+            section["type"] if isinstance(section.get("type"), str)
+            else "generic"
+        ),
+        "target": (
+            section["target"]
+            if isinstance(section.get("target"), int)
+            and not isinstance(section.get("target"), bool)
+            else 3
+        ),
+    }
+    api_key_env = section.get("api_key_env")
+    api_key = section.get("api_key")
+    if isinstance(api_key_env, str) and api_key_env:
+        fields["key_mode"] = "env"
+        fields["api_key_env"] = api_key_env
+    elif isinstance(api_key, str) and api_key:
+        fields["key_mode"] = "stored"
+        fields["api_key_stored"] = api_key
+    else:
+        fields["key_mode"] = "passthrough"
+    for key in (
+        "auth_header",
+        "auth_prefix",
+        "dashboard_url",
+        "dashboard_token_env",
+        "usage_key_env",
+    ):
+        value = section.get(key)
+        if isinstance(value, str):
+            fields[key] = value
+    return fields
+
+
+async def handle_providers_list(
+    send: Send,
+    providers: dict[str, ProviderContext],
+    config_store: ConfigStoreManager,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """GET /admin/providers — live providers joined with config-store rows.
+
+    One entry per live provider: identity plus a minimal ``live`` sub-dict
+    from the running context, merged with the store's MASKED row when one
+    exists (``source`` says which config owns the provider). Disabled store
+    rows (``enabled=0`` — D1 tombstones, hence not live) are included with
+    ``live: false`` so the GUI can show them. Read-only and masked
+    throughout (D2).
+    """
+    entries: list[dict[str, Any]] = []
+    for name, ctx in providers.items():
+        entry: dict[str, Any] = {"name": name, "enabled": True}
+        masked = config_store.get(name)
+        if masked is not None:
+            entry.update(masked)
+            entry["source"] = "store"
+        else:
+            entry["upstream"] = ctx.upstream_url
+            entry["source"] = "toml"
+        entry["live"] = {
+            "ready": ctx.reconcile.ready,
+            "gate_closed_reason": ctx.reconcile.gate_closed_reason(),
+            "target": ctx.reconcile.target,
+            "upstream": ctx.upstream_url,
+            "in_flight": ctx.gate.held,
+        }
+        entries.append(entry)
+    for masked in config_store.list_providers():
+        if masked["name"] in providers or masked["enabled"]:
+            continue
+        tombstone: dict[str, Any] = dict(masked)
+        tombstone["source"] = "store"
+        tombstone["live"] = False
+        entries.append(tombstone)
+    await send_json(
+        send, 200, {"providers": entries},
+        extra_headers=[
+            *cors_extra_headers(cors_allow_origin, None),
+            (b"cache-control", b"no-store"),
+        ],
+    )
+
+
+async def handle_provider_create(
+    send: Send,
+    receive: Receive,
+    provider_manager: ProviderManager,
+    config_store: ConfigStoreManager,
+    admin_token: str | None,
+    scope: Scope,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """POST /admin/providers — create a provider (store row + live context).
+
+    Body: the config store's upsert fields plus ``name``. The order is
+    load-bearing: (a) 409 if the name is already live or stored — a create
+    must never silently become an update; (b) DRY-BUILD first, so a section
+    the construction path would refuse (e.g. an unset ``api_key_env``)
+    answers 400 without poisoning the store; (c) only then persist; (d)
+    build the live context from the stored section and register it.
+
+    Runtime-added providers get no history ring: the boot path threads
+    ``history_store_path`` into construction and this handler does not (a
+    restart picks the ring up; live wiring is a Wave 2 item).
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(
+            send, 405,
+            {"error": "mutations disabled — set --admin-token to enable"},
+            extra_headers=cors,
+        )
+        return
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    ct = next(
+        (
+            v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+            if k == b"content-type"
+        ),
+        "",
+    )
+    if not ct.lower().startswith("application/json"):
+        await send_json(
+            send, 415,
+            {"error": "Content-Type must be application/json"},
+            extra_headers=cors,
+        )
+        return
+
+    try:
+        body = await read_body(receive)
+    except ValueError:
+        await send_json(
+            send, 413, {"error": "request body too large"},
+            extra_headers=cors,
+        )
+        return
+    except ConnectionError:
+        return
+
+    try:
+        data = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        await send_json(
+            send, 400, {"error": "invalid JSON body"},
+            extra_headers=cors,
+        )
+        return
+
+    if not isinstance(data, dict):
+        await send_json(
+            send, 400, {"error": "body must be a JSON object"},
+            extra_headers=cors,
+        )
+        return
+
+    name = data.get("name")
+    if not isinstance(name, str) or not name:
+        await send_json(
+            send, 400, {"error": "missing required field 'name'"},
+            extra_headers=cors,
+        )
+        return
+
+    if (
+        name in provider_manager.providers
+        or config_store.get(name) is not None
+    ):
+        await send_json(
+            send, 409,
+            {"error": f"provider '{name}' already exists"},
+            extra_headers=cors,
+        )
+        return
+
+    fields = _provider_fields_from_body(data)
+
+    # Dry-build against a THROWAWAY store: validates the fields with the
+    # store's own rules AND proves the construction path accepts the
+    # resulting section, all before anything persists.
+    scratch = ConfigStoreManager()
+    try:
+        scratch.upsert(name, fields)
+    except ValueError as exc:
+        await send_json(send, 400, {"error": str(exc)}, extra_headers=cors)
+        return
+    err = await _dry_build_error(name, scratch.to_provider_section(name))
+    if err is not None:
+        await send_json(send, 400, {"error": err}, extra_headers=cors)
+        return
+
+    try:
+        config_store.upsert(name, fields)
+    except ValueError as exc:
+        # Same validation the scratch store just ran; defensive only.
+        await send_json(send, 400, {"error": str(exc)}, extra_headers=cors)
+        return
+    except sqlite3.Error as exc:
+        log.error("provider create failed for %s: %s", name, exc)
+        await send_json(
+            send, 500, {"error": "config store write failed"},
+            extra_headers=cors,
+        )
+        return
+
+    masked = config_store.get(name)
+    if masked is not None and masked["enabled"]:
+        from switchboard.providers import build_provider_contexts_from_config
+
+        try:
+            built = build_provider_contexts_from_config(
+                {"provider": {name: config_store.to_provider_section(name)}}
+            )
+        except ValueError as exc:
+            # The dry build passed moments ago; only an environment change
+            # in between lands here. Undo the create — a row that cannot
+            # build must not poison the next boot.
+            config_store.remove(name)
+            await send_json(
+                send, 400, {"error": str(exc)}, extra_headers=cors,
+            )
+            return
+        try:
+            await provider_manager.add(name, built[name])
+        except ValueError:
+            await _discard_contexts(built)
+            config_store.remove(name)
+            await send_json(
+                send, 409,
+                {"error": f"provider '{name}' already exists"},
+                extra_headers=cors,
+            )
+            return
+
+    log.info("provider created: %s", name)
+    await send_json(send, 200, masked or {}, extra_headers=cors)
+
+
+async def handle_provider_update(
+    send: Send,
+    receive: Receive,
+    provider_manager: ProviderManager,
+    config_store: ConfigStoreManager,
+    admin_token: str | None,
+    scope: Scope,
+    prov_name: str,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """PUT /admin/providers/<name> — update a provider (store + live swap).
+
+    Write-only key semantics force a different order than create: with
+    ``key_mode='stored'`` an absent key on edit means "keep", and only the
+    REAL store knows the kept credential. So: upsert into the real store
+    first, build from the store's own section, and on build failure ROLL
+    BACK by re-upserting the previous row — captured via
+    ``to_provider_section`` *before* the write, because ``get`` is masked
+    and cannot restore a credential. The build doubles as the dry-run: the
+    live swap happens only after it succeeds.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(
+            send, 405,
+            {"error": "mutations disabled — set --admin-token to enable"},
+            extra_headers=cors,
+        )
+        return
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    ct = next(
+        (
+            v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+            if k == b"content-type"
+        ),
+        "",
+    )
+    if not ct.lower().startswith("application/json"):
+        await send_json(
+            send, 415,
+            {"error": "Content-Type must be application/json"},
+            extra_headers=cors,
+        )
+        return
+
+    try:
+        body = await read_body(receive)
+    except ValueError:
+        await send_json(
+            send, 413, {"error": "request body too large"},
+            extra_headers=cors,
+        )
+        return
+    except ConnectionError:
+        return
+
+    try:
+        data = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        await send_json(
+            send, 400, {"error": "invalid JSON body"},
+            extra_headers=cors,
+        )
+        return
+
+    if not isinstance(data, dict):
+        await send_json(
+            send, 400, {"error": "body must be a JSON object"},
+            extra_headers=cors,
+        )
+        return
+
+    live = prov_name in provider_manager.providers
+    prev_masked = config_store.get(prov_name)
+    if not live and prev_masked is None:
+        await send_json(
+            send, 404, {"error": "unknown provider"}, extra_headers=cors,
+        )
+        return
+    prev_section = (
+        config_store.to_provider_section(prov_name)
+        if prev_masked is not None
+        else None
+    )
+
+    fields = _provider_fields_from_body(data)
+    try:
+        config_store.upsert(prov_name, fields)
+    except ValueError as exc:
+        # Validation runs before the DB write — store unchanged, no rollback.
+        await send_json(send, 400, {"error": str(exc)}, extra_headers=cors)
+        return
+    except sqlite3.Error as exc:
+        log.error("provider update failed for %s: %s", prov_name, exc)
+        await send_json(
+            send, 500, {"error": "config store write failed"},
+            extra_headers=cors,
+        )
+        return
+
+    from switchboard.providers import build_provider_contexts_from_config
+
+    section = config_store.to_provider_section(prov_name)
+    try:
+        built = build_provider_contexts_from_config(
+            {"provider": {prov_name: section}}
+        )
+    except ValueError as exc:
+        # Roll back: restore the captured previous row, or remove the row
+        # this update just created for a TOML-only provider.
+        try:
+            if prev_section is not None and prev_masked is not None:
+                config_store.upsert(
+                    prov_name, _restore_fields(prev_section, prev_masked)
+                )
+            else:
+                config_store.remove(prov_name)
+        except (ValueError, sqlite3.Error):
+            log.error(
+                "provider update rollback failed for %s", prov_name,
+                exc_info=True,
+            )
+        await send_json(send, 400, {"error": str(exc)}, extra_headers=cors)
+        return
+
+    masked = config_store.get(prov_name)
+    if masked is not None and masked["enabled"]:
+        await provider_manager.replace(prov_name, built[prov_name])
+    else:
+        # The update disabled the row (D1 tombstone): the provider must
+        # leave the live map, not be replaced in it.
+        await _discard_contexts(built)
+        await provider_manager.remove(prov_name)
+
+    log.info("provider updated: %s", prov_name)
+    await send_json(send, 200, masked or {}, extra_headers=cors)
+
+
+async def handle_provider_delete(
+    send: Send,
+    provider_manager: ProviderManager,
+    config_store: ConfigStoreManager,
+    admin_token: str | None,
+    scope: Scope,
+    prov_name: str,
+    toml_provider_names: frozenset[str],
+    toml_provider_sections: dict[str, dict[str, Any]],
+    cors_allow_origin: str | None = None,
+) -> None:
+    """DELETE /admin/providers/<name> — remove, tombstoning TOML providers.
+
+    D1 precedence makes plain removal insufficient for a TOML-declared
+    provider: the next boot would re-load it from the file. Those get a
+    tombstone instead — the store row (or a row synthesized from the boot
+    TOML section) upserted with ``enabled=0``, which ``effective_providers``
+    treats as "remove from the effective set". Store-only providers are
+    genuinely deleted. Either way the live context is deregistered and
+    drained under the WI-2 rules.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(
+            send, 405,
+            {"error": "mutations disabled — set --admin-token to enable"},
+            extra_headers=cors,
+        )
+        return
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    live = prov_name in provider_manager.providers
+    masked = config_store.get(prov_name)
+    if not live and masked is None:
+        await send_json(
+            send, 404, {"error": "unknown provider"}, extra_headers=cors,
+        )
+        return
+
+    tombstoned = False
+    if prov_name in toml_provider_names:
+        if masked is not None:
+            fields = _tombstone_fields_from_masked(masked)
+        else:
+            fields = _tombstone_fields_from_toml(
+                toml_provider_sections.get(prov_name, {})
+            )
+        fields["enabled"] = 0
+        try:
+            config_store.upsert(prov_name, fields)
+        except ValueError as exc:
+            # Not the client's fault: the boot TOML section does not satisfy
+            # the store's row rules (e.g. target=0). Surface it honestly.
+            log.error(
+                "provider tombstone failed for %s: %s", prov_name, exc
+            )
+            await send_json(
+                send, 500,
+                {"error": f"could not tombstone provider: {exc}"},
+                extra_headers=cors,
+            )
+            return
+        except sqlite3.Error as exc:
+            log.error(
+                "provider tombstone failed for %s: %s", prov_name, exc
+            )
+            await send_json(
+                send, 500, {"error": "config store write failed"},
+                extra_headers=cors,
+            )
+            return
+        tombstoned = True
+    elif masked is not None:
+        try:
+            config_store.remove(prov_name)
+        except sqlite3.Error as exc:
+            log.error("provider delete failed for %s: %s", prov_name, exc)
+            await send_json(
+                send, 500, {"error": "config store write failed"},
+                extra_headers=cors,
+            )
+            return
+
+    await provider_manager.remove(prov_name)
+    log.info(
+        "provider removed: %s (tombstoned=%s)", prov_name, tombstoned,
+    )
+    await send_json(
+        send, 200, {"removed": True, "tombstoned": tombstoned},
+        extra_headers=cors,
+    )
+
+
+async def handle_provider_test(
+    send: Send,
+    providers: dict[str, ProviderContext],
+    admin_token: str | None,
+    scope: Scope,
+    prov_name: str,
+    cors_allow_origin: str | None = None,
+    client_factory: Callable[[], httpx.AsyncClient] | None = None,
+) -> None:
+    """POST /admin/providers/<name>/test — upstream reachability probe.
+
+    Issues ``GET {upstream}/models`` with the provider's own credential,
+    resolved exactly as the forwarding path presents it (the live context's
+    ``api_key``/``auth_header``/``auth_prefix``), and reports status +
+    latency. The credential is applied to the OUTBOUND request only and
+    appears nowhere in the response — no header echo, no key material.
+    Auth-gated like the mutating endpoints because each call spends a
+    request against a real upstream. ``client_factory`` exists for tests
+    (MockTransport); the default is a short-lived client with a 5 s timeout.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(
+            send, 405,
+            {"error": "mutations disabled — set --admin-token to enable"},
+            extra_headers=cors,
+        )
+        return
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    ctx = providers.get(prov_name)
+    if ctx is None:
+        await send_json(
+            send, 404, {"error": "unknown provider"}, extra_headers=cors,
+        )
+        return
+
+    url = ctx.upstream_url.rstrip("/") + "/models"
+    headers: dict[str, str] = {}
+    if ctx.api_key:
+        headers[ctx.auth_header] = f"{ctx.auth_prefix}{ctx.api_key}"
+    factory = client_factory or (
+        lambda: httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+    )
+
+    status_code: int | None = None
+    detail = ""
+    start = time.monotonic()
+    try:
+        async with factory() as client:
+            response = await client.get(url, headers=headers)
+            status_code = response.status_code
+    except httpx.TimeoutException:
+        detail = "timeout"
+    except httpx.HTTPError as exc:
+        detail = type(exc).__name__
+    latency_ms = round((time.monotonic() - start) * 1000.0, 1)
+
+    ok = status_code is not None and 200 <= status_code < 300
+    log.info(
+        "provider test: %s -> status=%s ok=%s", prov_name, status_code, ok,
+    )
+    await send_json(
+        send, 200,
+        {
+            "ok": ok,
+            "status": status_code,
+            "latency_ms": latency_ms,
+            "detail": detail,
+        },
+        extra_headers=cors,
+    )
+
+
+async def handle_config_effective(
+    send: Send,
+    config_store: ConfigStoreManager,
+    toml_provider_names: frozenset[str],
+    toml_provider_sections: dict[str, dict[str, Any]],
+    cors_allow_origin: str | None = None,
+) -> None:
+    """GET /admin/config/effective — the merged TOML+store view, MASKED.
+
+    Deliberately does NOT call ``effective_providers()`` — that is the
+    construction path and carries raw credentials. The view is assembled
+    from read surfaces instead: store rows via ``list_providers()`` (already
+    masked, tombstones included with ``enabled: false``), and TOML-only
+    providers from the boot sections with any inline ``api_key`` replaced by
+    ``api_key_set`` + a last-4 hint. Per D1, a store row shadows its TOML
+    section wholesale, so store-named providers show the store's row.
+    """
+    entries: list[dict[str, Any]] = []
+    store_names: set[str] = set()
+    for masked in config_store.list_providers():
+        row: dict[str, Any] = dict(masked)
+        row["source"] = "store"
+        entries.append(row)
+        store_names.add(str(masked["name"]))
+    for name in toml_provider_names:
+        if name in store_names:
+            continue
+        section = dict(toml_provider_sections.get(name, {}))
+        api_key = section.pop("api_key", None)
+        entry: dict[str, Any] = dict(section)
+        entry["name"] = name
+        entry["source"] = "toml"
+        entry["enabled"] = True
+        if isinstance(api_key, str) and api_key:
+            entry["api_key_set"] = True
+            entry["api_key_hint"] = api_key[-4:]
+        else:
+            entry["api_key_set"] = False
+            entry["api_key_hint"] = ""
+        entries.append(entry)
+    entries.sort(key=lambda e: str(e["name"]))
+    await send_json(
+        send, 200, {"providers": entries},
+        extra_headers=[
+            *cors_extra_headers(cors_allow_origin, None),
+            (b"cache-control", b"no-store"),
+        ],
+    )
 
 
 async def handle_usage_history(
