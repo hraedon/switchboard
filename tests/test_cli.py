@@ -368,3 +368,125 @@ class TestServeKeyStartup:
         assert drain_timeout == 17.0
         assert log_level == "warning"
         assert app._admin_token == "s3cret"
+
+
+class TestConfigStoreBootMerge:
+    """Plan 020 WI-4: the config store overlays TOML providers at boot (D1)."""
+
+    def test_store_row_added_and_tombstone_suppresses_toml(
+        self, tmp_path
+    ) -> None:
+        from switchboard.config_store import ConfigStoreManager
+
+        store_file = str(tmp_path / "rt.db")
+        seed = ConfigStoreManager(sqlite_path=store_file)
+        seed.upsert("gui", {
+            "upstream": "http://127.0.0.1:9002",
+            "provider_type": "generic",
+            "target": 1,
+            "key_mode": "passthrough",
+        })
+        # Tombstone for the TOML-declared provider: enabled=0 removes it
+        # from the effective set even though the file still declares it.
+        seed.upsert("umans", {
+            "upstream": "https://api.example.com",
+            "provider_type": "generic",
+            "target": 1,
+            "key_mode": "passthrough",
+            "enabled": 0,
+        })
+        seed.close()
+
+        cfg = _write_serve_config(tmp_path, _SERVE_PROVIDER)
+        app, _, _, _, _ = _build_serve_app(
+            _serve_args(config=cfg, route_table_store=store_file)
+        )
+        assert set(app._providers) == {"gui"}
+        assert app._providers["gui"].upstream_url == "http://127.0.0.1:9002"
+        # The admin layer received the boot TOML identity for D1 tombstones.
+        assert app._toml_provider_names == frozenset({"umans"})
+        assert app._config_store.get("gui") is not None
+        # The default route fell back to the EFFECTIVE set, not the TOML one.
+        assert app._route_table.default_providers == ("gui",)
+
+    def test_memory_only_store_when_no_store_path(self, tmp_path) -> None:
+        cfg = _write_serve_config(tmp_path, _SERVE_PROVIDER)
+        app, _, _, _, _ = _build_serve_app(_serve_args(config=cfg))
+        assert set(app._providers) == {"umans"}
+        assert app._config_store.db is None
+        assert app._toml_provider_names == frozenset({"umans"})
+
+    def test_store_row_replaces_toml_section_wholesale(
+        self, tmp_path
+    ) -> None:
+        from switchboard.config_store import ConfigStoreManager
+
+        store_file = str(tmp_path / "rt.db")
+        seed = ConfigStoreManager(sqlite_path=store_file)
+        seed.upsert("umans", {
+            "upstream": "http://127.0.0.1:9009",
+            "provider_type": "generic",
+            "target": 4,
+            "key_mode": "passthrough",
+        })
+        seed.close()
+
+        cfg = _write_serve_config(tmp_path, _SERVE_PROVIDER)
+        app, _, _, _, _ = _build_serve_app(
+            _serve_args(config=cfg, route_table_store=store_file)
+        )
+        assert set(app._providers) == {"umans"}
+        # The store row won: upstream comes from the row, not the TOML.
+        assert app._providers["umans"].upstream_url == "http://127.0.0.1:9009"
+
+
+def test_tombstoned_provider_reference_warns_not_bricks(
+    tmp_path, caplog
+) -> None:
+    """A GUI-tombstoned provider referenced by TOML routes/models must not
+    make the config unbootable — deliberate operator action degrades to a
+    warning; a genuinely unknown name stays a hard error (WI-3/4 review
+    open question 1)."""
+    import logging
+
+    import httpx
+
+    from switchboard.cli import _ConfigError, _validate_config
+    from switchboard.gate import PermitGate
+    from switchboard.limit import BreakerConfig
+    from switchboard.providers import ProviderContext
+    from switchboard.reconcile import ReconciliationLoop
+    from switchboard.truth import NullTruthSource
+
+    gate = PermitGate(initial_capacity=0)
+    truth = NullTruthSource(provider="generic")
+    ctx = ProviderContext(
+        name="alive",
+        upstream_url="https://a.example.com",
+        gate=gate,
+        reconcile=ReconciliationLoop(
+            truth_source=truth,
+            gate=gate,
+            max_concurrency=1,
+            provider_type="generic",
+            breaker_config=BreakerConfig(),
+        ),
+        truth_source=truth,
+        http_client=httpx.AsyncClient(),
+    )
+    config = {
+        "route": {"default": {"providers": ["alive", "buried"]}},
+        "model": {"m": {"alive": "m", "buried": "m-alias"}},
+    }
+
+    with caplog.at_level(logging.WARNING, "switchboard.cli"):
+        _validate_config(
+            config, {"alive": ctx}, tombstoned=frozenset({"buried"})
+        )
+    assert any("buried" in r.message for r in caplog.records)
+    assert any("disabled in the config store" in r.message for r in caplog.records)
+
+    import pytest as _pytest
+
+    with _pytest.raises(_ConfigError):
+        _validate_config(config, {"alive": ctx}, tombstoned=frozenset())

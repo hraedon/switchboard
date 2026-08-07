@@ -209,12 +209,32 @@ def _validate_config_pre_build(
 def _validate_config(
     config_data: dict[str, Any],
     providers: dict[str, Any],
+    *,
+    tombstoned: frozenset[str] = frozenset(),
 ) -> None:
     """Validate all configuration references (WI-006.8).
 
     Raises ``_ConfigError`` on the first validation failure.
+
+    ``tombstoned`` names providers the config store has disabled
+    (Plan 020 D1). A TOML reference to one of those is a deliberate
+    operator action, not a typo, and must not brick the next boot —
+    it degrades to a warning, and the routing core already skips
+    candidates with no live state. A name in neither set stays a
+    hard error: that IS the typo case validation exists for.
     """
     errors: list[str] = []
+    warnings: list[str] = []
+
+    def _check_ref(name: object, message: str) -> None:
+        if not isinstance(name, str):
+            return
+        if name in providers:
+            return
+        if name in tombstoned:
+            warnings.append(f"{message} (disabled in the config store)")
+        else:
+            errors.append(message)
 
     raw_providers = config_data.get("provider", {})
     if isinstance(raw_providers, dict):
@@ -237,9 +257,10 @@ def _validate_config(
                         errors.append(
                             f"default route: provider '{p}' must be a string"
                         )
-                    elif p not in providers:
-                        errors.append(
-                            f"default route references unknown provider: '{p}'"
+                    else:
+                        _check_ref(
+                            p,
+                            f"default route references unknown provider: '{p}'",
                         )
 
         for section_name, section_data in route_section.items():
@@ -254,10 +275,11 @@ def _validate_config(
                         errors.append(
                             f"route '{section_name}': provider must be a string"
                         )
-                    elif p not in providers:
-                        errors.append(
+                    else:
+                        _check_ref(
+                            p,
                             f"route '{section_name}' references unknown "
-                            f"provider: '{p}'"
+                            f"provider: '{p}'",
                         )
 
     routing_section = config_data.get("routing", {})
@@ -381,9 +403,10 @@ def _validate_config(
                     f"usage_24h_budget.'{prov_name}': cap_tokens must be > 0"
                 )
             if prov_name not in providers:
-                errors.append(
+                _check_ref(
+                    prov_name,
                     f"usage_24h_budget.'{prov_name}': "
-                    f"references unknown provider"
+                    f"references unknown provider",
                 )
 
     token_budget_section = config_data.get("token_budget", {})
@@ -430,8 +453,9 @@ def _validate_config(
                     f"soft_threshold must be in (0.0, 1.0]"
                 )
             if prov_name not in providers:
-                errors.append(
-                    f"token_budget.'{prov_name}': references unknown provider"
+                _check_ref(
+                    prov_name,
+                    f"token_budget.'{prov_name}': references unknown provider",
                 )
 
     model_section = config_data.get("model", {})
@@ -448,8 +472,10 @@ def _validate_config(
                         f"model '{model_name}': alias for '{provider_name}' must be a string"
                     )
                 if provider_name not in providers:
-                    errors.append(
-                        f"model '{model_name}': references unknown provider '{provider_name}'"
+                    _check_ref(
+                        provider_name,
+                        f"model '{model_name}': references unknown provider "
+                        f"'{provider_name}'",
                     )
 
     overload_section = config_data.get("overload", {})
@@ -483,10 +509,13 @@ def _validate_config(
             if not isinstance(tp, str):
                 errors.append("threshold.provider must be a string")
             elif tp not in providers:
-                errors.append(
-                    f"threshold.provider references unknown provider: '{tp}'"
+                _check_ref(
+                    tp,
+                    f"threshold.provider references unknown provider: '{tp}'",
                 )
 
+    for warning in warnings:
+        log.warning("config: %s", warning)
     if errors:
         raise _ConfigError("; ".join(errors))
 
@@ -572,6 +601,7 @@ def _build_serve_app(
     args: argparse.Namespace,
 ) -> tuple[Any, str, int, str, float]:
     """Build the ProxyApp + bind params from CLI args, env, and config file."""
+    from switchboard.config_store import ConfigStoreManager
     from switchboard.control import RoutingConfig
     from switchboard.estimator import ThresholdEstimator
     from switchboard.model_map import ModelMapManager
@@ -591,22 +621,10 @@ def _build_serve_app(
 
     store_path = _resolve_route_table_store(args, config_data)
 
-    providers = build_provider_contexts_from_config(
-        config_data,
-        history_store_path=store_path,
-    )
-    if not providers:
-        raise _ConfigError(
-            "no providers configured — provide a TOML config with [provider.*] sections"
-        )
-
-    try:
-        _validate_config(config_data, providers)
-    except _ConfigError:
-        for ctx in providers.values():
-            ctx.reconcile._stopped = True
-        raise
-
+    # Boot merge (Plan 020 WI-4, D1): the config store shares the route
+    # table's SQLite connection, so the route table is built FIRST — seeded
+    # with the config-declared default route only; the fallback default
+    # (all providers) is not known until the store has overlaid the TOML.
     default_providers: tuple[str, ...] = ()
     route_section = config_data.get("route", {})
     if isinstance(route_section, dict):
@@ -615,15 +633,6 @@ def _build_serve_app(
             providers_list = default_cfg.get("providers")
             if isinstance(providers_list, list):
                 default_providers = tuple(providers_list)
-
-    if not default_providers:
-        default_providers = tuple(providers.keys())
-
-    for name in default_providers:
-        if name not in providers:
-            raise _ConfigError(
-                f"default route references unknown provider: {name}"
-            )
 
     try:
         route_table = RouteTableManager(
@@ -635,7 +644,82 @@ def _build_serve_app(
             f"failed to open route table store: {exc}"
         ) from exc
 
+    # Matches the route table's dual mode: no store path = memory-only
+    # (the admin provider endpoints work, but their writes don't survive
+    # a restart).
+    if route_table.db is not None:
+        config_store = ConfigStoreManager(db=route_table.db)
+    else:
+        config_store = ConfigStoreManager()
+
+    # D1 precedence: a store row replaces its TOML section wholesale, and a
+    # disabled row (tombstone) removes the TOML provider from the effective
+    # set. The strict TOML validation above already ran on the raw file.
+    # NOTE: `effective` sections carry raw credentials (construction path
+    # only) — they are never serialized.
+    effective = config_store.effective_providers(config_data)
+    tombstoned_providers = frozenset(
+        str(row["name"])
+        for row in config_store.list_providers()
+        if not row["enabled"]
+    )
+
+    providers = build_provider_contexts_from_config(
+        {"provider": effective},
+        history_store_path=store_path,
+    )
+    if not providers:
+        raise _ConfigError(
+            "no providers configured — provide a TOML config with [provider.*] sections"
+        )
+
+    try:
+        _validate_config(
+            config_data, providers, tombstoned=tombstoned_providers
+        )
+    except _ConfigError:
+        for ctx in providers.values():
+            ctx.reconcile._stopped = True
+        raise
+
+    if not default_providers:
+        default_providers = tuple(providers.keys())
+        route_table.set_default_providers(default_providers)
+
+    for name in default_providers:
+        if name not in providers and name not in tombstoned_providers:
+            raise _ConfigError(
+                f"default route references unknown provider: {name}"
+            )
+
     route_table.load_from_config(config_data, overwrite=store_path is None)
+
+    # A tombstoned name in the declared default would just be dead weight in
+    # every routing decision (admission skips it) — drop it and say so, so
+    # the operator sees the default that actually fires (wave 0+1 review,
+    # finding 6). MUST run after load_from_config: that call re-sets the
+    # default from the TOML unconditionally and would clobber the filter
+    # (cycle-2 review, finding 1). Filter the route table's own view, which
+    # includes whatever load_from_config just installed.
+    declared_default = tuple(route_table.default_providers)
+    live_default = tuple(
+        name for name in declared_default if name not in tombstoned_providers
+    )
+    if live_default != declared_default:
+        dropped = [n for n in declared_default if n in tombstoned_providers]
+        log.warning(
+            "default route: dropping tombstoned provider(s) %s — effective "
+            "default is %s",
+            ", ".join(dropped),
+            list(live_default),
+        )
+        if not live_default:
+            raise _ConfigError(
+                "default route has no live providers — every declared "
+                "provider is disabled in the config store"
+            )
+        default_providers = live_default
+        route_table.set_default_providers(default_providers)
 
     routing_config = RoutingConfig()
     routing_section = config_data.get("routing", {})
@@ -694,7 +778,13 @@ def _build_serve_app(
         if rc_kwargs:
             routing_config = RoutingConfig(**rc_kwargs)
 
-    model_map_mgr = ModelMapManager(db=route_table.db)
+    # valid_providers guards SQLite-loaded aliases against providers that
+    # were since removed from the config — without it a stale row makes its
+    # model route nowhere, silently (WI-12b).
+    model_map_mgr = ModelMapManager(
+        db=route_table.db,
+        valid_providers=frozenset(effective),
+    )
     model_map_mgr.load_from_config(
         config_data, overwrite=store_path is None
     )
@@ -836,6 +926,16 @@ def _build_serve_app(
                 cap_tokens=cap_tokens,
             )
 
+    # Boot TOML sections, threaded to the admin layer for the D1 tombstone
+    # and /admin/config/effective paths. They may carry an inline api_key;
+    # every serialization surface masks them.
+    raw_provider_tables = config_data.get("provider")
+    toml_provider_sections: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_provider_tables, dict):
+        for prov_name, prov_section in raw_provider_tables.items():
+            if isinstance(prov_section, dict):
+                toml_provider_sections[str(prov_name)] = dict(prov_section)
+
     app = ProxyApp(
         providers=providers,
         route_table=route_table,
@@ -851,11 +951,26 @@ def _build_serve_app(
         estimator=estimator,
         budget_tracker=budget_tracker,
         usage_history_tracker=usage_history_tracker,
+        config_store=config_store,
+        toml_provider_names=frozenset(toml_provider_sections),
+        toml_provider_sections=toml_provider_sections,
     )
+
+    store_backed = {
+        str(row["name"])
+        for row in config_store.list_providers()
+        if row["enabled"]
+    }
+    n_store = sum(1 for name in providers if name in store_backed)
 
     log.info("switchboard %s starting", __version__)
     log.info("  listen:            %s:%d", host, port)
-    log.info("  providers:         %s", ", ".join(providers.keys()))
+    log.info(
+        "  providers:         %s (%d from TOML, %d from store)",
+        ", ".join(providers.keys()),
+        len(providers) - n_store,
+        n_store,
+    )
     log.info("  default_route:     %s", " -> ".join(default_providers))
     log.info("  queue_timeout:     %.1fs", queue_timeout)
     log.info("  drain_timeout:     %.1fs", drain_timeout)

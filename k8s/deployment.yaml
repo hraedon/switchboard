@@ -28,10 +28,13 @@ spec:
         app: switchboard
     spec:
       # Run as the image's unprivileged user (uid 10001) and refuse escalation.
+      # fsGroup makes the state volume group-writable for that user — Longhorn
+      # provisions volumes root-owned, and the store must be writable.
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
+        fsGroup: 10001
       containers:
         - name: switchboard
           image: ghcr.io/hraedon/switchboard:main
@@ -51,6 +54,12 @@ spec:
           # config. The pod does NOT start until the Secret has real values:
           # a declared-but-empty variable is a hard startup error by design.
           env:
+            # SQLite store path (route table, model map, provider config);
+            # the per-provider history DBs land beside it as
+            # store.sqlite.<provider>.history. Lives on the PVC — the only
+            # writable mount in the pod.
+            - name: SWITCHBOARD_ROUTE_TABLE_STORE
+              value: /var/lib/switchboard/store.sqlite
             - name: SWITCHBOARD_OPENCODE_GO_KEY
               valueFrom:
                 secretKeyRef:
@@ -71,6 +80,8 @@ spec:
               mountPath: /etc/switchboard/switchboard.toml
               subPath: switchboard.toml
               readOnly: true
+            - name: state
+              mountPath: /var/lib/switchboard
           livenessProbe:
             httpGet:
               path: /healthz
@@ -106,8 +117,8 @@ spec:
               memory: 256Mi
           securityContext:
             allowPrivilegeEscalation: false
-            # Nothing is written at runtime: the route table is in-memory
-            # (no --route-table-store), and the config is mounted readOnly.
+            # The root filesystem stays read-only: all runtime writes go to
+            # the single state volume mounted at /var/lib/switchboard.
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
@@ -115,3 +126,6 @@ spec:
         - name: config
           configMap:
             name: switchboard-config
+        - name: state
+          persistentVolumeClaim:
+            claimName: switchboard-state

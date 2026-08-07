@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import tempfile
+
+import pytest
 
 from switchboard.control import ModelMap
 from switchboard.model_map import ModelMapManager
@@ -166,3 +169,124 @@ def test_sqlite_persistence_set_replaces_row() -> None:
         db2.close()
     finally:
         os.unlink(path)
+
+
+# --- WI-12b: DB-first write ordering ---------------------------------------
+
+
+def test_set_model_db_failure_raises_and_leaves_memory_unchanged() -> None:
+    """A failed DB write must not leave memory claiming a phantom save."""
+    db = sqlite3.connect(":memory:")
+    mgr = ModelMapManager(db=db)
+    mgr.set_model("m", {"umans": "v1"})
+    db.close()  # every subsequent execute() raises sqlite3.ProgrammingError
+
+    with pytest.raises(sqlite3.Error):
+        mgr.set_model("m", {"umans": "v2"})
+    # Memory still holds the last successfully persisted value.
+    assert mgr.get_model_map().alias_for("m", "umans") == "v1"
+
+    with pytest.raises(sqlite3.Error):
+        mgr.set_model("brand-new", {"umans": "x"})
+    assert "brand-new" not in mgr.get_model_map()
+
+
+def test_remove_model_db_failure_raises_and_keeps_entry() -> None:
+    db = sqlite3.connect(":memory:")
+    mgr = ModelMapManager(db=db)
+    mgr.set_model("m", {"umans": "v1"})
+    db.close()
+
+    with pytest.raises(sqlite3.Error):
+        mgr.remove_model("m")
+    assert mgr.get_model_map().alias_for("m", "umans") == "v1"
+
+
+# --- WI-12b: distrust the store at load ------------------------------------
+
+
+def _seed_raw_row(db: sqlite3.Connection, model: str, aliases_json: str) -> None:
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS model_map "
+        "(model TEXT PRIMARY KEY, aliases TEXT)"
+    )
+    db.execute(
+        "INSERT OR REPLACE INTO model_map (model, aliases) VALUES (?, ?)",
+        (model, aliases_json),
+    )
+    db.commit()
+
+
+def test_load_skips_corrupt_json_row_and_keeps_the_rest(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db = sqlite3.connect(":memory:")
+    _seed_raw_row(db, "good", '{"umans": "ok"}')
+    _seed_raw_row(db, "corrupt", "{not json")
+
+    with caplog.at_level(logging.WARNING, logger="switchboard.model_map"):
+        mgr = ModelMapManager(db=db)  # must not raise
+
+    mm = mgr.get_model_map()
+    assert mm.alias_for("good", "umans") == "ok"
+    assert "corrupt" not in mm
+    assert any("corrupt" in r.message for r in caplog.records)
+    # The bad row is left in the DB for forensics, not deleted.
+    count = db.execute(
+        "SELECT COUNT(*) FROM model_map WHERE model = 'corrupt'"
+    ).fetchone()[0]
+    assert count == 1
+    db.close()
+
+
+def test_load_skips_non_object_json_row(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db = sqlite3.connect(":memory:")
+    _seed_raw_row(db, "listy", '["not", "a", "dict"]')
+
+    with caplog.at_level(logging.WARNING, logger="switchboard.model_map"):
+        mgr = ModelMapManager(db=db)
+
+    assert "listy" not in mgr.get_model_map()
+    assert any("listy" in r.message for r in caplog.records)
+    db.close()
+
+
+def test_valid_providers_skips_fully_unknown_row(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db = sqlite3.connect(":memory:")
+    _seed_raw_row(db, "stale", '{"gone-prov": "x", "also-gone": "y"}')
+
+    with caplog.at_level(logging.WARNING, logger="switchboard.model_map"):
+        mgr = ModelMapManager(db=db, valid_providers=frozenset({"umans"}))
+
+    assert "stale" not in mgr.get_model_map()
+    assert any("stale" in r.message for r in caplog.records)
+    db.close()
+
+
+def test_valid_providers_loads_known_subset_of_mixed_row(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db = sqlite3.connect(":memory:")
+    _seed_raw_row(db, "mixed", '{"umans": "ok", "gone-prov": "x"}')
+
+    with caplog.at_level(logging.WARNING, logger="switchboard.model_map"):
+        mgr = ModelMapManager(db=db, valid_providers=frozenset({"umans"}))
+
+    mm = mgr.get_model_map()
+    assert mm.alias_for("mixed", "umans") == "ok"
+    assert mm.providers_for("mixed") == frozenset({"umans"})
+    assert any("gone-prov" in r.message for r in caplog.records)
+    db.close()
+
+
+def test_valid_providers_none_disables_validation() -> None:
+    db = sqlite3.connect(":memory:")
+    _seed_raw_row(db, "stale", '{"gone-prov": "x"}')
+
+    mgr = ModelMapManager(db=db)  # None: prior behavior, load everything
+    assert mgr.get_model_map().alias_for("stale", "gone-prov") == "x"
+    db.close()

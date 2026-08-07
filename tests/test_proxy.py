@@ -337,7 +337,7 @@ async def test_admit_immediate_failover_to_idle_fallback() -> None:
         reason="failover",
     )
     result = await app._admit(plan)
-    assert result == "fallback"
+    assert result is not None and result[0] == "fallback"
 
     await primary_ctx.gate.release()
     await primary_ctx.http_client.aclose()
@@ -366,7 +366,7 @@ async def test_admit_race_fills_primary_tries_next() -> None:
     assert held
 
     result = await app._admit(plan)
-    assert result == "p2"
+    assert result is not None and result[0] == "p2"
 
     await ctx1.gate.release()
     await ctx1.http_client.aclose()
@@ -471,7 +471,7 @@ async def test_admit_permit_released_during_queue_wait() -> None:
     app._queue_timeout = 1.0
     # The queue wait on p1 should succeed after the permit is released.
     result = await app._admit(plan)
-    assert result == "p1"
+    assert result is not None and result[0] == "p1"
 
     await release_task
     await ctx1.gate.release()

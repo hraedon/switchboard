@@ -44,6 +44,7 @@ from typing import Any
 import httpx
 
 from switchboard.admin import (
+    handle_config_effective,
     handle_config_get,
     handle_healthz,
     handle_login_get,
@@ -52,6 +53,11 @@ from switchboard.admin import (
     handle_model_map_delete,
     handle_model_map_list,
     handle_model_map_set,
+    handle_provider_create,
+    handle_provider_delete,
+    handle_provider_test,
+    handle_provider_update,
+    handle_providers_list,
     handle_readyz,
     handle_route_add,
     handle_route_delete,
@@ -64,6 +70,7 @@ from switchboard.admin import (
     send_status_json,
     serve_static,
 )
+from switchboard.config_store import ConfigStoreManager
 from switchboard.control import (
     DEFAULT_REROUTE_STATUSES,
     AdmissionPlan,
@@ -80,6 +87,7 @@ from switchboard.estimator import ThresholdEstimator
 from switchboard.limit import RETRY_AFTER_SHORT
 from switchboard.model_map import ModelMapManager
 from switchboard.overload import OverloadConfig, OverloadTracker
+from switchboard.provider_manager import ProviderManager
 from switchboard.providers import ProviderContext, snapshot_provider_state
 from switchboard.route_table import RouteTableManager
 from switchboard.session import (
@@ -373,8 +381,23 @@ class ProxyApp:
         usage_history_tracker: UsageHistoryTracker | None = None,
         reroute_statuses: frozenset[int] | None = None,
         reroute_max_attempts: int = 0,
+        config_store: ConfigStoreManager | None = None,
+        toml_provider_names: frozenset[str] | None = None,
+        toml_provider_sections: dict[str, dict[str, Any]] | None = None,
     ) -> None:
-        self._providers = providers
+        self._provider_manager = ProviderManager(
+            providers, drain_timeout=drain_timeout
+        )
+        # Provider config store (Plan 020 WI-3/4). A memory-only store when
+        # the caller passes none keeps the admin endpoints functional (their
+        # writes simply don't survive a restart). The boot TOML sections are
+        # kept for the tombstone/effective-config paths ONLY — they may hold
+        # an inline api_key, and every serialization path masks them.
+        self._config_store = (
+            config_store if config_store is not None else ConfigStoreManager()
+        )
+        self._toml_provider_names = toml_provider_names or frozenset()
+        self._toml_provider_sections = toml_provider_sections or {}
         self._route_table = route_table
         self._routing_config = routing_config or RoutingConfig()
         self._admin_token = admin_token
@@ -412,6 +435,21 @@ class ProxyApp:
         self._provider_healthy_since: dict[str, float] = {}
 
     @property
+    def _providers(self) -> dict[str, ProviderContext]:
+        """Snapshot of the live provider map (owned by the manager).
+
+        Copy-on-swap semantics: this reference is replaced, never mutated,
+        so any admission/status path that grabs it works on a consistent
+        view even while providers are added or removed mid-request.
+        """
+        return self._provider_manager.providers
+
+    @property
+    def provider_manager(self) -> ProviderManager:
+        """Runtime provider lifecycle (Plan 020 WI-2); admin handlers use this."""
+        return self._provider_manager
+
+    @property
     def metrics(self) -> RoutingMetrics:
         """Routing metrics for /status.json and /metrics."""
         return self._metrics
@@ -441,13 +479,14 @@ class ProxyApp:
             and (
                 path in (
                     "/", "/status.json", "/metrics",
-                    "/admin/routes", "/admin/config", "/admin/model-map",
+                    "/admin/routes", "/admin/config",
+                    "/admin/config/effective",
+                    "/admin/model-map", "/admin/providers",
                     "/admin/threshold-events", "/admin/usage-history",
                     "/login", "/logout",
                 )
                 or (
                     path.startswith("/admin/providers/")
-                    and path.endswith("/override")
                 )
                 or (
                     path.startswith("/admin/model-map/")
@@ -613,6 +652,50 @@ class ProxyApp:
             )
             return
 
+        if path == "/admin/config/effective" and method == "GET":
+            authed = check_admin_auth(scope, self._admin_token)
+            if not authed and self._admin_token:
+                await send_json(
+                    send, 401, {"error": "unauthorized"},
+                    extra_headers=cors_extra_headers(
+                        self._cors_allow_origin, None
+                    ),
+                )
+                return
+            await handle_config_effective(
+                send, self._config_store,
+                self._toml_provider_names, self._toml_provider_sections,
+                self._cors_allow_origin,
+            )
+            return
+
+        if path == "/admin/providers":
+            if method == "GET":
+                authed = check_admin_auth(scope, self._admin_token)
+                if not authed and self._admin_token:
+                    await send_json(
+                        send, 401, {"error": "unauthorized"},
+                        extra_headers=cors_extra_headers(
+                            self._cors_allow_origin, None
+                        ),
+                    )
+                    return
+                await handle_providers_list(
+                    send, self._providers, self._config_store,
+                    self._cors_allow_origin,
+                    toml_provider_sections=self._toml_provider_sections,
+                )
+                return
+            if method == "POST":
+                await handle_provider_create(
+                    send, receive, self._provider_manager,
+                    self._config_store, self._admin_token, scope,
+                    self._cors_allow_origin,
+                )
+                return
+            await send_text(send, 405, "Method not allowed")
+            return
+
         if path == "/admin/usage-history" and method == "GET":
             await handle_usage_history(
                 send, scope, self._admin_token, self._providers,
@@ -631,18 +714,54 @@ class ProxyApp:
             path.startswith("/admin/providers/")
             and path.endswith("/override")
         ):
+            from urllib.parse import unquote
+
             from switchboard.admin import (
                 handle_provider_override,
             )
 
             parts = path.split("/")
             if len(parts) == 5 and parts[4] == "override":
-                prov_name = parts[3]
+                prov_name = unquote(parts[3])
                 await handle_provider_override(
                     send, receive, self._providers,
                     self._admin_token, scope, prov_name,
                     method, self._cors_allow_origin,
                 )
+                return
+
+        if path.startswith("/admin/providers/"):
+            from urllib.parse import unquote
+
+            parts = path.split("/")
+            if len(parts) == 5 and parts[4] == "test":
+                if method == "POST":
+                    await handle_provider_test(
+                        send, self._providers, self._admin_token,
+                        scope, unquote(parts[3]), self._cors_allow_origin,
+                    )
+                    return
+                await send_text(send, 405, "Method not allowed")
+                return
+            if len(parts) == 4 and parts[3]:
+                prov_name = unquote(parts[3])
+                if method == "PUT":
+                    await handle_provider_update(
+                        send, receive, self._provider_manager,
+                        self._config_store, self._admin_token, scope,
+                        prov_name, self._cors_allow_origin,
+                    )
+                    return
+                if method == "DELETE":
+                    await handle_provider_delete(
+                        send, self._provider_manager, self._config_store,
+                        self._admin_token, scope, prov_name,
+                        self._toml_provider_names,
+                        self._toml_provider_sections,
+                        self._cors_allow_origin,
+                    )
+                    return
+                await send_text(send, 405, "Method not allowed")
                 return
 
         await self._proxy_request(scope, receive, send)
@@ -709,6 +828,10 @@ class ProxyApp:
                     await ctx.truth_source.close()
                 for ctx in self._providers.values():
                     await ctx.http_client.aclose()
+                # Contexts removed/replaced at runtime drain on their own
+                # tasks; settle them so exit never abandons a half-closed
+                # context (Plan 020 WI-2).
+                await self._provider_manager.shutdown()
                 self._route_table.close()
                 if self._budget_tracker is not None:
                     self._budget_tracker.prune_all(now=time.monotonic())
@@ -879,9 +1002,9 @@ class ProxyApp:
             primary_healthy_since=self._provider_healthy_since.get(primary),
         )
 
-        acquired_provider: str | None = None
+        admitted: tuple[str, ProviderContext] | None = None
         try:
-            acquired_provider = await self._admit(
+            admitted = await self._admit(
                 plan, receive=receive, body_buffered=buffered_body is not None,
             )
         except Exception:
@@ -897,7 +1020,7 @@ class ProxyApp:
             )
             return
 
-        if acquired_provider is None:
+        if admitted is None:
             retry_after = RETRY_AFTER_SHORT
             reason = "no_capacity"
             ctx = self._providers.get(plan.terminal_fallback)
@@ -941,9 +1064,16 @@ class ProxyApp:
             )
             return
 
+        # From here on, the provider identity is the (name, ctx) pair the
+        # permit was acquired on — never a fresh map lookup. The map is
+        # copy-on-swap and may have changed during the admission awaits;
+        # re-indexing it here KeyErrors on a removed provider and, worse,
+        # releases the WRONG gate on a replaced one (wave 0+1 review,
+        # blocking finding 1).
+        acquired_provider, acquired_ctx = admitted
+
         if self._draining:
-            ctx = self._providers[acquired_provider]
-            await ctx.gate.release()
+            await acquired_ctx.gate.release()
             await send_json(
                 send, 503,
                 {
@@ -985,7 +1115,7 @@ class ProxyApp:
         reroutes_done = 0
 
         while True:
-            ctx = self._providers[acquired_provider]
+            ctx = acquired_ctx
             ctx.reconcile.record_request_forwarded()
             tried.add(acquired_provider)
 
@@ -1086,18 +1216,19 @@ class ProxyApp:
                 await self._send_usage_error(send, probe)
                 return
 
-            next_provider = await self._admit(
+            next_admitted = await self._admit(
                 plan,
                 receive=receive,
                 body_buffered=True,
                 exclude=frozenset(tried),
             )
-            if next_provider is None:
+            if next_admitted is None:
                 # Nobody else could take it: surface the upstream's own
                 # status so the client's backoff still sees the truth.
                 self._record_usage_give_up(tried, tried_statuses)
                 await self._send_usage_error(send, probe)
                 return
+            next_provider, next_ctx = next_admitted
             log.info(
                 "rerouting after usage error: %s -> %s (status=%s)",
                 acquired_provider,
@@ -1107,6 +1238,7 @@ class ProxyApp:
             self._metrics.record_usage_reroute(acquired_provider, next_provider)
             reroutes_done += 1
             acquired_provider = next_provider
+            acquired_ctx = next_ctx
             # Affinity is NOT written here. A pin must record who actually
             # served, not who was merely selected: cancellation, a forwarding
             # failure, or another usage error would otherwise leave the
@@ -1195,7 +1327,7 @@ class ProxyApp:
         receive: Receive | None = None,
         body_buffered: bool = False,
         exclude: frozenset[str] = frozenset(),
-    ) -> str | None:
+    ) -> tuple[str, ProviderContext] | None:
         """Plan-driven admission (Plan 006 §4).
 
         1. Try each immediate candidate with a non-blocking gate acquire.
@@ -1208,7 +1340,13 @@ class ProxyApp:
            queue wait doesn't burn the full timeout.  When the body is NOT
            buffered, the disconnect watcher would steal body events from
            ``_forward``'s ``body_stream``, so the plain acquire is used.
-        4. Return the acquired provider name, or None.
+        4. Return the ``(name, context)`` pair the permit was acquired on,
+           or None. Returning the CONTEXT and not just the name is
+           load-bearing: the provider map is copy-on-swap and may have
+           changed during the queue-wait awaits above — the caller must
+           forward through, and release on, the exact context whose gate
+           granted the permit, never a fresh map lookup (wave 0+1 review,
+           blocking finding 1).
         """
         admit_start = time.monotonic()
 
@@ -1220,7 +1358,7 @@ class ProxyApp:
                 continue
             acquired = await ctx.gate.acquire(timeout=0.0)
             if acquired:
-                return name
+                return name, ctx
 
         for name in plan.immediate_candidates:
             if name in exclude:
@@ -1235,7 +1373,7 @@ class ProxyApp:
                 continue
             acquired = await ctx.gate.acquire(timeout=0.0)
             if acquired:
-                return name
+                return name, ctx
 
         if plan.queue_candidate is not None and plan.queue_candidate not in exclude:
             elapsed = time.monotonic() - admit_start
@@ -1258,7 +1396,7 @@ class ProxyApp:
                             await ctx.gate.release()
                         raise
                     if acquired:
-                        return plan.queue_candidate
+                        return plan.queue_candidate, ctx
 
         return None
 

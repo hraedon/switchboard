@@ -201,6 +201,25 @@ are so Plans 015/016 behavior is unchanged.
   scores go stale → ordering falls back to config order with no errors;
   flap test proves the margin works.
 
+## 4b. Deferred review findings (wave 0+1, deepseek cycle 1)
+
+Carried forward deliberately, not forgotten:
+
+- **Top-level JSON-500 wrapper in `ProxyApp.__call__`** (finding 4): an
+  exception escaping a handler aborts the connection with no JSON error
+  body. Needs care around already-started streaming responses; take it
+  in Wave 2 alongside the GUI error handling.
+- **`check_csrf` passes when neither `Authorization` nor
+  `Sec-Fetch-Site` is present** (finding 10, pre-existing): inherited by
+  every mutating endpoint including the upstream-spending `/test` probe.
+  Tighten estate-wide in Wave 2 (all modern browsers send
+  `Sec-Fetch-Site`; the permissive branch exists for curl workflows —
+  decide whether to keep it for token-authed requests only).
+- **First PUT of a TOML-only provider** (finding 3, residual): the list
+  now exposes `key_mode`/`api_key_set` so the GUI can pre-fill, but the
+  API itself still accepts a full-row PUT that changes key_mode without
+  ceremony. Wave 2's form flow should require an explicit key decision.
+
 ## 5. What must not break (verify per wave)
 
 - Streaming: never buffer bodies; no new body reads outside the
