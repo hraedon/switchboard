@@ -201,6 +201,58 @@ function renderDefaultRouteForm(current, known) {
   };
 }
 
+// Configuration provenance (Plan 021 WI-7). Which tier owns each provider,
+// and which fields an env var has taken over. Read-only for now: the input
+// locking this data exists for needs Wave 2's provider form, which does not
+// exist yet — the only editable control on this page is the default route.
+// Rendering it now still answers the question an operator actually has, which
+// is "why is this value what it is", without reading the Deployment.
+function renderConfig(cfg) {
+  if (!cfg) return '';
+  let html = '<h2>Configuration</h2>';
+
+  const unmatched = cfg.unmatched_env_overrides || [];
+  if (unmatched.length) {
+    // These are inert — they name no configured provider. Worth shouting
+    // about anyway: the operator who set them believes a deployment controls
+    // a field it does not, and the boot-time log line has long scrolled away.
+    html += `<div class="card" style="border-color:var(--amber)">
+      <h3 style="color:var(--amber)">Ignored environment overrides</h3>
+      <p style="margin:0 0 0.5rem;color:var(--muted);font-size:0.85rem">
+        These match no configured provider and had no effect. Usually a typo
+        in the provider name.
+      </p>
+      ${unmatched.map(v => `<div class="stat"><span class="k">
+        <code>${esc(v)}</code></span></div>`).join('')}
+    </div>`;
+  }
+
+  const providers = cfg.providers || [];
+  if (!providers.length) return html + '<p style="color:var(--muted)">No providers.</p>';
+
+  html += '<table><thead><tr><th>Provider</th><th>Config source</th>'
+       +  '<th>Set by environment</th></tr></thead><tbody>';
+  for (const p of providers) {
+    const locked = Object.keys(p.field_sources || {}).sort();
+    const disabled = p.enabled === false;
+    const name = disabled
+      ? `<s style="color:var(--muted)">${esc(p.name)}</s> <span class="badge unknown">disabled</span>`
+      : esc(p.name);
+    const lockedCells = locked.length
+      ? locked.map(f => `<code style="color:var(--amber)">${esc(f)}</code>`).join(' ')
+      : '<span style="color:var(--muted)">&mdash;</span>';
+    html += `<tr><td>${name}</td><td>${esc(p.source || '?')}</td>`
+         +  `<td>${lockedCells}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  html += `<p style="color:var(--muted);font-size:0.8rem;margin-top:0.4rem">
+    Precedence is environment &rarr; stored (GUI) &rarr; config file. A field
+    listed above is owned by an environment variable, so editing it here would
+    be discarded at the next restart.
+  </p>`;
+  return html;
+}
+
 function fmtTokens(n) {
   if (n == null) return '-';
   if (n >= 1e9) return (n/1e9).toFixed(1)+'B';
@@ -229,6 +281,19 @@ async function load() {
   const el = document.getElementById('app');
 
   renderDefaultRoute(data);
+
+  // Separate surface from status.json, and optional: a dashboard served
+  // without an admin token still renders everything else rather than failing
+  // whole because one panel could not be fetched.
+  let cfg = null;
+  try {
+    const cresp = await fetch('/admin/config/effective', {
+      credentials: 'same-origin',
+    });
+    if (cresp.ok) cfg = await cresp.json();
+  } catch (e) {
+    cfg = null;
+  }
 
   let html = '<h2>Providers</h2><div class="grid">';
   for (const [name, p] of Object.entries(data.providers || {})) {
@@ -373,6 +438,8 @@ async function load() {
     }
     html += '</tbody></table>';
   }
+
+  html += renderConfig(cfg);
 
   const m = data.routing_metrics || {};
   html += '<h2>Routing Metrics</h2><div class="grid">';

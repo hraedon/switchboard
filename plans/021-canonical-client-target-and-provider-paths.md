@@ -1,6 +1,6 @@
 # Plan 021 — One canonical client target, per-provider paths
 
-Status: Wave 1 landed; Wave 3 WI-6+WI-8 landed; WI-7 and Wave 2 proposed
+Status: Waves 1 and 3 landed (WI-7 partial, blocked on Wave 2 WI-5); Wave 2 proposed
 Supersedes: the "clients must omit the version prefix" contract in
 `k8s/configmap.yaml` and `docs/deployment.md`.
 
@@ -214,7 +214,17 @@ surprise on the next rollout.
 **Wave 3 — precedence and recovery — WI-6 and WI-8 done 2026-08-08**
 - **WI-6 (done)**: Env tier per D6 for every provider field, with `source`
   reporting through `/admin/config/effective`.
-- **WI-7**: GUI lock indicators for env-owned fields.
+- **WI-7 (partial, done 2026-08-08)**: the dashboard now renders a
+  Configuration panel — the owning tier per provider, the fields an env
+  var has taken over, disabled providers, and a warning listing env
+  overrides that matched no provider (inert, and previously visible only
+  in a boot log that has long scrolled away).
+
+  **The locking half is blocked, not skipped.** Locking an input needs an
+  input: the only editable control on the page is the default route, and
+  the provider form is Wave 2 WI-5. When that lands it must consume
+  `field_sources` to disable env-owned inputs — the data is already
+  served and rendered, so it is a form-level change, not new plumbing.
 - **WI-8 (done)**: `POST /admin/config/reset` + `SWITCHBOARD_CONFIG_RESET`
   per D7, with the store rows it deletes logged by name.
 

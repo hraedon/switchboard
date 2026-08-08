@@ -159,6 +159,44 @@ check('escapes provider names in the read view',
       !dangerous.includes('<script>bad') && dangerous.includes('&lt;'),
       dangerous.slice(0, 160));
 
+// --- 8. configuration provenance panel (Plan 021 WI-7) -------------------
+const cfgHtml = sandbox.renderConfig({
+  providers: [
+    { name: 'opencode-go', source: 'toml',
+      field_sources: { target: 'env', upstream: 'env' } },
+    { name: 'ollama-cloud', source: 'store' },
+    { name: 'zai', source: 'store', enabled: false },
+  ],
+  unmatched_env_overrides: ['SWITCHBOARD_PROVIDER_TYPO_UPSTREAM'],
+});
+check('names env-owned fields', /target/.test(cfgHtml) && /upstream/.test(cfgHtml));
+check('shows the owning tier per provider',
+      /toml/.test(cfgHtml) && /store/.test(cfgHtml));
+check('flags a disabled provider', /disabled/.test(cfgHtml));
+check('warns about ignored env overrides',
+      cfgHtml.includes('SWITCHBOARD_PROVIDER_TYPO_UPSTREAM')
+      && /Ignored environment overrides/.test(cfgHtml));
+check('says an env-owned edit would be discarded',
+      /discarded at the next restart/.test(cfgHtml), cfgHtml.slice(-300));
+
+// A provider with no env-owned fields must not be shown as locked.
+const plainHtml = sandbox.renderConfig({
+  providers: [{ name: 'solo', source: 'toml' }],
+});
+check('unlocked provider shows no field list',
+      !/color:var\(--amber\)/.test(plainHtml), plainHtml);
+
+// Absent config (unauthenticated dashboard) renders nothing rather than
+// throwing and taking the rest of the page with it.
+check('missing config renders empty', sandbox.renderConfig(null) === '');
+
+// Provenance data is attacker-influenced only via config, but escape anyway.
+const xssHtml = sandbox.renderConfig({
+  providers: [{ name: '<script>bad</script>', source: 'toml' }],
+});
+check('escapes provider names in the config panel',
+      !xssHtml.includes('<script>bad'), xssHtml.slice(0, 160));
+
 // --- report ---------------------------------------------------------------
 let failed = 0;
 for (const r of results) {
