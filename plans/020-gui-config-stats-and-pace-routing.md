@@ -1,6 +1,18 @@
 # Plan 020 — GUI-managed configuration, per-provider statistics, pace-based routing
 
-Status: proposed (authored 2026-08-06, for Paul's review)
+Status: **Waves 0–1 landed; Wave 2 mostly landed; Wave 3 landed; Wave 4
+proposed.** Wave 1 (ConfigStoreManager, ProviderManager, admin provider CRUD
++ test probe, `/admin/config/effective`, k8s PVC) is on main. Wave 2 delivered
+the runtime-editable default route (WI-8a), the Add-Provider form (Plan 021
+WI-5), and keyed-route + model-map CRUD from the dashboard (WI-7 + the
+keyed-route half of WI-8). Wave 3 (per-provider speed statistics — TTFB,
+duration, tokens/sec) is landed: a `SpeedSampler` records timing per
+successful streamed response and feeds `/status.json`, `/metrics`, and the
+dashboard (WI-9 + WI-10; WI-11 persistence deferred). Still open: the
+edit-provider form (WI-6, completes WI-7's env-lock input-disabling), the
+strategy selector (blocked on Wave 4), and Wave 4 (pace-based routing,
+depends on external usage-dashboard monitoring). Originally authored
+2026-08-06.
 
 Depends on: Plan 018 (landed — switchboard is self-contained). Interacts
 with: Plan 019 (multi-account + conversation pinning, still draft — §9),

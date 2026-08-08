@@ -12,6 +12,7 @@ from switchboard.limit import BreakerConfig, CachedReading, LimitState
 from switchboard.overload import OverloadConfig, OverloadTracker
 from switchboard.providers import (
     ProviderContext,
+    _safe_filename,
     build_provider_context,
     build_provider_contexts_from_config,
     snapshot_provider_state,
@@ -473,7 +474,9 @@ def test_history_ring_warmed_from_store_on_startup(tmp_path) -> None:
     from switchboard.history import HistoryEntry, SQLiteHistoryStore
 
     store_path = str(tmp_path / "hist")
-    prior_store = SQLiteHistoryStore(f"{store_path}.prov_a.history")
+    prior_store = SQLiteHistoryStore(
+        f"{store_path}.{_safe_filename('prov_a')}.history"
+    )
     for i in range(3):
         prior_store.append(
             HistoryEntry(
@@ -519,7 +522,7 @@ def test_history_ring_warmup_survives_corrupt_store(tmp_path) -> None:
     """A corrupt store file degrades to an empty ring — never a startup
     crash (drop-sluice review cycle 2, finding 1/5)."""
     store_path = str(tmp_path / "hist")
-    corrupt = tmp_path / "hist.prov_a.history"
+    corrupt = tmp_path / f"hist.{_safe_filename('prov_a')}.history"
     corrupt.write_bytes(b"this is not a sqlite database")
 
     contexts = build_provider_contexts_from_config(
@@ -537,3 +540,17 @@ def test_history_ring_warmup_survives_corrupt_store(tmp_path) -> None:
     ring = contexts["prov_a"].reconcile.history
     assert ring is not None
     assert ring.to_dict_list(limit=10) == []
+
+
+def test_safe_filename_is_collision_resistant() -> None:
+    """F-10: distinct provider names that normalize to the same safe string
+    must map to DISTINCT files, or two providers share one history store and
+    cross-contaminate their per-tick time series."""
+    assert _safe_filename("opencode-go") != _safe_filename("opencode_go")
+    assert _safe_filename("a.b") != _safe_filename("a_b")
+    # Deterministic: the same name always maps to the same file.
+    assert _safe_filename("ollama-cloud") == _safe_filename("ollama-cloud")
+    # Still filesystem-safe (no path separators or null; the '.' is the
+    # intentional hash separator and is safe).
+    for c in ("/", "\\", "\0", " "):
+        assert c not in _safe_filename(f"weird{c}name")

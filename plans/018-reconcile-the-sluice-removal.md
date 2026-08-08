@@ -1,7 +1,9 @@
 # Plan 018 — Reconcile the rescued sluice removal onto main
 
-Status: steps 1–3 COMPLETE on `feat/018-2-drop-sluice` (2026-08-06);
-awaiting cross-lineage review before merge.
+Status: **merged to main.** The vendored flow-control core (`limit`, `gate`,
+`reconcile`, `truth`, `history`, `session`, `utils`) ships in switchboard's
+own modules, `pyproject.toml` has only `httpx` + `uvicorn`, and
+`tests/test_import_boundary.py` permanently forbids any `sluice` import.
 
 Execution notes (2026-08-06, this branch):
 

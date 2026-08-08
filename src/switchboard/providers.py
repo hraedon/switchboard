@@ -383,8 +383,10 @@ def snapshot_provider_state(
 
     # Token-budget utilization (Plan 012 Feature B).
     token_utilization: float | None = None
+    token_soft_threshold: float | None = None
     if budget_tracker is not None:
         token_utilization = budget_tracker.utilization(name, now=now)
+        token_soft_threshold = budget_tracker.soft_threshold_for(name)
 
     # Trailing-24h usage utilization (Plan 013).
     usage_24h_utilization: float | None = None
@@ -401,6 +403,7 @@ def snapshot_provider_state(
         usage_headroom=usage_headroom,
         quota_resets_in=quota_resets_in,
         token_utilization=token_utilization,
+        token_soft_threshold=token_soft_threshold,
         usage_24h_utilization=usage_24h_utilization,
     )
 
@@ -437,7 +440,18 @@ def _optional_float(d: dict[str, object], key: str) -> float | None:
 
 
 def _safe_filename(name: str) -> str:
-    """Sanitize a provider name for use in a filename."""
+    """Sanitize a provider name for use in a filename.
+
+    A short hash suffix makes the mapping collision-resistant: distinct
+    provider names that normalize to the same safe string (e.g.
+    ``opencode-go`` and ``opencode_go``, or ``a.b`` and ``a_b``) must not
+    share one history-store file, or their per-tick time series
+    cross-contaminate.  The hash is deterministic, so a name maps to one
+    stable file across restarts.
+    """
+    import hashlib
     import re
 
-    return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    return f"{safe}.{digest}"

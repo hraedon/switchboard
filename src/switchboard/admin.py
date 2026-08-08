@@ -15,6 +15,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import re
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable
@@ -105,6 +106,7 @@ def _provider_status(
     overload_tracker: Any | None = None,
     budget_tracker: Any | None = None,
     usage_history_tracker: Any | None = None,
+    speed_sampler: Any | None = None,
 ) -> dict[str, Any]:
     """Build a status dict for one provider (Plan 012 §3.1 — full parity surface).
 
@@ -218,6 +220,12 @@ def _provider_status(
         if uh is not None:
             status["usage_history"] = uh
 
+    # Switchboard-specific: per-provider speed statistics (Plan 020 Wave 3).
+    if speed_sampler is not None:
+        summary = speed_sampler.summary(ctx.name)
+        if summary is not None:
+            status["speed"] = summary
+
     # History trend summary (Plan 012 WI-2).
     hist = ctx.reconcile.history
     if hist is not None and hist.length > 0:
@@ -250,6 +258,7 @@ def _build_status_payload(
     budget_tracker: Any | None = None,
     usage_history_tracker: Any | None = None,
     model_map_mgr: ModelMapManager | None = None,
+    speed_sampler: Any | None = None,
 ) -> dict[str, Any]:
     """Build the full status payload for /status.json."""
     provider_states: dict[str, Any] = {}
@@ -259,6 +268,7 @@ def _build_status_payload(
             overload_tracker=overload_tracker,
             budget_tracker=budget_tracker,
             usage_history_tracker=usage_history_tracker,
+            speed_sampler=speed_sampler,
         )
 
     routes: dict[str, list[str]] = {}
@@ -277,6 +287,7 @@ def _build_status_payload(
             "evicted_decisions": routing_metrics.evicted_decisions,
             "affinity_pins_total": routing_metrics.affinity_pins_total,
             "affinity_failbacks_total": routing_metrics.affinity_failbacks_total,
+            "affinity_evictions_total": routing_metrics.affinity_evictions_total,
             "usage_reroutes_total": routing_metrics.usage_reroutes_total,
             "usage_reroutes_from": dict(routing_metrics.usage_reroutes_from),
             "usage_giveups_total": routing_metrics.usage_giveups_total,
@@ -328,6 +339,7 @@ async def send_status_json(
     budget_tracker: Any | None = None,
     usage_history_tracker: Any | None = None,
     model_map_mgr: ModelMapManager | None = None,
+    speed_sampler: Any | None = None,
 ) -> None:
     """GET /status.json — per-provider state + route table + routing metrics."""
     payload = _build_status_payload(
@@ -337,6 +349,7 @@ async def send_status_json(
         budget_tracker=budget_tracker,
         usage_history_tracker=usage_history_tracker,
         model_map_mgr=model_map_mgr,
+        speed_sampler=speed_sampler,
     )
     await send_json(
         send, 200, payload,
@@ -356,6 +369,7 @@ async def send_prometheus(
     budget_tracker: Any | None = None,
     usage_history_tracker: Any | None = None,
     estimator: ThresholdEstimator | None = None,
+    speed_sampler: Any | None = None,
 ) -> None:
     """GET /metrics — Prometheus text exposition format (Plan 012 §3.1)."""
     now_mono = time.monotonic()
@@ -454,6 +468,16 @@ async def send_prometheus(
     lines.append(
         "switchboard_affinity_failbacks_total "
         f"{routing_metrics.affinity_failbacks_total}"
+    )
+
+    lines.append(
+        "# HELP switchboard_affinity_evictions_total "
+        "Affinity entries evicted from the LRU table (pin loss)"
+    )
+    lines.append("# TYPE switchboard_affinity_evictions_total counter")
+    lines.append(
+        f"switchboard_affinity_evictions_total "
+        f"{routing_metrics.affinity_evictions_total}"
     )
 
     for name, ctx in sorted(providers.items()):
@@ -570,6 +594,41 @@ async def send_prometheus(
                         labels,
                         penalty.get("since_total"),
                     )
+
+        if speed_sampler is not None:
+            spd = speed_sampler.summary(name)
+            if spd is not None:
+                ttfb = spd.get("ttfb_ms") or {}
+                gauge(
+                    "switchboard_speed_ttfb_ms_avg",
+                    "Mean time-to-first-byte (ms)",
+                    labels,
+                    ttfb.get("avg"),
+                )
+                gauge(
+                    "switchboard_speed_ttfb_ms_p95",
+                    "p95 time-to-first-byte (ms)",
+                    labels,
+                    ttfb.get("p95"),
+                )
+                gauge(
+                    "switchboard_speed_duration_ms_avg",
+                    "Mean total request duration (ms)",
+                    labels,
+                    (spd.get("duration_ms") or {}).get("avg"),
+                )
+                gauge(
+                    "switchboard_speed_tokens_per_sec",
+                    "Mean completion tokens per second",
+                    labels,
+                    spd.get("tokens_per_sec"),
+                )
+                gauge(
+                    "switchboard_speed_samples",
+                    "Speed samples in the rolling window",
+                    labels,
+                    spd.get("samples"),
+                )
 
     if estimator is not None:
         est = estimator.state().estimate
@@ -1348,6 +1407,11 @@ _PROVIDER_BODY_FIELDS = (
     "enabled",
 )
 
+#: Provider names that collide with admin sub-paths and so must be refused at
+#: creation: a provider named e.g. "registry" would shadow
+#: ``GET /admin/providers/registry`` via the generic ``<name>`` branch.
+_RESERVED_PROVIDER_NAMES = frozenset({"registry", "discover"})
+
 
 def _provider_fields_from_body(data: dict[str, Any]) -> dict[str, object]:
     """Whitelist the store's upsert fields out of a request body."""
@@ -1696,6 +1760,14 @@ async def handle_provider_create(
     if not isinstance(name, str) or not name:
         await send_json(
             send, 400, {"error": "missing required field 'name'"},
+            extra_headers=cors,
+        )
+        return
+
+    if name in _RESERVED_PROVIDER_NAMES:
+        await send_json(
+            send, 400,
+            {"error": f"'{name}' is a reserved name"},
             extra_headers=cors,
         )
         return
@@ -2132,6 +2204,222 @@ async def handle_provider_test(
             "detail": detail,
         },
         extra_headers=cors,
+    )
+
+
+# ── Plan 021 Wave 2: registry, path preview, discovery probe ────────────────
+
+
+async def handle_provider_registry(
+    send: Send,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """GET /admin/providers/registry — curated provider registry (Plan 021 WI-3).
+
+    Feeds the GUI provider-picker.  Each entry carries the vendor's documented
+    base URL (paste-ready), the expected auth header, whether it needs a
+    usage key, and the probe endpoint for the discovery probe.  No secrets;
+    auth-gated at the dispatch layer for topology consistency.
+    """
+    from switchboard.truth import registry_entries
+
+    cors = cors_extra_headers(cors_allow_origin, None)
+    entries = [
+        {
+            "name": p.name,
+            "default_base_url": p.default_base_url,
+            "auth_header": p.auth_header,
+            "needs_usage_key": p.needs_usage_key,
+            "probe_endpoint": p.probe_endpoint,
+        }
+        for p in registry_entries()
+    ]
+    await send_json(send, 200, {"providers": entries}, extra_headers=cors)
+
+
+async def handle_preview_path(
+    send: Send,
+    scope: Scope,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """GET /admin/preview-path?base=...&path=/v1/chat/completions (Plan 021 WI-5).
+
+    Live preview of :func:`compose_upstream_path` — pure computation, no
+    secrets, no upstream.  The GUI calls this per keystroke so the operator
+    sees the exact URL switchboard will egress before they save.
+    """
+    from switchboard.control import compose_upstream_path
+
+    cors = cors_extra_headers(cors_allow_origin, None)
+    raw_qs = scope.get("query_string") or b""
+    qs = parse_qs(raw_qs.decode("ascii", "replace"))
+    base = (qs.get("base") or [""])[0]
+    client_path = (qs.get("path") or ["/v1/chat/completions"])[0]
+    composed = compose_upstream_path(base, client_path) if base else ""
+    await send_json(send, 200, {"composed": composed}, extra_headers=cors)
+
+
+# A path segment that names an API version: v1, v2, v1beta, v1alpha2. Must
+# stay byte-identical to switchboard.control._VERSION_SEGMENT so discovery's
+# strip-trailing-version candidate matches the composition rule exactly.
+_DISCOVER_VERSION = re.compile(r"^v\d+(?:[a-z]+\d*)?$")
+
+
+def _discover_candidates(base: str, probe: str) -> list[str]:
+    """The ordered, de-duplicated set of upstream URLs to try for a base.
+
+    Plan 021 D5 — three plausible compositions, in order:
+
+    1. ``{base}{probe}`` — the base already carries the version (the common
+       case, e.g. ``https://ollama.com/v1`` + ``/models``).
+    2. ``{base}/v1{probe}`` — the base is a bare host relying on the client
+       to supply the version.
+    3. strip a trailing ``/vN`` from the base, then ``{probe}`` — the base has
+       a version the endpoint would otherwise duplicate.
+    """
+    b = base.rstrip("/")
+    p = probe if probe.startswith("/") else "/" + probe
+    candidates: list[str] = []
+
+    def _add(url: str) -> None:
+        if url not in candidates:
+            candidates.append(url)
+
+    _add(b + p)
+    _add(b + "/v1" + p)
+    tail = b.rsplit("/", 1)[-1]
+    if _DISCOVER_VERSION.match(tail):
+        stripped = b.rsplit("/", 1)[0]
+        if stripped:
+            _add(stripped + p)
+    return candidates
+
+
+async def handle_provider_discover(
+    send: Send,
+    receive: Receive,
+    admin_token: str | None,
+    scope: Scope,
+    cors_allow_origin: str | None = None,
+    client_factory: Callable[[], httpx.AsyncClient] | None = None,
+) -> None:
+    """POST /admin/providers/discover — probe a base URL's compositions (Plan 021 WI-4).
+
+    The operator pastes a vendor base URL BEFORE saving and asks switchboard
+    which composition answers.  Tries the candidates from
+    :func:`_discover_candidates` in order and reports status + latency for
+    each, so the GUI can show what was tried and offer to save the winner.
+
+    Uses the provided credential (optional) exactly as the forwarding path
+    would present it, and reports status/latency only — never echoes the key
+    (no header echo, no key material).  Auth + CSRF gated because each call
+    spends a request against a real upstream.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(
+            send, 405,
+            {"error": "mutations disabled — set --admin-token to enable"},
+            extra_headers=cors,
+        )
+        return
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    ct = next(
+        (
+            v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+            if k == b"content-type"
+        ),
+        "",
+    )
+    if not ct.lower().startswith("application/json"):
+        await send_json(
+            send, 415,
+            {"error": "Content-Type must be application/json"},
+            extra_headers=cors,
+        )
+        return
+
+    try:
+        raw = await read_body(receive)
+    except ValueError:
+        await send_json(
+            send, 413, {"error": "request body too large"},
+            extra_headers=cors,
+        )
+        return
+    except ConnectionError:
+        # Client disconnected mid-upload: nothing to send back.
+        return
+
+    try:
+        data = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        await send_json(send, 400, {"error": "invalid JSON body"}, extra_headers=cors)
+        return
+    if not isinstance(data, dict):
+        await send_json(send, 400, {"error": "body must be a JSON object"}, extra_headers=cors)
+        return
+
+    base = str(data.get("base_url", "")).strip()
+    probe = str(data.get("probe_endpoint", "/models")).strip() or "/models"
+    api_key = str(data.get("api_key", "") or "")
+    auth_header = str(data.get("auth_header", "authorization")) or "authorization"
+    auth_prefix = str(data.get("auth_prefix", "Bearer "))
+    if not base:
+        await send_json(send, 400, {"error": "base_url required"}, extra_headers=cors)
+        return
+
+    urls = _discover_candidates(base, probe)
+    headers: dict[str, str] = (
+        {auth_header: f"{auth_prefix}{api_key}"} if api_key else {}
+    )
+    factory = client_factory or (
+        lambda: httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+    )
+
+    results: list[dict[str, Any]] = []
+    for url in urls:
+        status_code: int | None = None
+        detail = ""
+        start = time.monotonic()
+        try:
+            async with factory() as client:
+                response = await client.get(url, headers=headers)
+                status_code = response.status_code
+        except httpx.TimeoutException:
+            detail = "timeout"
+        except httpx.HTTPError as exc:
+            detail = type(exc).__name__
+        latency_ms = round((time.monotonic() - start) * 1000.0, 1)
+        ok = status_code is not None and 200 <= status_code < 300
+        results.append(
+            {
+                "url": url,
+                "status": status_code,
+                "latency_ms": latency_ms,
+                "ok": ok,
+                "detail": detail,
+            }
+        )
+
+    log.info(
+        "provider discover: %s -> %d candidates, ok=%s",
+        base,
+        len(results),
+        [r["url"] for r in results if r["ok"]],
+    )
+    await send_json(
+        send, 200, {"base_url": base, "candidates": results}, extra_headers=cors,
     )
 
 

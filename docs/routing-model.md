@@ -7,11 +7,12 @@ this before touching code.
 
 ## 1. The problem
 
-sluice governs concurrency for a single upstream. When that upstream is
-saturated (gate closed, breaker open, account boxed), sluice returns 503 and
-the client must retry. switchboard adds a routing layer above multiple
-sluice-style gates: when one provider is pressured, route to another that has
-capacity.
+A single upstream's concurrency is governed by its own gate + reconcile loop
+(now vendored into switchboard — Plan 018 dropped the external dependency).
+When that upstream is saturated (gate closed, breaker open, account boxed),
+the gate returns 503 and the client must retry. switchboard adds a routing
+layer above multiple gates: when one provider is pressured, route to another
+that has capacity.
 
 ## 2. Providers and their states
 
@@ -52,7 +53,7 @@ failover entirely. Unknown data never maps to zero pressure.
 ## 3. The routing decision (the pure function)
 
 `route_decision(states, table, route_key, config, now=now,
-primary_healthy_since=None) -> AdmissionPlan`
+healthy_since=None) -> AdmissionPlan`
 
 The decision proceeds in this order (Plans 006, 008, 014, 015, 016):
 
@@ -101,6 +102,7 @@ class AdmissionPlan:
 | `failover` | A non-primary is in immediate candidates |
 | `affinity_dwell` | Affinity provider is pinned within `dwell_interval` |
 | `affinity_hysteresis` | Affinity pin held past dwell while primary reproves itself (Plan 014) |
+| `affinity_pinned` | Conversation pinning (Plan 019) holds the pin past dwell — no failback to primary while the pinned provider stays FRESH + AVAILABLE |
 | `opportunistic` | No affinity pin; a quota-bearing fallback with expiring headroom took front preference (Plan 016) |
 | `queue_only` | No immediate candidates; queue on a candidate |
 | `no_eligible_candidates` | All candidates are closed or unknown |
@@ -124,7 +126,7 @@ Properties this guarantees:
   and a near-term quota reset may front `immediate`, but the primary remains
   immediate-eligible, queue backstop, and terminal fallback. Stale or
   unmeasured quota data never promotes.
-- **Pure.** `now`, `primary_healthy_since`, and all provider states are
+- **Pure.** `now`, `healthy_since`, and all provider states are
   arguments. No I/O, no clock.
 - **Deterministic.** Same inputs → same plan. Testable without a network.
 
@@ -180,16 +182,16 @@ from config on startup.
 
 ## 6. Provider contexts
 
-Each provider is a self-contained sluice instance:
+Each provider is a self-contained gate + reconcile loop + truth source:
 
 ```python
 @dataclass
 class ProviderContext:
     name: str                    # "umans", "ollama", etc.
     upstream_url: str
-    gate: PermitGate             # from sluice.gate
-    reconcile: ReconciliationLoop # from sluice.reconcile
-    truth_source: TruthSource    # from sluice.providers (or switchboard.dashboard)
+    gate: PermitGate             # from switchboard.gate
+    reconcile: ReconciliationLoop # from switchboard.reconcile
+    truth_source: TruthSource    # from switchboard.truth (or switchboard.dashboard)
     http_client: httpx.AsyncClient
 ```
 
@@ -211,13 +213,12 @@ output. Provider names in metrics come from config, not from clients.
 
 ## 9. What switchboard deliberately does not model
 
-- **Request content, tokens-per-request, or cost.** switchboard routes on
-  provider availability, not request semantics.
-- **Per-model routing.** Routing is per-provider. If a client requests a model
-  that provider A doesn't serve, that's a client misconfiguration, not a
-  routing concern.
+- **Cost.** switchboard routes on provider availability, not monetary cost.
 - **Request/response format translation.** Both upstreams must speak the same
-  API format. Cross-format routing is a future project.
+  API format. Cross-format routing (Anthropic ↔ OpenAI) is a future project.
+  *(switchboard does filter candidates by which providers serve a requested
+  model — Plan 010's `[model]` map — and may rewrite that one field on the
+  fallback path. That is model-name compatibility, not format translation.)*
 - **Fairness across providers.** Each provider has its own FIFO queue. There
   is no global fairness guarantee — a request routed to a saturated provider
   waits in that provider's queue.

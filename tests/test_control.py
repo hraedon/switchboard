@@ -31,6 +31,7 @@ def _state(
     usage_headroom: float | None = None,
     quota_resets_in: float | None = None,
     token_utilization: float | None = None,
+    token_soft_threshold: float | None = None,
     usage_24h_utilization: float | None = None,
 ) -> ProviderState:
     return ProviderState(
@@ -44,6 +45,7 @@ def _state(
         usage_headroom=usage_headroom,
         quota_resets_in=quota_resets_in,
         token_utilization=token_utilization,
+        token_soft_threshold=token_soft_threshold,
         usage_24h_utilization=usage_24h_utilization,
     )
 
@@ -611,7 +613,7 @@ def test_failback_delay_holds_pin_within_delay() -> None:
     affinity = _affinity("ollama", selected_at=0.0)
     plan = route_decision(
         states, TABLE, "k", config, now=40.0, affinity=affinity,
-        primary_healthy_since=5.0,
+        healthy_since={"umans": 5.0},
     )
     assert plan.immediate_candidates[0] == "ollama"
     assert plan.reason == "affinity_hysteresis"
@@ -627,14 +629,14 @@ def test_failback_delay_allows_failback_after_delay() -> None:
     affinity = _affinity("ollama", selected_at=0.0)
     plan = route_decision(
         states, TABLE, "k", config, now=100.0, affinity=affinity,
-        primary_healthy_since=20.0,
+        healthy_since={"umans": 20.0},
     )
     assert plan.immediate_candidates[0] == "umans"
     assert plan.reason == "primary_available"
 
 
 def test_failback_delay_none_never_healthy() -> None:
-    """primary_healthy_since=None (never observed healthy) → stay pinned."""
+    """healthy_since=None (never observed healthy) → stay pinned."""
     config = RoutingConfig(failback_delay=60.0)
     states = {
         "umans": _state("umans"),
@@ -643,7 +645,7 @@ def test_failback_delay_none_never_healthy() -> None:
     affinity = _affinity("ollama", selected_at=0.0)
     plan = route_decision(
         states, TABLE, "k", config, now=100.0, affinity=affinity,
-        primary_healthy_since=None,
+        healthy_since=None,
     )
     assert plan.immediate_candidates[0] == "ollama"
     assert plan.reason == "affinity_hysteresis"
@@ -660,7 +662,7 @@ def test_failback_delay_not_consulted_when_affinity_not_eligible() -> None:
     affinity = _affinity("ollama", selected_at=0.0)
     plan = route_decision(
         states, TABLE, "k", config, now=40.0, affinity=affinity,
-        primary_healthy_since=5.0,
+        healthy_since={"umans": 5.0},
     )
     assert plan.immediate_candidates[0] == "umans"
     assert plan.reason == "primary_available"
@@ -676,7 +678,7 @@ def test_failback_delay_zero_ignores_healthy_since() -> None:
     affinity = _affinity("ollama", selected_at=0.0)
     plan = route_decision(
         states, TABLE, "k", config, now=40.0, affinity=affinity,
-        primary_healthy_since=5.0,
+        healthy_since={"umans": 5.0},
     )
     assert plan.immediate_candidates[0] == "umans"
     assert plan.reason == "primary_available"
@@ -948,6 +950,306 @@ def test_token_budget_and_headroom_both_demote() -> None:
     plan = route_decision(states, table, "k", config, now=0.0)
     assert "umans" in plan.immediate_candidates
     assert "ollama-cloud" not in plan.immediate_candidates
+
+
+# --- Per-provider soft_threshold override (Plan 012 fix) ---
+
+
+def test_token_soft_threshold_overrides_global() -> None:
+    """A provider's own soft_threshold demotes it even when the global
+    token_budget_threshold is disabled (0.0).  This was dead config before the
+    wiring: parsed/validated/displayed but never consumed."""
+    config = RoutingConfig(token_budget_threshold=0.0)  # global off
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state(
+            "ollama-cloud",
+            token_utilization=0.90,
+            token_soft_threshold=0.85,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=0.0)
+    assert "ollama-cloud" not in plan.immediate_candidates
+    assert plan.queue_candidate == "ollama-cloud"
+
+
+def test_token_soft_threshold_below_not_demoted() -> None:
+    """Below the per-provider soft_threshold, no demotion."""
+    config = RoutingConfig(token_budget_threshold=0.0)
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state(
+            "ollama-cloud",
+            token_utilization=0.50,
+            token_soft_threshold=0.85,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=0.0)
+    assert "ollama-cloud" in plan.immediate_candidates
+
+
+def test_token_soft_threshold_takes_precedence_over_global() -> None:
+    """When both are set, the per-provider threshold wins for that provider."""
+    config = RoutingConfig(token_budget_threshold=0.99)  # global very high
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state(
+            "ollama-cloud",
+            token_utilization=0.90,
+            token_soft_threshold=0.85,  # lower → demotes
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=0.0)
+    assert "ollama-cloud" not in plan.immediate_candidates
+
+
+def test_token_soft_threshold_none_falls_back_to_global() -> None:
+    """Without a per-provider threshold, the global one still governs."""
+    config = RoutingConfig(token_budget_threshold=0.85)
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state(
+            "ollama-cloud",
+            token_utilization=0.90,
+            token_soft_threshold=None,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=0.0)
+    assert "ollama-cloud" not in plan.immediate_candidates
+
+
+def test_token_soft_threshold_never_demotes_primary() -> None:
+    """Safety pin: the per-provider threshold demotes non-primary providers
+    only — the primary stays immediate even at 0.99 utilization with its own
+    soft_threshold set.  The `not is_primary` guard must hold against the
+    per-provider threshold, not just the global one."""
+    config = RoutingConfig(token_budget_threshold=0.0)  # global off
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state(
+            "umans",
+            token_utilization=0.99,
+            token_soft_threshold=0.85,
+        ),
+        "ollama-cloud": _state("ollama-cloud", token_utilization=0.10),
+    }
+    plan = route_decision(states, table, "k", config, now=0.0)
+    assert plan.immediate_candidates[0] == "umans"
+
+
+# --- healthy_since uses the effective primary after model filtering (M1) ---
+
+
+def test_healthy_since_uses_effective_primary_after_model_filter() -> None:
+    """When a model map excludes the configured primary, the failback
+    hysteresis check must read the *effective* primary's clock from the
+    per-provider map, not the original primary's single value.
+
+    Setup: umans is the configured primary but does not serve the requested
+    model, so the model filter re-derives the effective primary to
+    ollama-cloud.  An affinity pin sits on zai.  Past ``dwell_interval`` the
+    hysteresis check consults the effective primary (ollama-cloud)'s clock:
+
+    * enough continuity → failback to ollama-cloud;
+    * insufficient continuity → hold the pin on zai.
+    """
+    config = RoutingConfig(failback_delay=60.0, dwell_interval=10.0)
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud", "zai")
+    )
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state("ollama-cloud"),
+        "zai": _state("zai"),
+    }
+    affinity = _affinity("zai", selected_at=0.0)
+    # umans does not serve the model → effective primary is ollama-cloud.
+    servable = frozenset({"ollama-cloud", "zai"})
+
+    # ollama-cloud healthy for 90s (>= 60s delay) → failback releases the pin.
+    plan = route_decision(
+        states, table, "k", config, now=100.0, affinity=affinity,
+        servable_providers=servable,
+        healthy_since={"ollama-cloud": 10.0},
+    )
+    assert plan.immediate_candidates[0] == "ollama-cloud"
+    assert plan.reason == "primary_available"
+
+    # ollama-cloud only healthy for 50s (< 60s delay) → pin holds on zai.
+    plan = route_decision(
+        states, table, "k", config, now=100.0, affinity=affinity,
+        servable_providers=servable,
+        healthy_since={"ollama-cloud": 50.0},
+    )
+    assert plan.immediate_candidates[0] == "zai"
+    assert plan.reason == "affinity_hysteresis"
+
+
+# --- Conversation pinning (Plan 019 §6) -------------------------------------
+
+
+def test_pin_conversations_suppresses_failback() -> None:
+    """With pin_conversations on, an active affinity pin on a FRESH fallback
+    stays front past dwell — the failback-to-primary branch is suppressed.
+    Without pinning, the same inputs fail back to the primary."""
+    base = dict(failback_delay=0.0, dwell_interval=10.0)
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama")
+    )
+    states = {"umans": _state("umans"), "ollama": _state("ollama")}
+    affinity = _affinity("ollama", selected_at=0.0)
+
+    # Without pinning: post-dwell, primary available → failback to umans.
+    plan = route_decision(
+        states, table, "k", RoutingConfig(**base), now=100.0, affinity=affinity,
+    )
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+    # With pinning: the pin holds — ollama stays front, no failback.
+    pinned = RoutingConfig(**base, pin_conversations=True)
+    plan = route_decision(
+        states, table, "k", pinned, now=100.0, affinity=affinity,
+    )
+    assert plan.immediate_candidates[0] == "ollama"
+    assert plan.reason == "affinity_pinned"
+
+
+def test_pin_conversations_releases_when_pinned_provider_drops() -> None:
+    """When the pinned provider drops out of immediate (BUSY), normal
+    failover selects the next best — pinning does not strand a request on
+    an unavailable provider."""
+    config = RoutingConfig(
+        pin_conversations=True, dwell_interval=10.0, failback_delay=0.0
+    )
+    table = RouteTable(entries={}, default_providers=("umans", "ollama"))
+    states = {
+        "umans": _state("umans"),
+        "ollama": _state("ollama", availability=Availability.BUSY),
+    }
+    affinity = _affinity("ollama", selected_at=0.0)
+    plan = route_decision(
+        states, table, "k", config, now=100.0, affinity=affinity,
+    )
+    # ollama is BUSY → not in immediate → pin cannot hold → umans serves.
+    assert plan.immediate_candidates[0] == "umans"
+
+
+def test_pin_conversations_on_primary_resists_opportunistic_diversion() -> None:
+    """M1 fix: a conversation pinned to the PRIMARY (pin-on-first-request)
+    must NOT be diverted by opportunistic quota-burn.  Without this guard the
+    pinned primary falls through to the else branch, opportunism fronts a
+    fallback, and the conversation permanently migrates — breaking the
+    pin-stays-until-drop promise."""
+    config = RoutingConfig(
+        pin_conversations=True,
+        opportunistic_enabled=True,
+        opportunistic_min_headroom=0.5,
+        opportunistic_reset_window=21600.0,
+        dwell_interval=10.0,
+        failback_delay=0.0,
+    )
+    table = RouteTable(entries={}, default_providers=("umans", "ollama"))
+    states = {
+        "umans": _state("umans"),
+        "ollama": _state(
+            "ollama", usage_headroom=0.9, quota_resets_in=3600.0,
+        ),
+    }
+    # Pin is on the primary (umans) — the if-block's `!= primary` guard
+    # routes to the else branch, where opportunism would otherwise fire.
+    affinity = _affinity("umans", selected_at=0.0)
+    plan = route_decision(
+        states, table, "k", config, now=100.0, affinity=affinity,
+    )
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "affinity_pinned"
+
+
+def test_pin_conversations_dwell_still_applies() -> None:
+    """Within dwell_interval, the pin holds with reason affinity_dwell
+    (the dwell mechanism is independent of the failback suppression)."""
+    config = RoutingConfig(
+        pin_conversations=True, dwell_interval=30.0, failback_delay=0.0
+    )
+    table = RouteTable(entries={}, default_providers=("umans", "ollama"))
+    states = {"umans": _state("umans"), "ollama": _state("ollama")}
+    affinity = _affinity("ollama", selected_at=0.0)
+    plan = route_decision(
+        states, table, "k", config, now=10.0, affinity=affinity,
+    )
+    assert plan.immediate_candidates[0] == "ollama"
+    assert plan.reason == "affinity_dwell"
+
+
+# --- Conversation fingerprint extraction (Plan 019 §6.2) --------------------
+
+
+from switchboard.control import extract_conversation_fingerprint  # noqa: E402
+
+
+def test_fingerprint_from_first_user_message() -> None:
+    body = b'{"messages":[{"role":"system","content":"x"},{"role":"user","content":"hello"}]}'
+    fp = extract_conversation_fingerprint(body)
+    assert fp is not None
+    assert len(fp) == 64  # SHA-256 hex
+
+
+def test_fingerprint_stable_for_same_content() -> None:
+    body = b'{"messages":[{"role":"user","content":"same question"}]}'
+    assert extract_conversation_fingerprint(body) == extract_conversation_fingerprint(body)
+
+
+def test_fingerprint_differs_for_different_content() -> None:
+    a = b'{"messages":[{"role":"user","content":"question A"}]}'
+    b = b'{"messages":[{"role":"user","content":"question B"}]}'
+    assert extract_conversation_fingerprint(a) != extract_conversation_fingerprint(b)
+
+
+def test_fingerprint_multimodal_first_text_part() -> None:
+    body = (
+        b'{"messages":[{"role":"user","content":'
+        b'[{"type":"image_url","image_url":"x"},'
+        b'{"type":"text","text":"describe this"}]}]}'
+    )
+    fp = extract_conversation_fingerprint(body)
+    assert fp is not None
+
+
+def test_fingerprint_none_when_no_user_message() -> None:
+    body = b'{"messages":[{"role":"system","content":"x"}]}'
+    assert extract_conversation_fingerprint(body) is None
+
+
+def test_fingerprint_none_on_invalid_json() -> None:
+    assert extract_conversation_fingerprint(b"not json") is None
+    assert extract_conversation_fingerprint(b"") is None
+
+
+def test_fingerprint_none_when_messages_not_list() -> None:
+    assert extract_conversation_fingerprint(b'{"messages":"oops"}') is None
+
+
+def test_fingerprint_none_on_deeply_nested_json() -> None:
+    """H1: deeply-nested JSON (valid syntax that overflows the parser) must
+    return None, not raise RecursionError out of the request path (a crafted
+    body that crashes the proxy is a DoS vector)."""
+    body = b"[" * 30000 + b"]" * 30000
+    assert extract_conversation_fingerprint(body) is None
 
 
 # --- Plan 013: trailing-24h usage filtering tests ---
@@ -1399,7 +1701,7 @@ def test_opportunistic_after_non_primary_affinity_failback() -> None:
     # After dwell + failback_delay: primary is fronted.
     plan = route_decision(
         states, table, "k", config, now=100.0, affinity=affinity,
-        primary_healthy_since=20.0,
+        healthy_since={"umans": 20.0},
     )
     assert plan.immediate_candidates[0] == "umans"
     assert plan.reason == "primary_available"

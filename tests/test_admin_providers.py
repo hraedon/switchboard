@@ -17,9 +17,13 @@ import httpx
 import pytest
 
 from switchboard.admin import (
+    _discover_candidates,
     handle_config_effective,
+    handle_preview_path,
     handle_provider_create,
     handle_provider_delete,
+    handle_provider_discover,
+    handle_provider_registry,
     handle_provider_test,
     handle_provider_update,
     handle_providers_list,
@@ -911,3 +915,268 @@ async def test_dispatch_probe_routes_to_test_handler() -> None:
     data = json.loads(body)
     assert data["ok"] is False
     assert data["status"] is None
+
+
+# ----------------------------------------------- Plan 021 Wave 2: registry
+
+
+@pytest.mark.asyncio
+async def test_registry_returns_curated_entries() -> None:
+    """GET /admin/providers/registry lists the validated live providers."""
+    messages, send = _make_send()
+    await handle_provider_registry(send)
+    status, body = _parse_response(messages)
+    assert status == 200
+    data = json.loads(body)
+    names = {e["name"] for e in data["providers"]}
+    # The three validated-live providers plus the original four.
+    assert {"opencode-go", "ollama-cloud", "zai-coding-plan"} <= names
+    assert {"umans", "anthropic", "openai", "generic"} <= names
+    ollama = next(e for e in data["providers"] if e["name"] == "ollama-cloud")
+    assert ollama["default_base_url"] == "https://ollama.com/v1"
+    assert ollama["auth_header"] == "authorization"
+    assert ollama["probe_endpoint"] == "/models"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_registry_requires_auth() -> None:
+    app = _make_app({"test": _make_ctx("test")}, ConfigStoreManager())
+    try:
+        status, _ = await _dispatch(app, "GET", "/admin/providers/registry")
+        assert status == 401
+        status, body = await _dispatch(
+            app, "GET", "/admin/providers/registry",
+            headers=[(b"authorization", f"Bearer {ADMIN_TOKEN}".encode())],
+        )
+        assert status == 200
+        assert "providers" in json.loads(body)
+    finally:
+        await app.provider_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_registry_not_treated_as_provider_name() -> None:
+    """'registry' must hit the registry handler, not a 404/PUT on a provider
+    named registry (regression for the dispatch ordering)."""
+    app = _make_app({"test": _make_ctx("test")}, ConfigStoreManager())
+    try:
+        status, body = await _dispatch(
+            app, "GET", "/admin/providers/registry",
+            headers=[(b"authorization", f"Bearer {ADMIN_TOKEN}".encode())],
+        )
+        assert status == 200
+        names = {e["name"] for e in json.loads(body)["providers"]}
+        assert "registry" not in names
+    finally:
+        await app.provider_manager.shutdown()
+
+
+# ------------------------------------------- Plan 021 Wave 2: path preview
+
+
+@pytest.mark.asyncio
+async def test_preview_path_composes() -> None:
+    scope = _make_scope(
+        "GET", "/admin/preview-path?base=https://ollama.com/v1"
+        "&path=/v1/chat/completions",
+    )
+    scope["query_string"] = (
+        b"base=https://ollama.com/v1&path=/v1/chat/completions"
+    )
+    messages, send = _make_send()
+    await handle_preview_path(send, scope)
+    status, body = _parse_response(messages)
+    assert status == 200
+    assert json.loads(body)["composed"] == (
+        "https://ollama.com/v1/chat/completions"
+    )
+
+
+@pytest.mark.asyncio
+async def test_preview_path_empty_base() -> None:
+    scope = _make_scope("GET", "/admin/preview-path")
+    messages, send = _make_send()
+    await handle_preview_path(send, scope)
+    status, body = _parse_response(messages)
+    assert status == 200
+    assert json.loads(body)["composed"] == ""
+
+
+# ---------------------------------------- Plan 021 Wave 2: discovery probe
+
+
+def test_discover_candidates_versioned_base() -> None:
+    """A versioned base: first candidate is base+probe; the bare-host +/v1
+    shape is also tried (it will just 404 at probe time); the stripped
+    variant is offered too. Discovery tries all shapes — it does not guess."""
+    c = _discover_candidates("https://ollama.com/v1", "/models")
+    assert c[0] == "https://ollama.com/v1/models"
+    assert "https://ollama.com/v1/v1/models" in c  # bare-host shape (doubles)
+    assert "https://ollama.com/models" in c        # stripped-trailing-version
+
+
+def test_discover_candidates_bare_host_adds_v1() -> None:
+    c = _discover_candidates("https://api.deepseek.com", "/models")
+    assert "https://api.deepseek.com/models" in c
+    assert "https://api.deepseek.com/v1/models" in c
+
+
+def test_discover_candidates_dedupes() -> None:
+    c = _discover_candidates("https://x.example/v1", "/models")
+    assert len(c) == len(set(c))
+
+
+def test_discover_candidates_strips_trailing_version() -> None:
+    c = _discover_candidates("https://opencode.ai/zen/go/v1", "/models")
+    # The stripped variant (zen/go + /models) is offered as the 3rd shape.
+    assert "https://opencode.ai/zen/go/models" in c
+
+
+@pytest.mark.asyncio
+async def test_discover_reports_ok_candidate_and_no_credential_leak() -> None:
+    """The composition that answers is flagged ok; the credential reaches the
+    upstream only and never the response body."""
+    captured: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(str(request.url))
+        # Only the bare-host + /v1 shape answers.
+        if str(request.url) == "https://api.example.com/v1/models":
+            return httpx.Response(200, json={"data": []})
+        return httpx.Response(404)
+
+    scope = _make_scope("POST", headers=_admin_headers())
+    messages, send = _make_send()
+    await handle_provider_discover(
+        send, _make_receive(
+            json.dumps(
+                {
+                    "base_url": "https://api.example.com",
+                    "api_key": "sk-discover-SENTINEL-9999",
+                }
+            ).encode()
+        ),
+        ADMIN_TOKEN, scope, client_factory=_mock_factory(handler),
+    )
+    status, body = _parse_response(messages)
+    assert status == 200
+    text = body.decode()
+    assert "sk-discover-SENTINEL" not in text
+    data = json.loads(body)
+    ok = [c for c in data["candidates"] if c["ok"]]
+    assert len(ok) == 1
+    assert ok[0]["url"] == "https://api.example.com/v1/models"
+    assert ok[0]["status"] == 200
+    # Every candidate URL was probed.
+    assert len(data["candidates"]) == len(captured)
+
+
+@pytest.mark.asyncio
+async def test_discover_requires_admin_token() -> None:
+    scope = _make_scope("POST", headers=_admin_headers())
+    messages, send = _make_send()
+    await handle_provider_discover(
+        send, _make_receive(b"{}"), None, scope,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 405
+
+
+@pytest.mark.asyncio
+async def test_discover_rejects_missing_base() -> None:
+    scope = _make_scope("POST", headers=_admin_headers())
+    messages, send = _make_send()
+    await handle_provider_discover(
+        send, _make_receive(b"{}"), ADMIN_TOKEN, scope,
+    )
+    status, body = _parse_response(messages)
+    assert status == 400
+    assert "base_url" in json.loads(body)["error"]
+
+
+@pytest.mark.asyncio
+async def test_discover_csrf_blocked_for_cookie_auth_cross_site() -> None:
+    """A cookie-authenticated, cross-site POST is refused CSRF — even though
+    the session cookie authenticates. A valid bearer token bypasses CSRF by
+    design (browsers block cross-site custom headers), so this must use
+    cookie auth to exercise the sec-fetch-site branch."""
+    cookie = mint_session(ADMIN_TOKEN, time.time(), 3600)
+    scope = _make_scope(
+        "POST",
+        headers=[
+            (b"content-type", b"application/json"),
+            (b"cookie", f"{SESSION_COOKIE}={cookie}".encode()),
+            (b"sec-fetch-site", b"cross-site"),
+        ],
+    )
+    messages, send = _make_send()
+    await handle_provider_discover(
+        send, _make_receive(json.dumps({"base_url": "https://x.example"}).encode()),
+        ADMIN_TOKEN, scope,
+    )
+    status, body = _parse_response(messages)
+    assert status == 403
+    assert "cross-site" in json.loads(body)["error"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_discover_routes_correctly() -> None:
+    """POST /admin/providers/discover reaches the discover handler, not the
+    generic <name> branch (which would treat 'discover' as a provider).
+    Uses a loopback-refused address so no real DNS/HTTP dependency is added."""
+    app = _make_app({"test": _make_ctx("test")}, ConfigStoreManager())
+    try:
+        status, body = await _dispatch(
+            app, "POST", "/admin/providers/discover",
+            headers=_admin_headers(),
+            body=json.dumps({"base_url": "http://127.0.0.1:1"}).encode(),
+        )
+        # No credential, refused connection → 200 with all-ok-false candidates.
+        assert status == 200
+        data = json.loads(body)
+        assert data["base_url"] == "http://127.0.0.1:1"
+        assert isinstance(data["candidates"], list)
+        assert all(not c["ok"] for c in data["candidates"])
+    finally:
+        await app.provider_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_discover_non_json_content_type_rejected() -> None:
+    scope = _make_scope(
+        "POST",
+        headers=[
+            (b"content-type", b"text/plain"),
+            (b"authorization", f"Bearer {ADMIN_TOKEN}".encode()),
+            (b"sec-fetch-site", b"same-origin"),
+        ],
+    )
+    messages, send = _make_send()
+    await handle_provider_discover(
+        send, _make_receive(b"x"), ADMIN_TOKEN, scope,
+    )
+    status, _body = _parse_response(messages)
+    assert status == 415
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_reserved_provider_name() -> None:
+    """A provider named 'registry'/'discover' would shadow the admin
+    sub-paths via the generic <name> branch — refuse it at creation."""
+    app = _make_app({"test": _make_ctx("test")}, ConfigStoreManager())
+    try:
+        for reserved in ("registry", "discover"):
+            status, body = await _dispatch(
+                app, "POST", "/admin/providers",
+                headers=_admin_headers(),
+                body=json.dumps(
+                    {"name": reserved, "upstream": "https://x.example",
+                     "provider_type": "generic", "target": 1}
+                ).encode(),
+            )
+            assert status == 400, (reserved, body)
+            assert "reserved" in json.loads(body)["error"]
+        assert "registry" not in app._providers
+        assert "discover" not in app._providers
+    finally:
+        await app.provider_manager.shutdown()

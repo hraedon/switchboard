@@ -20,7 +20,7 @@ gates and decides which upstream provider receives each request.
 - **Inert in-path — per provider.** switchboard forwards live traffic to the
   selected upstream. It **never reads, logs, stores, or rewrites request/response
   bodies.** It routes and streams bytes through untouched. Same guarantee as
-  sluice, applied per-upstream-path. *(Exceptions, both opt-in and gated:
+  sluice, applied per-upstream-path. *(Exceptions, all opt-in and gated:
   (1) when a `[model]` map is configured, switchboard MAY read the request
   body's top-level `model` field and MAY rewrite only that field for the
   fallback path — Plan 010. No other field is read or altered. (2) When a
@@ -28,7 +28,13 @@ gates and decides which upstream provider receives each request.
   `usage` object in the response stream **read-only in-flight** (SSE
   `data:` lines or non-streaming JSON) for token accounting — Plan 012.
   Bytes forwarded to the client are never modified; no other field is read.
-  Response bodies are fully inert when neither exception applies.)*
+  (3) When `[routing] pin_conversations` is configured, switchboard MAY read
+  the request body's `messages` array to extract a conversation fingerprint
+  (hash of the first user message's text content) for per-conversation
+  affinity — Plan 019. No other field is read; body bytes forwarded are
+  unchanged; a finite `max_request_body_bytes` is required. This exception
+  composes with (1) — each reads only its own field.
+  Response bodies are fully inert when none of the exceptions apply.)*
 - **Cache-transparency — indistinguishable from a direct client per upstream.**
   The request switchboard egresses to each upstream must be byte-for-byte what
   the client sent, with two bounded exceptions (the `model` rewrite below, and
@@ -122,6 +128,12 @@ src/switchboard/
   usage_observer.py     # read-only SSE/JSON usage parser (streaming-tracked counts)
   usage_history.py      # shell: 24h rolling token total + penalty event tokens (poll-based)
   estimator.py     # shell wrapper for threshold estimator
+  speed.py         # per-provider speed statistics: TTFB / duration / tokens-per-sec (Plan 020 Wave 3)
+  model_map.py     # model-name alias map: candidate filtering + egress rewrite (Plan 010 Feature B)
+  config_store.py  # SQLite-backed provider-config store; store > TOML precedence (Plan 020 WI-1)
+  provider_manager.py   # runtime provider lifecycle: add/remove/replace with draining (Plan 020 WI-2)
+  env_config.py    # env-tier provider-field overrides: env > store > TOML (Plan 021 WI-6)
+  config_reset.py  # reclaim store state: POST /admin/config/reset + SWITCHBOARD_CONFIG_RESET (Plan 021 WI-8)
   admin.py         # admin route handlers: health, status, metrics, route table CRUD, dashboard
   cli.py           # `switchboard serve ...` entry point
   static/          # dashboard assets

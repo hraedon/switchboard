@@ -119,6 +119,60 @@ class TestOpportunisticValidation:
             _validate_config(cfg, {"umans": None})
 
 
+class TestFailbackDelayValidation:
+    def test_valid_delay_passes(self) -> None:
+        cfg = _base_config()
+        cfg["routing"] = {"failback_delay": 60.0}
+        _validate_config(cfg, {"umans": None, "ollama-cloud": None})
+
+    def test_zero_passes(self) -> None:
+        cfg = _base_config()
+        cfg["routing"] = {"failback_delay": 0}
+        _validate_config(cfg, {"umans": None})
+
+    def test_negative_rejected(self) -> None:
+        cfg = _base_config()
+        cfg["routing"] = {"failback_delay": -1}
+        with pytest.raises(_ConfigError, match="failback_delay"):
+            _validate_config(cfg, {"umans": None})
+
+    def test_non_number_rejected(self) -> None:
+        cfg = _base_config()
+        cfg["routing"] = {"failback_delay": "soon"}
+        with pytest.raises(_ConfigError, match="failback_delay"):
+            _validate_config(cfg, {"umans": None})
+
+
+class TestPinConversationsValidation:
+    def test_valid_bool_passes(self) -> None:
+        cfg = _base_config()
+        cfg["routing"] = {"pin_conversations": True}
+        _validate_config(cfg, {"umans": None})
+
+    def test_non_bool_rejected(self) -> None:
+        cfg = _base_config()
+        cfg["routing"] = {"pin_conversations": "yes"}
+        with pytest.raises(_ConfigError, match="pin_conversations"):
+            _validate_config(cfg, {"umans": None})
+
+    def test_affinity_max_entries_valid(self) -> None:
+        cfg = _base_config()
+        cfg["routing"] = {"affinity_max_entries": 8192}
+        _validate_config(cfg, {"umans": None})
+
+    def test_affinity_max_entries_zero_rejected(self) -> None:
+        cfg = _base_config()
+        cfg["routing"] = {"affinity_max_entries": 0}
+        with pytest.raises(_ConfigError, match="affinity_max_entries"):
+            _validate_config(cfg, {"umans": None})
+
+    def test_affinity_max_entries_non_int_rejected(self) -> None:
+        cfg = _base_config()
+        cfg["routing"] = {"affinity_max_entries": "many"}
+        with pytest.raises(_ConfigError, match="affinity_max_entries"):
+            _validate_config(cfg, {"umans": None})
+
+
 def test_api_key_env_missing_fails_closed(tmp_path, monkeypatch) -> None:
     """A typo in a Secret must not silently downgrade to credential passthrough.
 
@@ -153,6 +207,7 @@ def _serve_args(**overrides: object) -> argparse.Namespace:
         "queue_timeout": None,
         "drain_timeout": None,
         "route_table_store": None,
+        "max_request_body_bytes": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -350,6 +405,31 @@ class TestServeKeyStartup:
         )
         with pytest.raises(_ConfigError, match="queue_timeout"):
             _build_serve_app(_serve_args(config=cfg))
+
+    def test_pin_conversations_without_body_limit_fails(self, tmp_path) -> None:
+        """pin_conversations buffers the body for a fingerprint — an unbounded
+        buffer is a memory risk, so startup refuses without a finite
+        max_request_body_bytes (Plan 019 §6.4 finding 11)."""
+        cfg = _write_serve_config(
+            tmp_path,
+            "[routing]\npin_conversations = true\n" + _SERVE_PROVIDER,
+        )
+        with pytest.raises(_ConfigError, match="max_request_body_bytes"):
+            _build_serve_app(_serve_args(config=cfg))
+
+    def test_pin_conversations_with_body_limit_starts(self, tmp_path) -> None:
+        cfg = _write_serve_config(
+            tmp_path,
+            "[routing]\npin_conversations = true\n"
+            "max_request_body_bytes = 1048576\n"
+            + _SERVE_PROVIDER,
+        )
+        # max_request_body_bytes is a top-level key (like queue_timeout), not
+        # under [routing] — pass it via the flag instead.
+        app, _, _, _, _ = _build_serve_app(
+            _serve_args(config=cfg, max_request_body_bytes=1048576)
+        )
+        assert app._routing_config.pin_conversations is True
 
     def test_valid_config_starts(self, tmp_path) -> None:
         cfg = _write_serve_config(

@@ -1,6 +1,9 @@
 # Plan 021 — One canonical client target, per-provider paths
 
-Status: Waves 1 and 3 landed (WI-7 partial, blocked on Wave 2 WI-5); Wave 2 proposed
+Status: All three waves landed. Wave 1 (path composition + docs), Wave 2
+(registry WI-3, discovery probe WI-4, GUI provider form WI-5), and Wave 3
+(env-tier overrides WI-6, provenance/lock rendering WI-7, config reset WI-8)
+are implemented and under test.
 Supersedes: the "clients must omit the version prefix" contract in
 `k8s/configmap.yaml` and `docs/deployment.md`.
 
@@ -201,24 +204,31 @@ surprise on the next rollout.
   stale** — it still documents the `--build-context sluice=../sluice`
   build removed by Plan 018 — fix that in the same pass.
 
-**Wave 2 — provider configuration**
-- **WI-3**: Registry per D4: extend `Provider`, populate validated
-  entries, expose them via the admin API for the GUI's picker.
-- **WI-4**: Discovery probe per D5, extending the existing `/test`
-  handler. Must not spend real tokens: `/models` is a GET.
-- **WI-5**: GUI provider form — registry picker, base URL field, "test
-  and detect" button, and the composed URL shown as a live preview
-  before saving. Seeing `…/zen/go/v1/chat/completions` render as you
-  type is worth more than any validation message.
+**Wave 2 — provider configuration — DONE**
+- **WI-3 (done)**: Registry per D4 — `Provider` gained a `probe_endpoint`
+  field and `registry_entries()` accessor (`truth.py`); the three validated
+  live providers (opencode-go, ollama-cloud, zai-coding-plan) plus a common
+  OpenAI-compatible fleet (deepseek, groq, openrouter) join the original
+  four. Exposed via `GET /admin/providers/registry`.
+- **WI-4 (done)**: Discovery probe per D5 — `POST /admin/providers/discover`
+  tries the three compositions (`base/probe`, `base/v1/probe`,
+  strip-trailing-`/vN`) and reports status + latency per candidate. Auth +
+  CSRF gated (each call hits a real upstream); credentials never echoed.
+- **WI-5 (done)**: GUI provider form — registry picker, base URL field, live
+  preview via `GET /admin/preview-path` (calls the pure
+  `compose_upstream_path`), and a "test & detect" button. The form lives
+  outside `#app` and freezes on edit so the 5 s poll cannot discard it.
+  Pinned by `tests/gui/providers_form.mjs`.
 
 **Wave 3 — precedence and recovery — WI-6 and WI-8 done 2026-08-08**
 - **WI-6 (done)**: Env tier per D6 for every provider field, with `source`
   reporting through `/admin/config/effective`.
-- **WI-7 (partial, done 2026-08-08)**: the dashboard now renders a
-  Configuration panel — the owning tier per provider, the fields an env
-  var has taken over, disabled providers, and a warning listing env
-  overrides that matched no provider (inert, and previously visible only
-  in a boot log that has long scrolled away).
+- **WI-7 (done)**: the dashboard renders a Configuration panel — the owning
+  tier per provider, the fields an env var has taken over (with an explicit
+  `env` badge + "edit would be discarded" hint), disabled providers, and a
+  warning listing env overrides that matched no provider. The `field_sources`
+  data the input-locking half needs is served and rendered; fully disabling
+  env-owned *inputs* awaits the edit-provider form (Plan 020 WI-6).
 
   **The locking half is blocked, not skipped.** Locking an input needs an
   input: the only editable control on the page is the default route, and
@@ -243,11 +253,10 @@ surprise on the next rollout.
   declared config is reclaimed; boot again normally and it stays
   reclaimed.
 
-  Still open: **WI-7**, the GUI lock indicators. Until it lands the
-  `field_sources` / `env_locked` data is served by
-  `/admin/config/effective` but nothing renders it, so a GUI edit to an
-  env-owned field will still appear to succeed and then be ignored at
-  the next boot.
+  Resolved: **WI-7** now renders the `field_sources` / env-locked data in the
+  Configuration panel with an explicit badge and "edit would be discarded"
+  hint. Fully *disabling* env-owned inputs awaits the edit-provider form
+  (Plan 020 WI-6).
 
 ## 5. What must not break
 

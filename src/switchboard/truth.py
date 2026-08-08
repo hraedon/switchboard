@@ -407,15 +407,21 @@ class Provider:
     Simplified from sluice.providers.Provider: no ``controller`` field
     (only one strategy: static max_concurrency with header-driven
     tightening for non-umans providers).
+
+    The registry doubles as the GUI provider-picker source (Plan 021 WI-3):
+    ``default_base_url`` is the vendor's documented API root (paste-ready),
+    and ``probe_endpoint`` is the reachability path the discovery probe GETs.
     """
 
     name: str
     default_base_url: str
     auth_header: str
     needs_usage_key: bool = False
+    probe_endpoint: str = "/models"
 
 
 _PROVIDERS: dict[str, Provider] = {
+    # ── original switchboard providers ──
     "umans": Provider(
         name="umans",
         default_base_url="https://api.code.umans.ai",
@@ -434,6 +440,38 @@ _PROVIDERS: dict[str, Provider] = {
         auth_header="authorization",
         needs_usage_key=False,
     ),
+    # ── validated live providers (Plan 021 D4; bases verified 2026-08-08) ──
+    "opencode-go": Provider(
+        name="opencode-go",
+        default_base_url="https://opencode.ai/zen/go/v1",
+        auth_header="authorization",
+    ),
+    "ollama-cloud": Provider(
+        name="ollama-cloud",
+        default_base_url="https://ollama.com/v1",
+        auth_header="authorization",
+    ),
+    "zai-coding-plan": Provider(
+        name="zai-coding-plan",
+        default_base_url="https://api.z.ai/api/coding/paas/v4",
+        auth_header="authorization",
+    ),
+    # ── common OpenAI-compatible fleet ──
+    "deepseek": Provider(
+        name="deepseek",
+        default_base_url="https://api.deepseek.com",
+        auth_header="authorization",
+    ),
+    "groq": Provider(
+        name="groq",
+        default_base_url="https://api.groq.com/openai/v1",
+        auth_header="authorization",
+    ),
+    "openrouter": Provider(
+        name="openrouter",
+        default_base_url="https://openrouter.ai/api/v1",
+        auth_header="authorization",
+    ),
     "generic": Provider(
         name="generic",
         default_base_url="",
@@ -450,6 +488,16 @@ def get_provider(name: str) -> Provider:
             f"unknown provider '{name}' — must be one of {sorted(_PROVIDERS)}"
         )
     return _PROVIDERS[name]
+
+
+def registry_entries() -> list[Provider]:
+    """All registry providers, sorted by name, for the GUI picker.
+
+    ``generic`` is always present as the catch-all for providers not in the
+    curated registry.  The list is a stable order so the picker does not
+    reshuffle between calls.
+    """
+    return sorted(_PROVIDERS.values(), key=lambda p: p.name)
 
 
 def make_truth_source(

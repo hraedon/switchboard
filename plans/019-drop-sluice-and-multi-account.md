@@ -4,7 +4,14 @@
 > deployment work that landed on main while this branch sat uncommitted.
 > Content is otherwise unchanged from the original author's draft.
 
-Status: draft (revised after qwen + sol adversarial review)
+Status: **Phase 1 + 2 done via Plan 018/020; Phase 3 (conversation pinning) implemented.**
+Phase 1 (drop sluice) and Phase 2 (per-provider credential injection) shipped
+under Plans 018 and 020. Phase 3 — `pin_conversations` on `RoutingConfig`,
+`extract_conversation_fingerprint`, separated `route_key`/`affinity_key`,
+pin-on-first-request, configurable `affinity_max_entries` with an eviction
+counter, and the `max_request_body_bytes` finite requirement — is implemented
+and under test. The AGENTS.md inert-in-path exception (3) documents the body
+read.
 
 Depends on: nothing (this is a foundational refactor). All prior plans'
 routing intelligence (006, 008, 010, 012, 013, 014, 015, 016) is preserved

@@ -406,6 +406,64 @@ async def test_admit_all_fail_returns_none() -> None:
 
 
 @pytest.mark.asyncio
+async def test_acquire_with_disconnect_aborts_on_client_disconnect() -> None:
+    """F-11 regression: a client disconnect during a queue-wait cancels the
+    acquire and returns False (no admission), and does not leak a permit to a
+    caller that never got one."""
+    ctx = _make_provider_context("p1", capacity=1)
+    await ctx.gate.acquire(timeout=0.0)  # saturate — acquire will block
+
+    app = _make_app(providers={"p1": ctx}, default_providers=("p1",))
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.disconnect"}
+
+    acquired = await app._acquire_with_disconnect(ctx, timeout=2.0, receive=receive)
+    assert acquired is False
+    # No permit leaked: the caller never received one, the gate is unchanged.
+    assert ctx.gate.available == 0
+
+    await ctx.gate.release()
+    await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_admit_body_not_buffered_does_not_watch_disconnect() -> None:
+    """F-11 safety property: ``_acquire_with_disconnect``'s watcher calls
+    ``receive()``, which would steal body events from ``_forward``'s
+    ``body_stream``. ``_admit`` therefore invokes it ONLY when the body is
+    already buffered. With an unbuffered body, plain ``gate.acquire`` is used
+    and ``receive`` is never touched — proven here by a receive that would
+    surface any call."""
+    from switchboard.control import AdmissionPlan
+    ctx = _make_provider_context("p1", capacity=1)
+    await ctx.gate.acquire(timeout=0.0)  # saturate the gate
+
+    app = _make_app(providers={"p1": ctx}, default_providers=("p1",))
+    app._queue_timeout = 0.1
+    plan = AdmissionPlan(
+        immediate_candidates=(),
+        queue_candidate="p1",
+        terminal_fallback="p1",
+        reason="queue_only",
+    )
+
+    receive_calls = 0
+
+    async def receive() -> dict[str, Any]:
+        nonlocal receive_calls
+        receive_calls += 1
+        return {"type": "http.disconnect"}
+
+    result = await app._admit(plan, receive=receive, body_buffered=False)
+    assert result is None          # timed out — no admission
+    assert receive_calls == 0      # watcher never ran → body not stolen
+
+    await ctx.gate.release()
+    await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_admit_queue_wait_uses_remaining_budget() -> None:
     """WI-006.3: queue wait uses remaining budget, not full timeout."""
     from switchboard.control import AdmissionPlan

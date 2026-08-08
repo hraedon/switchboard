@@ -42,8 +42,8 @@ multi-provider, which a single-upstream breaker cannot express.
   format (OpenAI-compatible `/v1/chat/completions`). The `/v1/messages`
   (Anthropic) surface is passthrough to a single Anthropic-compatible upstream
   only — no cross-format routing.
-- **No response caching, prompt logging, or model routing** beyond
-  provider-level failover. Those are out of scope.
+- **No response caching, prompt logging, or content-based routing** beyond
+  model-name compatibility filtering for failover. Those are out of scope.
 - **No re-serialization of request bodies** on the primary path.
   Cache-transparency applies to the primary/umans path — bytes are forwarded
   as-is. *(Exceptions: (1) when a `[model]` map is configured, the fallback

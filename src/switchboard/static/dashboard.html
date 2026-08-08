@@ -74,6 +74,14 @@ button {
   border-radius: 4px;
   cursor: pointer;
 }
+.mini-btn {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 0.2rem 0.5rem;
+  font-size: 0.78rem;
+}
+.mini-btn:hover { color: var(--red); border-color: var(--red); }
 .section-title {
   font-size: 0.8rem;
   color: var(--muted);
@@ -91,6 +99,9 @@ button {
 <body>
 <h1>switchboard</h1>
 <div id="default-route"></div>
+<div id="add-provider"></div>
+<div id="route-add"></div>
+<div id="model-add"></div>
 <div id="app">Loading...</div>
 <script>
 // The default route is the only control on this page that WRITES, so it lives
@@ -201,12 +212,353 @@ function renderDefaultRouteForm(current, known) {
   };
 }
 
+// ── Add Provider form (Plan 021 WI-5) ────────────────────────────────────
+// Lives outside #app for the same reason the default-route editor does: the
+// 5 s poll rebuilds #app wholesale and would wipe a half-filled form.
+// `editingProvider` freezes this section while the form is open, so a poll
+// landing mid-edit cannot discard what was typed.
+let editingProvider = false;
+let registryCache = null;
+
+function renderAddProvider(_data) {
+  if (editingProvider) return;
+  const el = document.getElementById('add-provider');
+  el.innerHTML = `
+    <h2>Providers</h2>
+    <div class="card">
+      <p style="margin:0 0 0.6rem;color:var(--muted);font-size:0.85rem">
+        Add a provider by pasting the vendor's documented base URL. Pick a
+        registry entry to pre-fill, or use &ldquo;generic&rdquo; and type it.
+      </p>
+      <button id="add-provider-btn">Add provider</button>
+    </div>`;
+  const btn = document.getElementById('add-provider-btn');
+  if (btn) btn.onclick = () => { editingProvider = true; renderProviderForm(); };
+}
+
+async function _loadRegistry() {
+  if (registryCache) return registryCache;
+  try {
+    const resp = await fetch('/admin/providers/registry', { credentials: 'same-origin' });
+    if (resp.ok) registryCache = (await resp.json()).providers || [];
+  } catch (e) { registryCache = []; }
+  return registryCache || [];
+}
+
+function renderProviderForm() {
+  const el = document.getElementById('add-provider');
+  el.innerHTML = `
+    <h2>Add Provider</h2>
+    <div class="card">
+      <div class="form-row">
+        <label for="pf-registry">From registry (optional)</label>
+        <select id="pf-registry"><option value="">loading…</option></select>
+      </div>
+      <div class="form-row">
+        <label for="pf-name">Name</label>
+        <input id="pf-name" autocomplete="off" placeholder="e.g. ollama-cloud">
+      </div>
+      <div class="form-row">
+        <label for="pf-base">Base URL (vendor documented API root)</label>
+        <input id="pf-base" autocomplete="off" placeholder="e.g. https://ollama.com/v1">
+      </div>
+      <div class="form-row">
+        <label>Live preview (composed upstream for /v1/chat/completions)</label>
+        <code id="pf-preview" style="display:block;background:var(--bg);padding:0.4rem 0.5rem;
+          border-radius:4px;font-size:0.82rem;color:var(--muted);min-height:1.2em"></code>
+      </div>
+      <div class="form-row">
+        <label for="pf-target">Target concurrency</label>
+        <input id="pf-target" type="number" min="1" value="1" style="width:6rem">
+      </div>
+      <div class="form-row">
+        <label for="pf-auth-header">Auth header</label>
+        <input id="pf-auth-header" value="authorization" autocomplete="off">
+      </div>
+      <div class="form-row">
+        <label for="pf-key-env">API key env var (name only — value stays server-side)</label>
+        <input id="pf-key-env" autocomplete="off" placeholder="e.g. SWITCHBOARD_OLLAMA_KEY">
+      </div>
+      <div id="pf-discover" style="margin:0.3rem 0 0.6rem;font-size:0.82rem"></div>
+      <div id="pf-error" style="color:var(--red);font-size:0.85rem;margin-bottom:0.5rem"></div>
+      <button id="pf-test">Test &amp; detect</button>
+      <button id="pf-save">Save</button>
+      <button id="pf-cancel" style="background:transparent;border:1px solid var(--border)">Cancel</button>
+    </div>`;
+
+  document.getElementById('pf-cancel').onclick = () => {
+    editingProvider = false; load();
+  };
+  const regSel = document.getElementById('pf-registry');
+  regSel.onchange = () => _applyRegistryPick(regSel.value);
+  const baseInput = document.getElementById('pf-base');
+  let previewTimer = null;
+  baseInput.oninput = () => {
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(_refreshPreview, 150);
+  };
+  document.getElementById('pf-test').onclick = _runDiscover;
+  document.getElementById('pf-save').onclick = _saveProvider;
+
+  // Populate the registry picker, then seed defaults from "generic".
+  _loadRegistry().then(entries => {
+    const opts = ['<option value="">— pick to pre-fill, or type below —</option>'];
+    for (const e of entries) {
+      opts.push(`<option value="${esc(e.name)}">${esc(e.name)}${
+        e.default_base_url ? ' — ' + esc(e.default_base_url) : ''
+      }</option>`);
+    }
+    regSel.innerHTML = opts.join('');
+  });
+}
+
+function _applyRegistryPick(name) {
+  if (!registryCache) return;
+  const entry = registryCache.find(e => e.name === name);
+  if (!entry) return;
+  if (entry.default_base_url) document.getElementById('pf-base').value = entry.default_base_url;
+  if (entry.auth_header) document.getElementById('pf-auth-header').value = entry.auth_header;
+  if (!document.getElementById('pf-name').value) document.getElementById('pf-name').value = name;
+  _refreshPreview();
+}
+
+async function _refreshPreview() {
+  const base = (document.getElementById('pf-base') || {}).value || '';
+  const out = document.getElementById('pf-preview');
+  if (!out) return;
+  if (!base.trim()) { out.textContent = ''; return; }
+  try {
+    const q = new URLSearchParams({ base, path: '/v1/chat/completions' });
+    const resp = await fetch('/admin/preview-path?' + q, { credentials: 'same-origin' });
+    if (resp.ok) {
+      const data = await resp.json();
+      out.textContent = data.composed || '';
+    }
+  } catch (e) { /* preview is best-effort */ }
+}
+
+async function _runDiscover() {
+  const base = (document.getElementById('pf-base') || {}).value || '';
+  const out = document.getElementById('pf-discover');
+  const errEl = document.getElementById('pf-error');
+  errEl.textContent = '';
+  if (!base.trim()) { errEl.textContent = 'enter a base URL first'; return; }
+  out.innerHTML = '<span style="color:var(--muted)">probing…</span>';
+  try {
+    // No credential is sent: the key lives in a server-side env var the
+    // browser never sees. Public /models endpoints answer; auth-gated ones
+    // report 401/403 — the composition is still discoverable from the URL
+    // that was tried. After saving, the per-provider Test uses the credential.
+    const resp = await fetch('/admin/providers/discover', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ base_url: base.trim() }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { errEl.textContent = data.error || ('HTTP ' + resp.status); return; }
+    const rows = (data.candidates || []).map(c => {
+      const mark = c.ok ? '✓' : (c.status ? '✗' : '·');
+      const color = c.ok ? 'var(--green)' : 'var(--muted)';
+      const st = c.ok ? 'ok' : (c.detail || (c.status != null ? c.status : 'no response'));
+      return `<div style="color:${color}">${mark} <code>${esc(c.url)}</code> — ${esc(st)}</div>`;
+    });
+    const okCount = (data.candidates || []).filter(c => c.ok).length;
+    out.innerHTML = `<div style="margin-bottom:0.3rem">${okCount} answered</div>${rows.join('')}`;
+  } catch (e) { errEl.textContent = String(e); }
+}
+
+async function _saveProvider() {
+  const name = (document.getElementById('pf-name') || {}).value.trim();
+  const upstream = (document.getElementById('pf-base') || {}).value.trim();
+  const target = parseInt((document.getElementById('pf-target') || {}).value, 10) || 1;
+  const auth_header = (document.getElementById('pf-auth-header') || {}).value.trim() || 'authorization';
+  const api_key_env = (document.getElementById('pf-key-env') || {}).value.trim();
+  const errEl = document.getElementById('pf-error');
+  errEl.textContent = '';
+  if (!name) { errEl.textContent = 'name is required'; return; }
+  if (!upstream) { errEl.textContent = 'base URL is required'; return; }
+  const body = { name, upstream, provider_type: 'generic', target, auth_header };
+  if (api_key_env) { body.key_mode = 'env'; body.api_key_env = api_key_env; }
+  try {
+    const resp = await fetch('/admin/providers', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) { errEl.textContent = data.error || ('HTTP ' + resp.status); return; }
+    editingProvider = false;
+    load();
+  } catch (e) { errEl.textContent = String(e); }
+}
+
+// ── Keyed-route management (Plan 020 WI-8) ────────────────────────────────
+let editingRoute = false;
+
+function renderRouteAdd(_data) {
+  if (editingRoute) return;
+  const el = document.getElementById('route-add');
+  el.innerHTML = `
+    <h2>Keyed Routes</h2>
+    <div class="card">
+      <p style="margin:0 0 0.6rem;color:var(--muted);font-size:0.85rem">
+        Route a specific API key to a fixed provider list. Unmatched traffic
+        follows the default route.
+      </p>
+      <button id="add-route-btn">Add keyed route</button>
+    </div>`;
+  const btn = document.getElementById('add-route-btn');
+  if (btn) btn.onclick = () => { editingRoute = true; renderRouteAddForm(); };
+}
+
+function renderRouteAddForm() {
+  const el = document.getElementById('route-add');
+  el.innerHTML = `
+    <h2>Add Keyed Route</h2>
+    <div class="card">
+      <div class="form-row">
+        <label for="rf-key">API key (raw — hashed server-side, never stored in clear)</label>
+        <input id="rf-key" autocomplete="off" placeholder="sk-...">
+      </div>
+      <div class="form-row">
+        <label for="rf-providers">Providers, comma-separated, most preferred first</label>
+        <input id="rf-providers" autocomplete="off" placeholder="umans, ollama-cloud">
+      </div>
+      <div id="rf-error" style="color:var(--red);font-size:0.85rem;margin-bottom:0.5rem"></div>
+      <button id="rf-save">Save</button>
+      <button id="rf-cancel" style="background:transparent;border:1px solid var(--border)">Cancel</button>
+    </div>`;
+  document.getElementById('rf-cancel').onclick = () => { editingRoute = false; load(); };
+  document.getElementById('rf-save').onclick = async () => {
+    const key = (document.getElementById('rf-key') || {}).value || '';
+    const raw = (document.getElementById('rf-providers') || {}).value || '';
+    const providers = raw.split(',').map(s => s.trim()).filter(s => s);
+    const errEl = document.getElementById('rf-error');
+    errEl.textContent = '';
+    if (!key.trim()) { errEl.textContent = 'API key is required'; return; }
+    if (!providers.length) { errEl.textContent = 'at least one provider is required'; return; }
+    try {
+      const resp = await fetch('/admin/routes', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ key: key.trim(), providers }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) { errEl.textContent = data.error || ('HTTP ' + resp.status); return; }
+      editingRoute = false; load();
+    } catch (e) { errEl.textContent = String(e); }
+  };
+}
+
+async function deleteRoute(key) {
+  if (!confirm('Delete this keyed route?')) return;
+  try {
+    const resp = await fetch('/admin/routes/' + encodeURIComponent(key), {
+      method: 'DELETE', credentials: 'same-origin',
+    });
+    if (!resp.ok) {
+      const b = await resp.json().catch(() => ({}));
+      alert(b.error || ('HTTP ' + resp.status));
+      return;
+    }
+    load();
+  } catch (e) { alert(String(e)); }
+}
+
+// ── Model-map management (Plan 020 WI-7) ──────────────────────────────────
+let editingModel = false;
+
+function renderModelAdd(data) {
+  if (editingModel) return;
+  const known = Object.keys((data && data.providers) || {}).sort();
+  const el = document.getElementById('model-add');
+  el.innerHTML = `
+    <h2>Model Map</h2>
+    <div class="card">
+      <p style="margin:0 0 0.6rem;color:var(--muted);font-size:0.85rem">
+        Map a model name to per-provider aliases. Only providers with an alias
+        can serve the model; the alias is what gets sent upstream.
+      </p>
+      <button id="add-model-btn">Add model mapping</button>
+    </div>`;
+  const btn = document.getElementById('add-model-btn');
+  if (btn) btn.onclick = () => { editingModel = true; renderModelAddForm(known); };
+}
+
+function renderModelAddForm(knownProviders) {
+  const el = document.getElementById('model-add');
+  const provs = (knownProviders || []).slice().sort();
+  const aliasRows = provs.map(p => `
+    <div class="form-row">
+      <label for="mf-alias-${esc(p)}">${esc(p)} alias</label>
+      <input id="mf-alias-${esc(p)}" autocomplete="off" placeholder="leave blank if ${esc(p)} does not serve it">
+    </div>`).join('');
+  el.innerHTML = `
+    <h2>Add Model Mapping</h2>
+    <div class="card">
+      <div class="form-row">
+        <label for="mf-model">Model name (as the client sends it)</label>
+        <input id="mf-model" autocomplete="off" placeholder="e.g. glm-5.2">
+      </div>
+      ${aliasRows || '<p style="color:var(--muted)">No providers configured.</p>'}
+      <div id="mf-error" style="color:var(--red);font-size:0.85rem;margin-bottom:0.5rem"></div>
+      <button id="mf-save">Save</button>
+      <button id="mf-cancel" style="background:transparent;border:1px solid var(--border)">Cancel</button>
+    </div>`;
+  document.getElementById('mf-cancel').onclick = () => { editingModel = false; load(); };
+  document.getElementById('mf-save').onclick = async () => {
+    const model = (document.getElementById('mf-model') || {}).value.trim();
+    const errEl = document.getElementById('mf-error');
+    errEl.textContent = '';
+    if (!model) { errEl.textContent = 'model name is required'; return; }
+    const aliases = {};
+    for (const p of provs) {
+      const v = (document.getElementById('mf-alias-' + p) || {}).value.trim();
+      if (v) aliases[p] = v;
+    }
+    if (!Object.keys(aliases).length) {
+      errEl.textContent = 'fill in at least one provider alias';
+      return;
+    }
+    try {
+      const resp = await fetch('/admin/model-map', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ model, aliases }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) { errEl.textContent = data.error || ('HTTP ' + resp.status); return; }
+      editingModel = false; load();
+    } catch (e) { errEl.textContent = String(e); }
+  };
+}
+
+async function deleteModel(model) {
+  if (!confirm('Delete the mapping for ' + model + '?')) return;
+  try {
+    const resp = await fetch('/admin/model-map/' + encodeURIComponent(model), {
+      method: 'DELETE', credentials: 'same-origin',
+    });
+    if (!resp.ok) {
+      const b = await resp.json().catch(() => ({}));
+      alert(b.error || ('HTTP ' + resp.status));
+      return;
+    }
+    load();
+  } catch (e) { alert(String(e)); }
+}
+
 // Configuration provenance (Plan 021 WI-7). Which tier owns each provider,
-// and which fields an env var has taken over. Read-only for now: the input
-// locking this data exists for needs Wave 2's provider form, which does not
-// exist yet — the only editable control on this page is the default route.
-// Rendering it now still answers the question an operator actually has, which
-// is "why is this value what it is", without reading the Deployment.
+// and which fields an env var has taken over. Fields shown as env-locked are
+// owned by a Deployment variable: editing them here (once an edit-provider
+// form lands — Plan 020 WI-6) would be discarded at the next restart, so they
+// must render as locked. The Add Provider form above is the first writing
+// control this enables; the provenance it reports answers "why is this value
+// what it is" without reading the Deployment.
 function renderConfig(cfg) {
   if (!cfg) return '';
   let html = '<h2>Configuration</h2>';
@@ -239,7 +591,7 @@ function renderConfig(cfg) {
       ? `<s style="color:var(--muted)">${esc(p.name)}</s> <span class="badge unknown">disabled</span>`
       : esc(p.name);
     const lockedCells = locked.length
-      ? locked.map(f => `<code style="color:var(--amber)">${esc(f)}</code>`).join(' ')
+      ? locked.map(f => `<code style="color:var(--amber)" title="Owned by an environment variable; a GUI edit would be discarded at restart">${esc(f)}</code> <span class="badge unknown" style="font-size:0.7rem">env</span>`).join(' ')
       : '<span style="color:var(--muted)">&mdash;</span>';
     html += `<tr><td>${name}</td><td>${esc(p.source || '?')}</td>`
          +  `<td>${lockedCells}</td></tr>`;
@@ -281,6 +633,9 @@ async function load() {
   const el = document.getElementById('app');
 
   renderDefaultRoute(data);
+  renderAddProvider(data);
+  renderRouteAdd(data);
+  renderModelAdd(data);
 
   // Separate surface from status.json, and optional: a dashboard served
   // without an admin token still renders everything else rather than failing
@@ -365,6 +720,17 @@ async function load() {
       html += `<div class="stat"><span class="k">tokens_out</span><span class="v">${fmtTokens(p.tokens_out)}</span></div>`;
     }
 
+    // Per-provider speed (Plan 020 Wave 3)
+    if (p.speed) {
+      const sp = p.speed;
+      const ttfb = sp.ttfb_ms || {};
+      html += `<div class="section-title">Speed (${sp.samples} samples)</div>`;
+      html += `<div class="stat"><span class="k">ttfb_avg</span><span class="v">${ttfb.avg != null ? Math.round(ttfb.avg) + 'ms' : '-'}</span></div>`;
+      html += `<div class="stat"><span class="k">ttfb_p95</span><span class="v">${ttfb.p95 != null ? Math.round(ttfb.p95) + 'ms' : '-'}</span></div>`;
+      html += `<div class="stat"><span class="k">duration_avg</span><span class="v">${(sp.duration_ms || {}).avg != null ? Math.round(sp.duration_ms.avg) + 'ms' : '-'}</span></div>`;
+      html += `<div class="stat"><span class="k">tokens_per_sec</span><span class="v">${sp.tokens_per_sec != null ? sp.tokens_per_sec : '-'}</span></div>`;
+    }
+
     html += `</div>`;
   }
   html += '</div>';
@@ -396,15 +762,17 @@ async function load() {
   // phantom "default..." row alongside real keys.
   const keyedRoutes = Object.entries(data.route_table || {})
     .filter(([key]) => key !== 'default');
-  html += '<h2>Route Table</h2>';
+  html += '<h2>Keyed Routes</h2>';
   if (keyedRoutes.length === 0) {
     html += '<p style="color:var(--muted)">No keyed routes — all traffic '
          +  'follows the default route.</p>';
   } else {
-    html += '<table><thead><tr><th>Key (truncated)</th><th>Providers</th></tr></thead><tbody>';
-    for (const [key, providers] of keyedRoutes) {
-      html += `<tr><td><code>${key.substring(0, 16)}...</code></td><td>${providers.join(' &rarr; ')}</td></tr>`;
-    }
+    html += '<table><thead><tr><th>Key (truncated)</th><th>Providers</th><th></th></tr></thead><tbody>';
+    keyedRoutes.forEach(([key, providers], i) => {
+      html += `<tr><td><code>${esc(key.substring(0, 16))}...</code></td>`
+           +  `<td>${providers.join(' &rarr; ')}</td>`
+           +  `<td><button id="del-route-${i}" class="mini-btn">Delete</button></td></tr>`;
+    });
     html += '</tbody></table>';
   }
 
@@ -420,22 +788,22 @@ async function load() {
   } else {
     html += '<table><thead><tr><th>Model</th>';
     for (const pn of allProviders) {
-      html += `<th>${pn}</th>`;
+      html += `<th>${esc(pn)}</th>`;
     }
-    html += '</tr></thead><tbody>';
-    for (const model of mmModels.sort()) {
+    html += '<th></th></tr></thead><tbody>';
+    mmModels.sort().forEach((model, mi) => {
       const aliases = mm[model] || {};
-      html += `<tr><td><code>${model}</code></td>`;
+      html += `<tr><td><code>${esc(model)}</code></td>`;
       for (const pn of allProviders) {
         const alias = aliases[pn];
         if (alias != null) {
-          html += `<td style="color:var(--green)">${alias}</td>`;
+          html += `<td style="color:var(--green)">${esc(alias)}</td>`;
         } else {
           html += `<td style="color:var(--muted)">&mdash;</td>`;
         }
       }
-      html += '</tr>';
-    }
+      html += `<td><button id="del-model-${mi}" class="mini-btn">Delete</button></td></tr>`;
+    });
     html += '</tbody></table>';
   }
 
@@ -455,6 +823,17 @@ async function load() {
   html += '</div></div>';
 
   el.innerHTML = html;
+
+  // Wire per-row Delete buttons now that the table HTML is in the DOM. The
+  // 5 s poll rebuilds #app and re-runs this, so no stale-handler problem.
+  keyedRoutes.forEach(([key], i) => {
+    const btn = document.getElementById('del-route-' + i);
+    if (btn) btn.onclick = () => deleteRoute(key);
+  });
+  mmModels.slice().sort().forEach((model, mi) => {
+    const btn = document.getElementById('del-model-' + mi);
+    if (btn) btn.onclick = () => deleteModel(model);
+  });
 }
 load();
 setInterval(load, 5000);

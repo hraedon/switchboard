@@ -1,8 +1,8 @@
 # Plan 010 — Overloaded-response failover with model remapping
 
-Status: **implemented** (Features A, B, C and the reactive backstop; Feature 0
-surfacing landed; one sluice release/pin tail remains — see WI-0b, which this
-plan already marks PARTIAL)
+Status: **implemented** (Features A, B, C, the reactive backstop, and Feature 0
+surfacing all landed). The former WI-0b sluice release/pin tail is moot —
+Plan 018 vendored the flow-control core and deleted the sluice dependency.
 
 Evidence (do not re-plan; this work is in the code and under test):
 

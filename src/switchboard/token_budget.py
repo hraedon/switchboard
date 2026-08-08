@@ -57,6 +57,24 @@ class TokenBudgetTracker:
                 f"CREATE TABLE IF NOT EXISTS {_WINDOW_START_STORE} "
                 "(provider TEXT, timestamp REAL, tokens INTEGER)"
             )
+            # Wall-clock timestamp for cross-reboot age (Plan 012 fix: the
+            # monotonic ``timestamp`` resets at every system reboot, so a row
+            # written hours before a reboot looks "fresh" afterwards and poisons
+            # the window.  ``wall_ts`` ages by the wall clock on load and is
+            # translated back into the current monotonic frame so in-memory
+            # windowing stays consistent.  Existing rows have NULL wall_ts and
+            # are treated as stale (skipped on load, purged on prune).
+            cols = {
+                row[1]
+                for row in db.execute(
+                    f"PRAGMA table_info({_WINDOW_START_STORE})"
+                )
+            }
+            if "wall_ts" not in cols:
+                db.execute(
+                    f"ALTER TABLE {_WINDOW_START_STORE} "
+                    f"ADD COLUMN wall_ts REAL"
+                )
             db.execute(
                 f"CREATE INDEX IF NOT EXISTS "
                 f"idx_{_WINDOW_START_STORE}_provider_ts "
@@ -67,6 +85,15 @@ class TokenBudgetTracker:
     def has_budget(self, provider: str) -> bool:
         """True if a token budget is configured for this provider."""
         return provider in self._configs
+
+    def soft_threshold_for(self, provider: str) -> float | None:
+        """The configured ``soft_threshold`` for a provider, or None.
+
+        None means no token budget is configured for this provider; the
+        routing core then falls back to the global ``token_budget_threshold``.
+        """
+        cfg = self._configs.get(provider)
+        return cfg.soft_threshold if cfg is not None else None
 
     def record_usage(
         self,
@@ -93,8 +120,9 @@ class TokenBudgetTracker:
             try:
                 self._db.execute(
                     f"INSERT INTO {_WINDOW_START_STORE} "
-                    "(provider, timestamp, tokens) VALUES (?, ?, ?)",
-                    (provider, now, total),
+                    "(provider, timestamp, tokens, wall_ts) "
+                    "VALUES (?, ?, ?, ?)",
+                    (provider, now, total, time.time()),
                 )
                 self._db.commit()
             except Exception:
@@ -209,26 +237,41 @@ class TokenBudgetTracker:
     def load(self) -> None:
         """Load persisted samples from SQLite into the rolling windows.
 
-        Called once at startup.  Only loads samples within the largest
-        configured window so stale data from a long downtime doesn't poison
-        the window.
+        Called once at startup.  Ages samples by their **wall-clock** timestamp
+        (``wall_ts``) so the window is correct across a system reboot, where the
+        monotonic clock resets to zero.  Each loaded sample is translated into
+        the current monotonic frame (``mono_now - age``) so in-memory pruning
+        and projection agree.  Rows without ``wall_ts`` (pre-fix) or older than
+        the largest configured window are skipped.
         """
         if self._db is None or not self._configs:
             return
         max_window = max(
             cfg.window_seconds for cfg in self._configs.values()
         )
-        cutoff = time.monotonic() - max_window
+        wall_now = time.time()
+        mono_now = time.monotonic()
         try:
             cursor = self._db.execute(
-                f"SELECT provider, timestamp, tokens "
-                f"FROM {_WINDOW_START_STORE} WHERE timestamp > ?",
-                (cutoff,),
+                f"SELECT provider, tokens, wall_ts "
+                f"FROM {_WINDOW_START_STORE} "
+                f"WHERE wall_ts IS NOT NULL AND wall_ts > ?",
+                (wall_now - max_window,),
             )
-            for provider, ts, tokens in cursor:
+            for provider, tokens, wall_ts in cursor:
                 if provider not in self._configs:
                     continue
-                self._window(provider).append((ts, tokens))
+                age = wall_now - wall_ts
+                if age < 0:
+                    age = 0.0
+                self._window(provider).append((mono_now - age, tokens))
+            # Drop rows too old to matter (or lacking wall_ts), once on load.
+            self._db.execute(
+                f"DELETE FROM {_WINDOW_START_STORE} "
+                f"WHERE wall_ts IS NULL OR wall_ts <= ?",
+                (wall_now - max_window,),
+            )
+            self._db.commit()
         except Exception:
             log.warning(
                 "failed to load token usage history", exc_info=True
@@ -239,15 +282,15 @@ class TokenBudgetTracker:
         for provider in self._configs:
             self._prune(provider, now)
         if self._db is not None:
-            oldest = now - max(
+            wall_oldest = time.time() - max(
                 (c.window_seconds for c in self._configs.values()),
                 default=3600.0,
             )
             try:
                 self._db.execute(
                     f"DELETE FROM {_WINDOW_START_STORE} "
-                    f"WHERE timestamp < ?",
-                    (oldest,),
+                    f"WHERE wall_ts IS NULL OR wall_ts <= ?",
+                    (wall_oldest,),
                 )
                 self._db.commit()
             except Exception:
