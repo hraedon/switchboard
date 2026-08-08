@@ -20,24 +20,48 @@ const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
 
 function makeEl(id) {
   // oninput/onchange are assigned by the form; create them as assignable
-  // props so the harness can invoke them directly.
+  // props so the harness can invoke them directly. `checked` backs the
+  // enabled-toggle checkbox in the edit form; `disabled` is settable so a
+  // test can assert the env-lock state via the element too.
   return {
     id, innerHTML: '', textContent: '', value: '', onclick: null,
     onchange: null, oninput: null, style: {}, type: '',
+    checked: false, disabled: false,
   };
 }
 
 const $ = (id) => document.getElementById(id);
 const getEditing = () => vm.runInContext('editingProvider', sandbox);
 const setEditing = (v) => vm.runInContext(`editingProvider = ${!!v}`, sandbox);
+const getEditingName = () => vm.runInContext('editingProviderName', sandbox);
 const results = [];
 function check(name, cond, detail) {
   results.push({ name, ok: !!cond, detail: detail === undefined ? '' : String(detail) });
+}
+// Pull one input element's HTML out of a rendered string (the shim does not
+// parse innerHTML into elements, so attribute checks are string matches).
+function inputHtml(view, id) {
+  const m = view.match(new RegExp('<input[^>]*id="' + id + '"[^>]*>'));
+  return m ? m[0] : '';
+}
+// A real browser destroys absent children when a container's innerHTML is
+// reassigned; the shim reuses element objects, so stale pf-* values leak
+// across re-renders (e.g. an env-mode form's api_key_env survives into a
+// stored-mode save and flips the payload's key_mode). Purging pf-* elements
+// before each re-open mirrors the browser and keeps tests independent.
+function resetFormEls() {
+  for (const k of Object.keys(els)) {
+    if (k.startsWith('pf-')) delete els[k];
+  }
 }
 
 // --- harness state ---------------------------------------------------------
 let fetchCalls = [];
 let nextResponse = { ok: true, status: 200, json: async () => ({}) };
+// Exact-URL responses take precedence over `nextResponse`, so a test can stage
+// the two distinct fetches the edit flow makes (/admin/providers then
+// /admin/config/effective) without racing the single `nextResponse`.
+let responsesByUrl = {};
 const els = {};
 
 const document = {
@@ -53,7 +77,11 @@ const sandbox = {
   setInterval: () => 0,
   setTimeout: (fn) => { timers.push(fn); return timers.length; },
   clearTimeout: () => {},
-  fetch: async (url, opts) => { fetchCalls.push({ url, opts }); return nextResponse; },
+  fetch: async (url, opts) => {
+    fetchCalls.push({ url, opts });
+    if (responsesByUrl[url]) return responsesByUrl[url];
+    return nextResponse;
+  },
   URLSearchParams,
   window: { location: { href: '' } },
 };
@@ -218,6 +246,314 @@ const dangerous = $('pf-discover').innerHTML;
 check('escapes attacker-influenced URLs in the discover output',
       !dangerous.includes('<script>bad') && dangerous.includes('&lt;'),
       dangerous.slice(0, 160));
+
+// --- 11. EDIT FORM: editProvider opens a prefilled form (Plan 020 WI-6) ----
+// Reset responsesByUrl so the two distinct edit-flow fetches are staged
+// independently of the global nextResponse.
+responsesByUrl = {};
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+resetFormEls();
+setEditing(false);
+vm.runInContext('editingProviderName = null; editEnvLocked = null;', sandbox);
+
+responsesByUrl['/admin/providers'] = {
+  ok: true, status: 200,
+  json: async () => ({
+    providers: [{
+      name: 'umans', upstream: 'https://u.example/v1', target: 3,
+      provider_type: 'generic', key_mode: 'env', api_key_env: 'UMANS_KEY',
+      auth_header: 'authorization', auth_prefix: '', dashboard_url: '',
+      dashboard_token_env: '', usage_key_env: 'UMANS_USAGE', enabled: true,
+    }],
+  }),
+};
+responsesByUrl['/admin/config/effective'] = {
+  ok: true, status: 200,
+  json: async () => ({ providers: [{ name: 'umans', env_locked: ['target'] }] }),
+};
+await sandbox.editProvider('umans');
+check('editProvider sets editingProvider', getEditing() === true, getEditing());
+check('editProvider records the name being edited',
+      getEditingName() === 'umans', getEditingName());
+let eform = $('add-provider').innerHTML;
+check('edit form has the Edit Provider title', /Edit Provider/.test(eform), eform.slice(0, 80));
+check('edit form prefills the name', $('pf-name').value === 'umans', $('pf-name').value);
+check('edit form prefills the base URL',
+      $('pf-base').value === 'https://u.example/v1', $('pf-base').value);
+check('edit form prefills the api_key_env',
+      $('pf-key-env').value === 'UMANS_KEY', $('pf-key-env').value);
+check('edit form prefills the usage_key_env',
+      $('pf-usage-key-env').value === 'UMANS_USAGE', $('pf-usage-key-env').value);
+// Name is the route key — it must be disabled, not a free input.
+check('edit form disables the name input',
+      inputHtml(eform, 'pf-name').includes('disabled'), inputHtml(eform, 'pf-name'));
+
+// --- 12. EDIT FORM: env-locked fields render disabled ----------------------
+// 'target' is env_locked above; upstream is not. The lock must be on target
+// only — disabling upstream would hide the real editable surface.
+const targetInput = inputHtml(eform, 'pf-target');
+const baseInput = inputHtml(eform, 'pf-base');
+check('env-locked field (target) is disabled', targetInput.includes('disabled'), targetInput);
+check('env-locked field carries the lock note', /env-locked/.test(eform));
+check('non-locked field (upstream) is editable', !baseInput.includes('disabled'), baseInput);
+
+// --- 13. EDIT FORM: save PUTs the full row to /admin/providers/<name> ------
+$('pf-target').value = '5';  // operator raises concurrency (target is locked,
+                              // but the shim element is mutable — the payload
+                              // carries the field either way; what matters is
+                              // the method + URL + body shape).
+fetchCalls = [];
+responsesByUrl = {};  // PUT goes to /admin/providers/umans, a new exact URL
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await sandbox._saveProvider();
+const putCall = fetchCalls.find(c => c.url === '/admin/providers/umans');
+check('save PUTs to /admin/providers/<name>', !!putCall, fetchCalls.map(c => c.url));
+check('uses PUT', putCall?.opts?.method === 'PUT', putCall?.opts?.method);
+check('uses same-origin credentials',
+      putCall?.opts?.credentials === 'same-origin');
+const putBody = putCall ? JSON.parse(putCall.opts.body) : {};
+check('PUT body carries upstream', putBody.upstream === 'https://u.example/v1', putBody);
+check('PUT body carries provider_type', putBody.provider_type === 'generic');
+check('PUT body carries key_mode env', putBody.key_mode === 'env' && putBody.api_key_env === 'UMANS_KEY');
+check('PUT body carries enabled', putBody.enabled === true);
+check('PUT omits api_key_stored in env mode', !('api_key_stored' in putBody));
+check('save clears editing state on success',
+      getEditing() === false && getEditingName() === null, [getEditing(), getEditingName()]);
+
+// --- 14. EDIT FORM: write-only stored key — blank means "keep" -------------
+resetFormEls();
+responsesByUrl = {};
+responsesByUrl['/admin/providers'] = {
+  ok: true, status: 200,
+  json: async () => ({
+    providers: [{
+      name: 'paid', upstream: 'https://p.example/v1', target: 2,
+      provider_type: 'generic', key_mode: 'stored', api_key_hint: '4321',
+      auth_header: 'authorization', enabled: true,
+    }],
+  }),
+};
+responsesByUrl['/admin/config/effective'] = {
+  ok: true, status: 200,
+  json: async () => ({ providers: [{ name: 'paid', env_locked: [] }] }),
+};
+setEditing(false);
+await sandbox.editProvider('paid');
+check('stored-key form shows the hint',
+      /ending 4321/.test($('add-provider').innerHTML), $('add-provider').innerHTML);
+check('stored-key form shows the new-key field',
+      $('add-provider').innerHTML.includes('id="pf-key-new"'));
+check('stored-key form has no env-key field',
+      !$('add-provider').innerHTML.includes('id="pf-key-env"'));
+// Blank new key: PUT must keep key_mode='stored' and NOT send api_key_stored
+// (write-only keep semantics — the server retains the existing credential).
+fetchCalls = [];
+responsesByUrl = {};
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await sandbox._saveProvider();
+const stCall = fetchCalls.find(c => c.url === '/admin/providers/paid');
+const stBody = stCall ? JSON.parse(stCall.opts.body) : {};
+check('blank stored key keeps key_mode stored',
+      stBody.key_mode === 'stored', stBody);
+check('blank stored key is not sent (keep)',
+      !('api_key_stored' in stBody), stBody);
+
+// --- 14b. EDIT FORM: a newly typed stored key IS sent ----------------------
+resetFormEls();
+responsesByUrl['/admin/providers'] = {
+  ok: true, status: 200,
+  json: async () => ({
+    providers: [{
+      name: 'paid', upstream: 'https://p.example/v1', target: 2,
+      provider_type: 'generic', key_mode: 'stored', api_key_hint: '4321',
+      auth_header: 'authorization', enabled: true,
+    }],
+  }),
+};
+responsesByUrl['/admin/config/effective'] = {
+  ok: true, status: 200,
+  json: async () => ({ providers: [{ name: 'paid', env_locked: [] }] }),
+};
+setEditing(false);
+await sandbox.editProvider('paid');
+$('pf-key-new').value = 'sk-newsecret';
+fetchCalls = [];
+responsesByUrl = {};
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await sandbox._saveProvider();
+const rotCall = fetchCalls.find(c => c.url === '/admin/providers/paid');
+const rotBody = rotCall ? JSON.parse(rotCall.opts.body) : {};
+check('a typed stored key is sent for rotation',
+      rotBody.key_mode === 'stored' && rotBody.api_key_stored === 'sk-newsecret',
+      rotBody);
+
+// --- 15. EDIT FORM: a 400 surfaces the message and stays in edit mode ------
+resetFormEls();
+responsesByUrl = {};
+responsesByUrl['/admin/providers'] = {
+  ok: true, status: 200,
+  json: async () => ({
+    providers: [{
+      name: 'umans', upstream: 'https://u.example/v1', target: 3,
+      provider_type: 'generic', key_mode: 'env', api_key_env: 'UMANS_KEY',
+      auth_header: 'authorization', enabled: true,
+    }],
+  }),
+};
+responsesByUrl['/admin/config/effective'] = {
+  ok: true, status: 200,
+  json: async () => ({ providers: [{ name: 'umans', env_locked: [] }] }),
+};
+setEditing(false);
+await sandbox.editProvider('umans');
+fetchCalls = [];
+responsesByUrl = {};
+nextResponse = {
+  ok: false, status: 400,
+  json: async () => ({ error: "field 'upstream' is required" }),
+};
+await sandbox._saveProvider();
+check('edit surfaces the server error verbatim',
+      $('pf-error').textContent === "field 'upstream' is required",
+      $('pf-error').textContent);
+check('edit stays open after a rejection',
+      getEditing() === true && getEditingName() === 'umans',
+      [getEditing(), getEditingName()]);
+
+// --- 16. EDIT FORM: XSS — provider name escaped in the prefilled form ------
+resetFormEls();
+responsesByUrl = {};
+responsesByUrl['/admin/providers'] = {
+  ok: true, status: 200,
+  json: async () => ({
+    providers: [{
+      name: '<script>bad</script>', upstream: 'https://x.example', target: 1,
+      provider_type: 'generic', key_mode: 'passthrough',
+      auth_header: 'authorization', enabled: true,
+    }],
+  }),
+};
+responsesByUrl['/admin/config/effective'] = {
+  ok: true, status: 200,
+  json: async () => ({ providers: [] }),
+};
+setEditing(false);
+await sandbox.editProvider('<script>bad</script>');
+const xform = $('add-provider').innerHTML;
+check('attacker name is escaped in the edit form',
+      !xform.includes('<script>bad') && xform.includes('&lt;script&gt;'),
+      xform.slice(0, 200));
+
+// --- 17. EDIT FORM: passthrough key mode shows no credential field --------
+check('passthrough mode shows the passthrough note',
+      /passthrough/.test(xform), xform.slice(0, 300));
+
+// --- 18. EDIT FORM: TOML provider's `type` is preserved (finding 1) --------
+// GET /admin/providers emits the TOML section key `type`, not `provider_type`;
+// the form must resolve from either so a save does not rewrite the type to
+// 'generic' (which would shadow the TOML section with a wrong store row).
+resetFormEls();
+responsesByUrl = {};
+responsesByUrl['/admin/providers'] = {
+  ok: true, status: 200,
+  json: async () => ({
+    providers: [{
+      name: 'local', upstream: 'http://localhost:11434', target: 4,
+      type: 'ollama', key_mode: 'passthrough',
+      auth_header: 'authorization', source: 'toml', enabled: true,
+    }],
+  }),
+};
+responsesByUrl['/admin/config/effective'] = {
+  ok: true, status: 200,
+  json: async () => ({ providers: [{ name: 'local', env_locked: [] }] }),
+};
+setEditing(false);
+await sandbox.editProvider('local');
+check('TOML provider type is read from the section key',
+      $('pf-type').value === 'ollama', $('pf-type').value);
+check('TOML provider type round-trips in the PUT body',
+      true);  // verified structurally below
+fetchCalls = [];
+responsesByUrl = {};
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await sandbox._saveProvider();
+const tomlPut = fetchCalls.find(c => c.url === '/admin/providers/local');
+const tomlBody = tomlPut ? JSON.parse(tomlPut.opts.body) : {};
+check('PUT preserves provider_type ollama (not rewritten to generic)',
+      tomlBody.provider_type === 'ollama', tomlBody);
+
+// --- 19. EDIT FORM: TOML-stored provider cannot keep-on-blank (finding 2) --
+resetFormEls();
+responsesByUrl = {};
+responsesByUrl['/admin/providers'] = {
+  ok: true, status: 200,
+  json: async () => ({
+    providers: [{
+      name: 'paid-toml', upstream: 'https://p.example/v1', target: 2,
+      provider_type: 'generic', key_mode: 'stored', api_key_hint: '4321',
+      auth_header: 'authorization', source: 'toml', enabled: true,
+    }],
+  }),
+};
+responsesByUrl['/admin/config/effective'] = {
+  ok: true, status: 200,
+  json: async () => ({ providers: [{ name: 'paid-toml', env_locked: [] }] }),
+};
+setEditing(false);
+await sandbox.editProvider('paid-toml');
+check('TOML-stored form marks the key as required',
+      /required/.test($('add-provider').innerHTML), $('add-provider').innerHTML.slice(0, 400));
+// Blank key on a TOML-stored provider must NOT PUT (the store would 400).
+fetchCalls = [];
+responsesByUrl = {};
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await sandbox._saveProvider();
+check('blank key on TOML-stored provider does not PUT',
+      !fetchCalls.some(c => c.url === '/admin/providers/paid-toml'));
+check('blank key on TOML-stored provider surfaces a message',
+      /API key/i.test($('pf-error').textContent), $('pf-error').textContent);
+
+// --- 20. ADD button clears stale edit state (finding 4) --------------------
+// Open an edit, then click Add: the Add form must not carry a stale
+// editingProviderName that would route its save to a PUT.
+resetFormEls();
+responsesByUrl = {};
+responsesByUrl['/admin/providers'] = {
+  ok: true, status: 200,
+  json: async () => ({
+    providers: [{
+      name: 'umans', upstream: 'https://u.example/v1', target: 3,
+      provider_type: 'generic', key_mode: 'env', api_key_env: 'UMANS_KEY',
+      auth_header: 'authorization', source: 'store', enabled: true,
+    }],
+  }),
+};
+responsesByUrl['/admin/config/effective'] = {
+  ok: true, status: 200,
+  json: async () => ({ providers: [{ name: 'umans', env_locked: [] }] }),
+};
+setEditing(false);
+await sandbox.editProvider('umans');
+check('precondition: edit set the editing name', getEditingName() === 'umans');
+// Now simulate the operator clicking "Add provider".
+sandbox.renderAddProvider({ providers: { umans: {} } });
+$('add-provider-btn').onclick();
+check('Add button clears editingProviderName',
+      getEditingName() === null, getEditingName());
+check('Add form title is Add (not Edit)',
+      /Add Provider/.test($('add-provider').innerHTML));
+// A save from the Add form must POST, not PUT.
+$('pf-name').value = 'fresh';
+$('pf-base').value = 'https://f.example';
+fetchCalls = [];
+responsesByUrl = {};
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await sandbox._saveProvider();
+check('Add-after-edit POSTs (not a stale PUT to the edited provider)',
+      fetchCalls.some(c => c.url === '/admin/providers' && c.opts.method === 'POST')
+      && !fetchCalls.some(c => c.url === '/admin/providers/umans'),
+      fetchCalls.map(c => c.url));
 
 // --- report ---------------------------------------------------------------
 let failed = 0;

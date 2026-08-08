@@ -180,6 +180,30 @@ are so Plans 015/016 behavior is unchanged.
 **Wave 2 — GUI (#1 + #4 surface)**
 - **WI-6**: Providers panel: list with live state (from status.json),
   add/edit/remove forms, key-mode indicator, test-connection button.
+
+  **WI-6 edit-provider form DONE 2026-08-08.** A per-card Edit button opens
+  the provider form pre-filled from `GET /admin/providers` (the masked store
+  row — the tier the PUT writes, not the env-merged view) and saves via the
+  existing `PUT /admin/providers/<name>`. Fields owned by an environment
+  variable (per `GET /admin/config/effective` `env_locked`, Plan 021 WI-7)
+  render disabled with a lock note — this is the env-lock input-disabling
+  WI-7's data was staged to serve. Write-only stored-key semantics: a blank
+  new-key field keeps the existing credential (`key_mode='stored'`, no
+  `api_key_stored`); a typed key rotates it. The full editable field set is
+  exposed (upstream, target, type, auth header/prefix, dashboard URL/token,
+  usage key env, enabled toggle). Name is read-only (it is the route key).
+  A deepseek adversarial pass then caught four issues, all fixed: (1) a
+  TOML-only provider's `type` was misread as `provider_type` and silently
+  rewritten to `generic` on save — the form now resolves `type` from either
+  key; (2) a TOML-only stored provider cannot keep-on-blank (no store row),
+  so the form marks the key required and blocks the PUT client-side; (3)
+  `account` is round-tripped so an edit does not reset it to `default`; (4)
+  a stale `editingProviderName` could route an Add-form save to a PUT for a
+  different provider — the Add button clears edit state, and a monotonic
+  token guards `editProvider`'s async render against reentrancy. Pinned by
+  `tests/gui/providers_form.mjs` (cases 11–20) through the python wrapper.
+  Add/remove were already WI-3/WI-4's API + the add form; the key-mode
+  indicator and per-provider test-connection pre-existed.
 - **WI-7**: Models panel: create/edit a model with per-provider aliases
   (the API exists; the panel gains an add flow + inline validation
   errors from the 400 responses).
@@ -267,10 +291,14 @@ Carried forward deliberately, not forgotten:
   the longer this waits, the larger the blast radius of the eventual
   fix, which argues for taking it as its own WI early in Wave 2 rather
   than as a rider on the last one.
-- **First PUT of a TOML-only provider** (finding 3, residual): the list
-  now exposes `key_mode`/`api_key_set` so the GUI can pre-fill, but the
-  API itself still accepts a full-row PUT that changes key_mode without
-  ceremony. Wave 2's form flow should require an explicit key decision.
+- **First PUT of a TOML-only provider** (finding 3, resolved GUI-side by
+  WI-6): the list exposes `key_mode`/`api_key_set`/`api_key_hint`, and the
+  edit form now pre-fills the credential block from that mode — stored keys
+  show the hint + a write-only "new key" field, env shows the var name,
+  passthrough says so explicitly. The GUI never silently drops a credential
+  on edit. The API itself still accepts a full-row PUT that changes key_mode
+  without ceremony (that is a server-side hardening item, deliberately left
+  to Plan 008's admin-plane work rather than a GUI rider).
 
 ## 5. What must not break (verify per wave)
 
