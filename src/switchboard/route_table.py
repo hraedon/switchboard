@@ -107,6 +107,21 @@ class RouteTableManager:
             return entry.providers
         return self._default_providers
 
+    def get_entry(self, hashed_key: str) -> tuple[str, ...] | None:
+        """Return the providers for a keyed entry, or None on no keyed match.
+
+        Unlike :meth:`lookup` (which returns the default route on a miss),
+        this distinguishes a keyed-route hit from the default fallback. HMAC
+        key rotation (Plan 008 §3) needs that distinction: the proxy tries
+        several hash candidates (new secret, then previous) and must know
+        whether each actually hit a keyed entry before falling back to the
+        default route.
+        """
+        entry = self._entries.get(hashed_key)
+        if entry is not None:
+            return entry.providers
+        return None
+
     def add_entry(
         self,
         hashed_key: str,

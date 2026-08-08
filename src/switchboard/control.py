@@ -11,6 +11,7 @@ Enforced by tests/test_import_boundary.py.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -242,9 +243,24 @@ class AdmissionPlan:
     reason: str
 
 
-def hash_route_key(raw_key: str) -> str:
-    """SHA-256 hash of the raw API key. Pure, deterministic."""
-    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+def hash_route_key(raw_key: str, secret: str | None = None) -> str:
+    """Hash a raw API key to its stored route identifier.
+
+    With no ``secret`` (the default, and the pre-HMAC behaviour) this is a
+    plain SHA-256 digest. With a ``secret`` it is HMAC-SHA-256, which defeats
+    rainbow-table matching of stored digests should the route-table store
+    leak: without the secret, a guessed API key cannot be confirmed against a
+    stored digest (Plan 008 §3). Rotation uses a bounded dual-read window —
+    the caller hashes with the new secret, and on a lookup miss retries with
+    the previous secret until stored entries are re-added under the new key.
+
+    Pure, deterministic, stdlib-only (``hashlib`` + ``hmac``).
+    """
+    if not secret:
+        return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    return hmac.new(
+        secret.encode("utf-8"), raw_key.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
 
 
 def extract_conversation_fingerprint(body: bytes) -> str | None:

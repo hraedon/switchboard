@@ -212,6 +212,38 @@ async def test_handle_route_add_hashes_key_and_persists() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_route_add_with_secret_stores_hmac_hash() -> None:
+    """When a route_key_secret is provided, the stored digest is the
+    HMAC-SHA-256 of the key (not the plain digest), so the proxy's dual-read
+    lookup matches it back and a leaked store resists rainbow-table matching."""
+    from switchboard.control import hash_route_key
+
+    mgr = RouteTableManager(default_providers=("umans",))
+    scope = _make_scope(
+        method="POST",
+        headers=[
+            (b"content-type", b"application/json"),
+            (b"authorization", b"Bearer admin-secret"),
+            (b"sec-fetch-site", b"same-origin"),
+        ],
+    )
+    body = json.dumps({"key": "sk-test-key", "providers": ["umans"]}).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_route_add(
+        send, receive, mgr, "admin-secret", scope,
+        route_key_secret="route-hmac-secret",
+    )
+    status, resp_body = _parse_response(messages)
+    assert status == 200
+    data = json.loads(resp_body)
+    expected = hash_route_key("sk-test-key", "route-hmac-secret")
+    assert data["key"] == expected
+    assert data["key"] != hash_route_key("sk-test-key")  # not the plain digest
+    assert mgr.lookup(expected) == ("umans",)
+
+
+@pytest.mark.asyncio
 async def test_handle_route_add_invalid_json_returns_400() -> None:
     mgr = RouteTableManager(default_providers=("umans",))
     scope = _make_scope(

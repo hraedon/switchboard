@@ -1,8 +1,8 @@
 # Plan 008 — Production routing contracts and deployment shape
 
 Status: **partially implemented** — capability contract, capability
-filtering, stickiness/failback and the failure/replay boundary shipped;
-identity-HMAC, explicit modes, versioned config, singleton lifecycle,
+filtering, stickiness/failback, the failure/replay boundary, and route-key
+HMAC shipped; explicit modes, versioned config, singleton lifecycle,
 credential-broker protocol and admin-plane isolation did not
 
 Landed:
@@ -27,6 +27,20 @@ Landed:
   receives its own stored credential via `api_key_env` (commit 6f6591b);
   `test_each_provider_receives_its_own_credential` in
   `tests/test_usage_reroute.py`.
+- §3 route-key HMAC (WI-008.3b, DONE 2026-08-08): `hash_route_key` is
+  HMAC-SHA-256 when a `SWITCHBOARD_ROUTE_KEY_SECRET` is set, plain SHA-256
+  when not (full backward compatibility). Rotation uses
+  `SWITCHBOARD_ROUTE_KEY_SECRET_PREV` for a bounded dual-read window: the
+  proxy's `_match_route` returns the providers AND the matched digest
+  (current or previous secret), and `route_decision` re-resolves by that
+  digest so a legacy entry matched under the previous secret is not silently
+  dropped to the default route. Env-only sourcing (secrets must not sit in
+  committed TOML); the secret is never logged, serialized, or sent upstream.
+  A boot warning fires when HMAC is enabled with existing keyed entries,
+  since entries hashed without a secret (TOML `[route.*]`, pre-HMAC SQLite
+  rows) stop matching and must be re-added. Pure-core (`control.py`) stays
+  stdlib-only (`hashlib` + `hmac`). Tests in `test_control.py`,
+  `test_route_table.py`, `test_proxy.py`, `test_admin.py`, `test_cli.py`.
 
 Not landed:
 
@@ -36,8 +50,6 @@ Not landed:
   validator.
 - §2 explicit operating modes and §2.3 mode gate: no transparent/broker mode
   selection or startup mode validation.
-- §3 route identifiers as HMAC-SHA-256 with a rotatable route-index key:
-  `hash_route_key` (`src/switchboard/control.py`) is plain unkeyed SHA-256.
 - WI-008.6 singleton/fenced production lifecycle: no leadership lease,
   leadership-aware readiness, or *leadership-tied* drain. Note that a
   graceful-shutdown drain IS shipped and tested — `--drain-timeout`

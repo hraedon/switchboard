@@ -170,6 +170,98 @@ def test_extract_route_key_bearer_is_case_insensitive() -> None:
     assert _extract_route_key(scope) == "sk-test-key"
 
 
+# ── HMAC route-key rotation (Plan 008 §3) ──────────────────────────────────
+def _make_app_with_secrets(
+    secrets: tuple[str, ...],
+    default_providers: tuple[str, ...] = ("default-prov",),
+) -> ProxyApp:
+    route_table = RouteTableManager(default_providers=default_providers)
+    return ProxyApp(
+        providers={"test": _make_provider_context()},
+        route_table=route_table,
+        routing_config=RoutingConfig(),
+        route_key_secrets=secrets,
+    )
+
+
+def test_match_route_no_secrets_is_plain_sha256_lookup() -> None:
+    """No secrets = the pre-HMAC path: an entry hashed with plain SHA-256
+    matches, and an unknown key falls to the default (backward compat)."""
+    from switchboard.control import hash_route_key
+
+    app = _make_app_with_secrets(())
+    app._route_table.add_entry(hash_route_key("sk-keyed"), ["a", "b"])
+    providers, matched_hash = app._match_route("sk-keyed")
+    assert providers == ("a", "b")
+    assert matched_hash == hash_route_key("sk-keyed")
+    providers, matched_hash = app._match_route("sk-unknown")
+    assert providers == ("default-prov",)
+    # No keyed match → default; the returned hash is the plain digest.
+    assert matched_hash == hash_route_key("sk-unknown")
+
+
+def test_match_route_hmac_entry_matches_under_current_secret() -> None:
+    from switchboard.control import hash_route_key
+
+    app = _make_app_with_secrets(("current-secret",))
+    app._route_table.add_entry(
+        hash_route_key("sk-keyed", "current-secret"), ["a", "b"]
+    )
+    # A plain-SHA-256 entry would NOT match (the secret changes the digest),
+    # proving the secret actually participates in the lookup.
+    providers, matched_hash = app._match_route("sk-keyed")
+    assert providers == ("a", "b")
+    assert matched_hash == hash_route_key("sk-keyed", "current-secret")
+
+
+def test_match_route_rotation_dual_read_matches_previous_secret() -> None:
+    """The bounded dual-read window: an entry hashed under the PREVIOUS
+    secret still routes while both secrets are active, so rotation does not
+    drop traffic for keys not yet re-added under the new secret."""
+    from switchboard.control import hash_route_key
+
+    app = _make_app_with_secrets(("new-secret", "old-secret"))
+    legacy_hash = hash_route_key("sk-legacy", "old-secret")
+    app._route_table.add_entry(legacy_hash, ["legacy-prov"])
+    providers, matched_hash = app._match_route("sk-legacy")
+    assert providers == ("legacy-prov",)
+    # The matched digest is the one under which the entry was actually found
+    # (the PREVIOUS secret's), NOT the current secret's — route_decision
+    # re-resolves by this digest, so returning the current-secret hash here
+    # would miss and silently fall to the default (review finding 1).
+    assert matched_hash == legacy_hash
+    assert matched_hash != hash_route_key("sk-legacy", "new-secret")
+
+
+def test_match_route_current_secret_takes_priority_over_previous() -> None:
+    """When a key exists under both secrets (mid-rotation, re-added), the
+    current-secret entry wins — so the operator's re-add is authoritative."""
+    from switchboard.control import hash_route_key
+
+    app = _make_app_with_secrets(("new-secret", "old-secret"))
+    app._route_table.add_entry(
+        hash_route_key("sk-shared", "old-secret"), ["old-prov"]
+    )
+    new_hash = hash_route_key("sk-shared", "new-secret")
+    app._route_table.add_entry(new_hash, ["new-prov"])
+    providers, matched_hash = app._match_route("sk-shared")
+    assert providers == ("new-prov",)
+    assert matched_hash == new_hash
+
+
+def test_match_route_falls_to_default_when_no_keyed_match_under_any_secret() -> None:
+    from switchboard.control import hash_route_key
+
+    app = _make_app_with_secrets(("new-secret", "old-secret"))
+    app._route_table.add_entry(
+        hash_route_key("sk-someone-else", "new-secret"), ["a"]
+    )
+    # A key that matches no entry under either secret hits the default route.
+    providers, matched_hash = app._match_route("sk-unmatched")
+    assert providers == ("default-prov",)
+    assert matched_hash == hash_route_key("sk-unmatched", "new-secret")
+
+
 def test_routing_metrics_record_decision_tracks_failovers() -> None:
     metrics = RoutingMetrics()
     metrics.record_decision("key1", "umans", "umans")

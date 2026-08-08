@@ -399,6 +399,7 @@ class ProxyApp:
         toml_provider_sections: dict[str, dict[str, Any]] | None = None,
         env_field_sources: dict[str, dict[str, str]] | None = None,
         unmatched_env: list[str] | None = None,
+        route_key_secrets: tuple[str, ...] = (),
     ) -> None:
         self._provider_manager = ProviderManager(
             providers, drain_timeout=drain_timeout
@@ -421,6 +422,11 @@ class ProxyApp:
         self._unmatched_env = unmatched_env or []
         self._route_table = route_table
         self._routing_config = routing_config or RoutingConfig()
+        # Route-key HMAC secrets (Plan 008 §3), ordered current-first then any
+        # previous secret for the rotation dual-read window. Empty tuple =
+        # plain SHA-256 (the pre-HMAC behaviour, full backward compat). The
+        # first element is the "current" secret used to hash newly-added keys.
+        self._route_key_secrets = tuple(route_key_secrets)
         self._admin_token = admin_token
         self._queue_timeout = queue_timeout
         self._drain_timeout = drain_timeout
@@ -465,6 +471,33 @@ class ProxyApp:
         view even while providers are added or removed mid-request.
         """
         return self._provider_manager.providers
+
+    def _match_route(self, raw_key: str) -> tuple[tuple[str, ...], str]:
+        """Resolve ``(providers, matched_hashed_key)`` for a raw API key under
+        HMAC rotation.
+
+        Tries each active route-key secret in order (current, then any
+        previous secret for the dual-read window) against the keyed entries;
+        the first keyed hit wins and its digest is returned. With no keyed
+        match under any secret the request falls through to the default route
+        (Plan 008 §3) and the primary-secret digest is returned. With no
+        secrets configured this is plain SHA-256 lookup — byte-for-byte the
+        pre-HMAC behaviour, so an unconfigured deployment is unchanged.
+
+        The matched digest (not always the current-secret one) is what
+        ``route_decision`` re-resolves the entry by, so it must be the digest
+        that actually hit — otherwise a legacy entry matched under the
+        previous secret would be re-resolved under the current secret, miss,
+        and silently fall back to the default route mid-rotation.
+        """
+        for secret in self._route_key_secrets:
+            h = hash_route_key(raw_key, secret)
+            keyed = self._route_table.get_entry(h)
+            if keyed is not None:
+                return keyed, h
+        primary = self._route_key_secrets[0] if self._route_key_secrets else None
+        h = hash_route_key(raw_key, primary)
+        return self._route_table.lookup(h), h
 
     @property
     def provider_manager(self) -> ProviderManager:
@@ -615,6 +648,7 @@ class ProxyApp:
                     send, receive, self._route_table,
                     self._admin_token, scope, self._cors_allow_origin,
                     self._providers,
+                    self._route_key_secrets[0] if self._route_key_secrets else None,
                 )
                 return
             await send_text(send, 405, "Method not allowed")
@@ -988,8 +1022,12 @@ class ProxyApp:
             return
 
         raw_key = _extract_route_key(scope)
-        hashed_key = hash_route_key(raw_key)
-        candidates = self._route_table.lookup(hashed_key)
+        # _match_route returns the providers AND the digest under which a
+        # keyed entry was actually found (current secret, or the previous
+        # secret during the rotation dual-read window). route_decision
+        # re-resolves the entry by that digest, so it must be the matched
+        # one — not always the current-secret hash.
+        candidates, hashed_key = self._match_route(raw_key)
 
         if not candidates:
             await send_json(

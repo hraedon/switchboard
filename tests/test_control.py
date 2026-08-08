@@ -233,6 +233,36 @@ def test_hash_route_key_never_returns_raw() -> None:
     assert raw not in hashed
 
 
+def test_hash_route_key_no_secret_is_plain_sha256() -> None:
+    """No secret = plain SHA-256 (Plan 008 §3 backward compatibility). An
+    unconfigured deployment and a nil secret must produce byte-identical
+    digests so existing route-table entries keep matching."""
+    import hashlib
+
+    raw = "sk-legacy"
+    assert hash_route_key(raw) == hash_route_key(raw, None)
+    assert hash_route_key(raw) == hash_route_key(raw, "")
+    assert hash_route_key(raw) == hashlib.sha256(raw.encode()).hexdigest()
+
+
+def test_hash_route_key_hmac_differs_from_plain() -> None:
+    """A keyed HMAC must not equal the unkeyed digest — otherwise the secret
+    adds no defense against rainbow-table matching of a leaked store."""
+    raw = "sk-secret"
+    assert hash_route_key(raw, "route-hmac-key") != hash_route_key(raw)
+
+
+def test_hash_route_key_hmac_secret_dependent() -> None:
+    """Different secrets yield different digests for the same key (rotation
+    changes the stored identity), and the same secret is stable."""
+    raw = "sk-secret"
+    a = hash_route_key(raw, "secret-a")
+    b = hash_route_key(raw, "secret-b")
+    assert a != b
+    assert a == hash_route_key(raw, "secret-a")
+    assert len(a) == 64
+
+
 def test_route_table_lookup_uses_entry() -> None:
     entry = RouteEntry(key="abc123", providers=("ollama", "umans"))
     table = RouteTable(entries={"abc123": entry}, default_providers=("umans", "ollama"))
