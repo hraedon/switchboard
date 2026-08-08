@@ -110,6 +110,23 @@ carries the upstream's status and `Retry-After`. Reroutes are counted in `/statu
 `switchboard_usage_reroutes_from_total{provider=...}` — the operational
 question being "who is running out".
 
+## Pointing a client at switchboard
+
+Point it the way you would point it at any OpenAI-compatible endpoint:
+
+```jsonc
+"options": { "baseURL": "https://switchboard.<host>/v1" }
+```
+
+No switchboard-specific configuration. Switchboard composes each upstream
+URL from the provider's own API root, so providers with different path shapes
+(`/zen/go/v1`, `/v1`, `/v4`) all serve one route without the client knowing.
+The rule, in full: **the provider base declares the version if it has one** —
+a leading version on the client's path is dropped only when the base already
+ends in one. A version-free client base works too.
+
+See [docs/deployment.md](docs/deployment.md) for how to configure `upstream`.
+
 ## The default route
 
 The default route is where a request goes when no route key matches it — in

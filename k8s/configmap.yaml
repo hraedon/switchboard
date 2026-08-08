@@ -38,11 +38,19 @@ data:
     # to start if a declared variable is absent or empty (fail-closed): it will
     # never fall back to forwarding the client's own credential upstream.
 
-    # Each upstream is the provider's COMPLETE API root, because switchboard
-    # appends the client's path verbatim. Clients must therefore be pointed at
-    # switchboard WITHOUT a version prefix and send /chat/completions. See
-    # docs/deployment.md — this is what lets providers with different path
-    # shapes (z.ai has no /v1) share one route.
+    # Each upstream is the provider's COMPLETE API root, exactly as the vendor
+    # documents it — including its version segment, whatever that is. Since
+    # Plan 021 switchboard COMPOSES rather than concatenates: when the base
+    # ends in a version, a leading version on the client's path is redundant
+    # and dropped. That is what lets providers with different path shapes
+    # (z.ai is /v4, opencode is /zen/go/v1) share one route.
+    #
+    # Clients need no accommodation: point them at
+    # https://switchboard.k8s.hraedon.com/v1 like any OpenAI-compatible
+    # endpoint. The older version-free form still works.
+    #
+    # A base with NO version segment keeps the client's — so a bare host is
+    # also valid, and the client's /v1 passes through to the upstream.
     [provider.opencode-go]
     upstream = "https://opencode.ai/zen/go/v1"
     type = "generic"

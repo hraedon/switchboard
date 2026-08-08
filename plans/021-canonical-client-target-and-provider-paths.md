@@ -1,6 +1,6 @@
 # Plan 021 — One canonical client target, per-provider paths
 
-Status: proposed
+Status: Wave 1 landed; Waves 2-3 proposed
 Supersedes: the "clients must omit the version prefix" contract in
 `k8s/configmap.yaml` and `docs/deployment.md`.
 
@@ -75,6 +75,19 @@ upstream URL becomes `provider_base + "/" + endpoint`.
 A leading segment is treated as a version prefix when it matches
 `^v\d+(?:[a-z]+\d*)?$` — `v1`, `v2`, `v1beta`. **At most one** segment is
 stripped, and only in leading position. Everything else is endpoint.
+
+**Refined during implementation:** the prefix is dropped *only when the
+base's own last segment is a version*. The rule reads: **the base
+declares the version if it has one.**
+
+The first draft stripped unconditionally, and that was wrong. A base with
+no version (`https://api.example.com`) relying on the client to supply
+`/v1` is a configuration that **works today** — unconditional stripping
+would have composed `https://api.example.com/chat/completions` and broken
+it. Conditioning on the base makes the compatibility claim below true for
+every working configuration rather than merely for the documented one,
+which is the claim that actually matters for something in the request
+path.
 
 This is what makes D4 work: because the endpoint no longer carries a
 version, the provider base is free to carry whatever version *it* uses,
@@ -166,23 +179,23 @@ the declared config becomes authoritative again — plus a
 `SWITCHBOARD_CONFIG_RESET` env var doing the same at boot for the case
 where the API is unreachable. Both log loudly.
 
-**Open question for Paul:** should mounted TOML also beat the store, or
-only env? Env-only keeps the GUI meaningful (its edits persist across
-restarts, which is the point of Plan 020) and makes the configmap purely
-a seed. TOML-wins would make the configmap the source of truth and
-reduce the GUI to a live-tuning surface whose changes vanish on restart.
-D6 as written assumes **env-only**, with D7's reset as the escape hatch.
+**DECIDED by Paul 2026-08-08: env-only, plus reset.** Mounted TOML does
+not beat the store — the GUI stays meaningful, its edits persist across
+restarts (the point of Plan 020), and the configmap is a seed. Recovery
+is D7's explicit reset rather than an implicit precedence rule, so
+reclaiming state is always a deliberate, logged act rather than a
+surprise on the next rollout.
 
 ## 4. Work items
 
-**Wave 1 — the contract**
-- **WI-1**: Path composition per D2 — a pure function
+**Wave 1 — the contract — DONE 2026-08-08**
+- **WI-1 (done)**: Path composition per D2 — a pure function
   (`compose_upstream_path(base, client_path) -> str`) in the stdlib-only
   core, with table-driven tests covering: version stripped, no version,
   nested endpoints, query strings preserved, `/v1` appearing *inside* the
   endpoint (must not be stripped twice), trailing slashes, and the three
   live provider shapes as literal cases. Wire into `_build_url`.
-- **WI-2**: Update `k8s/configmap.yaml`, `docs/deployment.md`, and the
+- **WI-2 (done)**: Update `k8s/configmap.yaml`, `docs/deployment.md`, and the
   README to state the canonical target. Delete the "clients must omit the
   version prefix" instruction. `docs/deployment.md` is **separately
   stale** — it still documents the `--build-context sluice=../sluice`

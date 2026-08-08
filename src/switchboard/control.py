@@ -11,6 +11,7 @@ Enforced by tests/test_import_boundary.py.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -227,6 +228,54 @@ class AdmissionPlan:
 def hash_route_key(raw_key: str) -> str:
     """SHA-256 hash of the raw API key. Pure, deterministic."""
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+#: A path segment that names an API version: v1, v2, v1beta, v1alpha2.
+_VERSION_SEGMENT = re.compile(r"^v\d+(?:[a-z]+\d*)?$")
+
+
+def compose_upstream_path(base: str, client_path: str) -> str:
+    """Compose an upstream URL from a provider base and the client's path.
+
+    Plan 021 D2. Clients must not have to accommodate switchboard: pointing
+    one at ``https://switchboard.<host>/v1`` — the shape every
+    OpenAI-compatible ``baseURL`` conventionally takes — has to work. But the
+    provider base is most useful when it can be pasted verbatim from the
+    vendor's own quickstart, and those usually already end in a version
+    (``https://ollama.com/v1``, ``.../zen/go/v1``, ``.../paas/v4``). Naive
+    concatenation doubles the version and 404s.
+
+    **The base declares the version if it has one.** When the base's last
+    segment looks like a version, a leading version segment on the client
+    path is redundant and is dropped. When the base carries no version, the
+    client's is preserved — that is what keeps a bare-host base (the natural
+    OpenAI-style setup, working today) working unchanged.
+
+    At most one segment is ever dropped, and only in leading position, so a
+    ``v1`` appearing later in an endpoint is left alone.
+
+        >>> compose_upstream_path("https://ollama.com/v1", "/v1/chat/completions")
+        'https://ollama.com/v1/chat/completions'
+        >>> compose_upstream_path("https://api.example.com", "/v1/chat/completions")
+        'https://api.example.com/v1/chat/completions'
+
+    Pure and deterministic: no I/O, no network, no clock.
+    """
+    base = base.rstrip("/")
+    path, sep, query = client_path.partition("?")
+
+    segments = [s for s in path.split("/") if s]
+
+    base_tail = base.rsplit("/", 1)[-1]
+    if (
+        segments
+        and _VERSION_SEGMENT.match(segments[0])
+        and _VERSION_SEGMENT.match(base_tail)
+    ):
+        segments = segments[1:]
+
+    composed = base + ("/" + "/".join(segments) if segments else "")
+    return composed + (sep + query if sep else "")
 
 
 def _satisfies_capabilities(

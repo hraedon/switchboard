@@ -80,6 +80,7 @@ from switchboard.control import (
     RouteAffinity,
     RoutingConfig,
     SignalFreshness,
+    compose_upstream_path,
     hash_route_key,
     route_decision,
     should_reroute,
@@ -1896,13 +1897,22 @@ class ProxyApp:
                     await watcher_task
 
     def _build_url(self, ctx: ProviderContext, scope: Scope) -> str:
-        """Build the upstream URL from the provider's base URL + path + query."""
-        upstream = ctx.upstream_url.rstrip("/")
+        """Build the upstream URL from the provider's base URL + path + query.
+
+        Composition (not concatenation) since Plan 021: the provider base
+        declares the API version when it carries one, so a client sending the
+        conventional ``/v1/...`` is not forced to drop it. See
+        :func:`switchboard.control.compose_upstream_path`.
+
+        Called once per attempt by the reroute loop, so a request that moves
+        to another provider composes against THAT provider's base — the whole
+        point, since the two rarely share a path shape.
+        """
         path: str = scope["path"]
         qs: bytes = scope.get("query_string", b"")
         if qs:
             path += "?" + qs.decode("latin-1")
-        return upstream + path
+        return compose_upstream_path(ctx.upstream_url, path)
 
     @staticmethod
     def _apply_provider_credential(
