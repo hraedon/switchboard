@@ -431,6 +431,24 @@ class TestServeKeyStartup:
         )
         assert app._routing_config.pin_conversations is True
 
+    def test_route_key_secret_env_threads_to_app(self, tmp_path, monkeypatch) -> None:
+        """SWITCHBOARD_ROUTE_KEY_SECRET (and _PREV) reach the ProxyApp as the
+        ordered secrets tuple (Plan 008 §3). Env-only by design — a credential
+        must not sit in committed TOML."""
+        cfg = _write_serve_config(tmp_path, _SERVE_PROVIDER)
+        monkeypatch.setenv("SWITCHBOARD_ROUTE_KEY_SECRET", "current-hmac")
+        monkeypatch.setenv("SWITCHBOARD_ROUTE_KEY_SECRET_PREV", "previous-hmac")
+        app, _, _, _, _ = _build_serve_app(_serve_args(config=cfg))
+        assert app._route_key_secrets == ("current-hmac", "previous-hmac")
+
+    def test_route_key_secret_absent_is_empty_tuple(self, tmp_path, monkeypatch) -> None:
+        """No env vars = no secrets = plain SHA-256 (backward compat)."""
+        cfg = _write_serve_config(tmp_path, _SERVE_PROVIDER)
+        monkeypatch.delenv("SWITCHBOARD_ROUTE_KEY_SECRET", raising=False)
+        monkeypatch.delenv("SWITCHBOARD_ROUTE_KEY_SECRET_PREV", raising=False)
+        app, _, _, _, _ = _build_serve_app(_serve_args(config=cfg))
+        assert app._route_key_secrets == ()
+
     def test_valid_config_starts(self, tmp_path) -> None:
         cfg = _write_serve_config(
             tmp_path,

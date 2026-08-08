@@ -1062,6 +1062,47 @@ def _build_serve_app(
             "to a finite limit (unbounded buffering is a memory risk)"
         )
 
+    # Route-key HMAC secret (Plan 008 §3). Env-only by design — a credential
+    # must not sit in a committed TOML. SWITCHBOARD_ROUTE_KEY_SECRET is the
+    # current key; SWITCHBOARD_ROUTE_KEY_SECRET_PREV is the previous key,
+    # kept for a bounded dual-read window so stored entries hashed under the
+    # old key still route until they are re-added under the new one. Absent
+    # both, route keys are plain SHA-256 (full backward compatibility).
+    # Values are stripped so a stray-whitespace env value ("  ") cannot
+    # become a degenerate, trivially-guessable HMAC key.
+    route_key_secrets = tuple(
+        s
+        for s in (
+            v.strip() if isinstance(v, str) else None
+            for v in (
+                os.environ.get("SWITCHBOARD_ROUTE_KEY_SECRET"),
+                os.environ.get("SWITCHBOARD_ROUTE_KEY_SECRET_PREV"),
+            )
+        )
+        if s
+    )
+    if route_key_secrets:
+        log.info(
+            "route-key HMAC enabled (%d active secret%s)",
+            len(route_key_secrets),
+            "" if len(route_key_secrets) == 1 else "s",
+        )
+        # Enabling HMAC changes the digest every stored entry must match. Any
+        # entry hashed without a secret (TOML [route.*] sections are always
+        # plain digests; SQLite rows written before HMAC was enabled are too)
+        # will stop matching and silently fall to the default route. The
+        # dual-read window covers secret-A → secret-B rotation, NOT the
+        # plain→HMAC adoption — warn so the operator re-adds them.
+        existing = route_table.list_entries()
+        if existing:
+            log.warning(
+                "route-key HMAC enabled with %d existing keyed route(s); "
+                "entries hashed without a secret will no longer match — "
+                "re-add them via POST /admin/routes so they are stored "
+                "under the HMAC key",
+                len(existing),
+            )
+
     app = ProxyApp(
         providers=providers,
         route_table=route_table,
@@ -1084,6 +1125,7 @@ def _build_serve_app(
         toml_provider_sections=toml_provider_sections,
         env_field_sources=env_field_sources,
         unmatched_env=unmatched_env,
+        route_key_secrets=route_key_secrets,
     )
 
     store_backed = {

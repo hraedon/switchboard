@@ -170,8 +170,13 @@ class RouteTable:
 ```
 
 The routing key is derived from the request's `Authorization` header (or
-`x-api-key`). The key is **hashed** (SHA-256) before lookup — switchboard never
-stores or logs the raw API key. The hash is the route table key.
+`x-api-key`). The key is **hashed** before lookup — switchboard never stores
+or logs the raw API key. The hash is the route table key. With no
+`SWITCHBOARD_ROUTE_KEY_SECRET` configured the hash is plain SHA-256; with a
+secret it is HMAC-SHA-256 (Plan 008 §3), which defeats rainbow-table matching
+of stored digests should the route-table store leak. Rotation is supported via
+`SWITCHBOARD_ROUTE_KEY_SECRET_PREV`: the proxy tries the current secret's
+HMAC, then the previous secret's, before falling back to the default route.
 
 ### Persistence (WI-006.7)
 

@@ -17,6 +17,21 @@ def test_lookup_returns_entry_providers_when_key_matches() -> None:
     assert mgr.lookup("abc123") == ("ollama", "umans")
 
 
+def test_get_entry_distinguishes_keyed_match_from_default() -> None:
+    """get_entry returns None on a keyed miss (unlike lookup, which returns
+    the default). HMAC rotation needs that distinction to try multiple hash
+    candidates before settling for the default route."""
+    mgr = RouteTableManager(default_providers=("umans", "ollama"))
+    mgr.add_entry("abc123", ["ollama", "umans"])
+    assert mgr.get_entry("abc123") == ("ollama", "umans")
+    assert mgr.get_entry("not-a-keyed-entry") is None
+
+
+def test_get_entry_with_no_default_still_none_on_miss() -> None:
+    mgr = RouteTableManager()
+    assert mgr.get_entry("anything") is None
+
+
 def test_add_entry_adds_and_persists_in_memory() -> None:
     mgr = RouteTableManager(default_providers=("umans",))
     mgr.add_entry("key1", ["umans", "ollama"])

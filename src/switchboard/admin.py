@@ -747,11 +747,15 @@ async def handle_route_add(
     scope: Scope,
     cors_allow_origin: str | None = None,
     providers: dict[str, ProviderContext] | None = None,
+    route_key_secret: str | None = None,
 ) -> None:
     """POST /admin/routes — add or update a route entry.
 
     Body: ``{"key": "<raw API key>", "providers": ["umans", "ollama"]}``
     The server hashes the key before storing. The raw key is never persisted.
+    When ``route_key_secret`` is set the hash is HMAC-SHA-256 (Plan 008 §3),
+    so the stored digest cannot be matched to a guessed key without the
+    secret; the proxy's dual-read lookup matches it back on the next request.
     """
     cors = cors_extra_headers(cors_allow_origin, None)
     if not admin_token:
@@ -847,7 +851,7 @@ async def handle_route_add(
 
     from switchboard.control import hash_route_key
 
-    hashed = hash_route_key(raw_key)
+    hashed = hash_route_key(raw_key, route_key_secret)
     route_table.add_entry(hashed, providers_raw)
 
     log.info("route added: %s -> %s", hashed[:16] + "...", providers_raw)
