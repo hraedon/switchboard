@@ -218,6 +218,28 @@ function renderDefaultRouteForm(current, known) {
 // `editingProvider` freezes this section while the form is open, so a poll
 // landing mid-edit cannot discard what was typed.
 let editingProvider = false;
+// null  → add mode (POST /admin/providers).
+// name  → edit mode (PUT /admin/providers/<name>); the name is the path key
+//         and is not editable. Set by editProvider() before renderProviderForm.
+let editingProviderName = null;
+// Section-key Set of fields an environment variable owns for the provider
+// being edited (Plan 021 WI-7 provenance). A locked field renders disabled:
+// editing it here would be discarded at the next restart because env > store.
+let editEnvLocked = null;
+// The edited provider's current key_mode. The edit form does not offer a
+// mode switcher — it renders the credential input appropriate to the existing
+// mode — so _saveProvider reads this to send the right key_mode without
+// depending on which credential input elements happen to be in the DOM.
+let editingKeyMode = null;
+// Round-trip helpers for fields the form does not expose but must not clobber:
+// `account` (Plan 019 forward-compat column) and the TOML-stored flag (a
+// TOML-only stored provider has no store row, so keep-on-blank is impossible).
+let editingAccount = null;
+let editingTomlStored = false;
+// Monotonic token guarding editProvider's async fetch-then-render against
+// reentrancy (double-click, or an Edit racing an Add). The latest opener
+// bumps it; a late render whose captured token is stale is a no-op.
+let editToken = 0;
 let registryCache = null;
 
 function renderAddProvider(_data) {
@@ -233,7 +255,17 @@ function renderAddProvider(_data) {
       <button id="add-provider-btn">Add provider</button>
     </div>`;
   const btn = document.getElementById('add-provider-btn');
-  if (btn) btn.onclick = () => { editingProvider = true; renderProviderForm(); };
+  if (btn) btn.onclick = () => {
+    // Clear any stale edit state so an Add-form save cannot route to a PUT
+    // for a provider that was being edited when the operator switched to
+    // Add (review finding 4: cross-provider config clobber). Bump editToken
+    // so an in-flight editProvider render cannot overwrite this Add form.
+    editToken = (editToken || 0) + 1;
+    editingProvider = true; editingProviderName = null;
+    editEnvLocked = null; editingKeyMode = null;
+    editingAccount = null; editingTomlStored = false;
+    renderProviderForm();
+  };
 }
 
 async function _loadRegistry() {
@@ -245,22 +277,136 @@ async function _loadRegistry() {
   return registryCache || [];
 }
 
-function renderProviderForm() {
+function renderProviderForm(existing) {
   const el = document.getElementById('add-provider');
-  el.innerHTML = `
-    <h2>Add Provider</h2>
-    <div class="card">
+  const editing = !!existing;
+  const locked = editEnvLocked || new Set();
+  // `locked` uses provider-section keys (upstream, target, type, enabled, …)
+  // as produced by env_config; map each form field through that vocabulary.
+  const isLocked = (sectionKey) => editing && locked.has(sectionKey);
+  const lockNote = '<span style="color:var(--amber);font-size:0.75rem">'
+    + '&#128274; env-locked — owned by a Deployment variable; '
+    + 'a GUI edit is discarded at restart</span>';
+  const lockAttr = (sectionKey) => isLocked(sectionKey) ? ' disabled' : '';
+  // In edit mode every managed field is sent on PUT (the store's upsert
+  // requires upstream/provider_type/target/key_mode verbatim and does not
+  // merge), so locked inputs keep their prefilled value — re-sending it is
+  // a no-op for the store and env still wins at boot.
+
+  const title = editing ? 'Edit Provider' : 'Add Provider';
+  // Store rows expose `provider_type`; TOML sections expose the TOML key
+  // `type` (see _masked_toml_section). Resolve from either so a TOML
+  // provider's real type is not silently rewritten to 'generic' on save,
+  // which would create a store row shadowing the TOML section wholesale.
+  const ptype = editing ? (existing.provider_type || existing.type || 'generic') : 'generic';
+  // TOML-only providers have no store row yet: the store's write-only
+  // "absent key means keep" branch needs an existing row, so a TOML
+  // provider with an inline api_key (stored) cannot keep-on-blank — the
+  // browser never had the credential and the store has no copy. Detect
+  // that so the credential block and save validation are honest about it.
+  const tomlStored = editing && existing.source === 'toml' && (existing.key_mode === 'stored');
+
+  // Credential block differs by key_mode in edit mode. In add mode the form
+  // only offers the env path (the recommended mode); edit mode must also
+  // represent stored keys (write-only: leave blank to keep) and passthrough.
+  let credBlock;
+  const km = editing ? (existing.key_mode || 'passthrough') : null;
+  if (editing && km === 'stored') {
+    const hint = existing.api_key_hint ? 'ending ' + esc(existing.api_key_hint) : 'set';
+    // A TOML-only stored provider has no store row: blank-on-save cannot
+    // keep (the store has no credential to retain), so the operator must
+    // re-enter the full key. Store-source providers keep-on-blank as normal.
+    const keyLabel = tomlStored
+      ? 'API key (required — re-enter; the store has no copy of this TOML key)'
+      : 'New API key (leave blank to keep current)';
+    credBlock = `
+      <div class="form-row">
+        <label>API key</label>
+        <span style="color:var(--muted);font-size:0.85rem">stored (${hint}) — write-only</span>
+      </div>
+      <div class="form-row">
+        <label for="pf-key-new">${esc(keyLabel)}</label>
+        <input id="pf-key-new" type="password" autocomplete="off">
+      </div>`;
+  } else if (editing && km === 'passthrough') {
+    credBlock = `
+      <div class="form-row">
+        <label>API key</label>
+        <span style="color:var(--muted);font-size:0.85rem">passthrough — no credential; the client&apos;s key is forwarded</span>
+      </div>`;
+  } else {
+    const envVal = editing ? esc(existing.api_key_env || '') : '';
+    credBlock = `
+      <div class="form-row">
+        <label for="pf-key-env">API key env var (name only — value stays server-side)</label>
+        <input id="pf-key-env" autocomplete="off" placeholder="e.g. SWITCHBOARD_OLLAMA_KEY"
+          value="${envVal}"${lockAttr('api_key_env')}>
+        ${isLocked('api_key_env') ? lockNote : ''}
+      </div>`;
+  }
+
+  // Edit-only fields. The quick-add form relies on server defaults for these;
+  // editing is where an operator tunes the full row (Plan 020 WI-6).
+  const editExtras = editing ? `
+      <div class="form-row">
+        <label for="pf-type">Provider type</label>
+        <input id="pf-type" autocomplete="off" value="${esc(ptype)}"${lockAttr('type')}>
+        ${isLocked('type') ? lockNote : ''}
+      </div>
+      <div class="form-row">
+        <label for="pf-auth-prefix">Auth prefix</label>
+        <input id="pf-auth-prefix" autocomplete="off" placeholder="e.g. Bearer"
+          value="${esc(existing.auth_prefix || '')}"${lockAttr('auth_prefix')}>
+        ${isLocked('auth_prefix') ? lockNote : ''}
+      </div>
+      <div class="form-row">
+        <label for="pf-dashboard-url">Usage dashboard URL (optional)</label>
+        <input id="pf-dashboard-url" autocomplete="off" placeholder="https://dashboard/v1"
+          value="${esc(existing.dashboard_url || '')}"${lockAttr('dashboard_url')}>
+        ${isLocked('dashboard_url') ? lockNote : ''}
+      </div>
+      <div class="form-row">
+        <label for="pf-dashboard-token-env">Dashboard token env var (optional)</label>
+        <input id="pf-dashboard-token-env" autocomplete="off"
+          value="${esc(existing.dashboard_token_env || '')}"${lockAttr('dashboard_token_env')}>
+        ${isLocked('dashboard_token_env') ? lockNote : ''}
+      </div>
+      <div class="form-row">
+        <label for="pf-usage-key-env">Usage key env var (optional)</label>
+        <input id="pf-usage-key-env" autocomplete="off"
+          value="${esc(existing.usage_key_env || '')}"${lockAttr('usage_key_env')}>
+        ${isLocked('usage_key_env') ? lockNote : ''}
+      </div>
+      <div class="form-row">
+        <label><input id="pf-enabled" type="checkbox"
+          ${existing.enabled === false ? '' : 'checked'}${lockAttr('enabled')}>
+          Enabled (uncheck to retire without deleting)</label>
+        ${isLocked('enabled') ? lockNote : ''}
+      </div>` : '';
+
+  // The registry picker is an add-mode affordance; in edit mode the base URL
+  // is already populated and a pick would clobber operator edits.
+  const registryRow = editing ? '' : `
       <div class="form-row">
         <label for="pf-registry">From registry (optional)</label>
         <select id="pf-registry"><option value="">loading…</option></select>
-      </div>
+      </div>`;
+
+  el.innerHTML = `
+    <h2>${title}</h2>
+    <div class="card">
+      ${registryRow}
       <div class="form-row">
         <label for="pf-name">Name</label>
-        <input id="pf-name" autocomplete="off" placeholder="e.g. ollama-cloud">
+        <input id="pf-name" autocomplete="off" placeholder="e.g. ollama-cloud"
+          value="${editing ? esc(existing.name || '') : ''}"${editing ? ' disabled' : ''}>
+        ${editing ? '<span style="color:var(--muted);font-size:0.75rem">the name is the route key; rename via delete + add</span>' : ''}
       </div>
       <div class="form-row">
         <label for="pf-base">Base URL (vendor documented API root)</label>
-        <input id="pf-base" autocomplete="off" placeholder="e.g. https://ollama.com/v1">
+        <input id="pf-base" autocomplete="off" placeholder="e.g. https://ollama.com/v1"
+          value="${editing ? esc(existing.upstream || '') : ''}"${lockAttr('upstream')}>
+        ${isLocked('upstream') ? lockNote : ''}
       </div>
       <div class="form-row">
         <label>Live preview (composed upstream for /v1/chat/completions)</label>
@@ -269,28 +415,35 @@ function renderProviderForm() {
       </div>
       <div class="form-row">
         <label for="pf-target">Target concurrency</label>
-        <input id="pf-target" type="number" min="1" value="1" style="width:6rem">
+        <input id="pf-target" type="number" min="1" value="${editing ? esc(existing.target || 1) : 1}"
+          style="width:6rem"${lockAttr('target')}>
+        ${isLocked('target') ? lockNote : ''}
       </div>
       <div class="form-row">
         <label for="pf-auth-header">Auth header</label>
-        <input id="pf-auth-header" value="authorization" autocomplete="off">
+        <input id="pf-auth-header" value="${editing ? esc(existing.auth_header || 'authorization') : 'authorization'}"
+          autocomplete="off"${lockAttr('auth_header')}>
+        ${isLocked('auth_header') ? lockNote : ''}
       </div>
-      <div class="form-row">
-        <label for="pf-key-env">API key env var (name only — value stays server-side)</label>
-        <input id="pf-key-env" autocomplete="off" placeholder="e.g. SWITCHBOARD_OLLAMA_KEY">
-      </div>
+      ${editExtras}
+      ${credBlock}
       <div id="pf-discover" style="margin:0.3rem 0 0.6rem;font-size:0.82rem"></div>
       <div id="pf-error" style="color:var(--red);font-size:0.85rem;margin-bottom:0.5rem"></div>
       <button id="pf-test">Test &amp; detect</button>
-      <button id="pf-save">Save</button>
+      <button id="pf-save">${editing ? 'Save changes' : 'Save'}</button>
       <button id="pf-cancel" style="background:transparent;border:1px solid var(--border)">Cancel</button>
     </div>`;
 
   document.getElementById('pf-cancel').onclick = () => {
-    editingProvider = false; load();
+    editingProvider = false; editingProviderName = null;
+    editEnvLocked = null; editingKeyMode = null;
+    editingAccount = null; editingTomlStored = false;
+    load();
   };
-  const regSel = document.getElementById('pf-registry');
-  regSel.onchange = () => _applyRegistryPick(regSel.value);
+  if (!editing) {
+    const regSel = document.getElementById('pf-registry');
+    regSel.onchange = () => _applyRegistryPick(regSel.value);
+  }
   const baseInput = document.getElementById('pf-base');
   let previewTimer = null;
   baseInput.oninput = () => {
@@ -300,16 +453,45 @@ function renderProviderForm() {
   document.getElementById('pf-test').onclick = _runDiscover;
   document.getElementById('pf-save').onclick = _saveProvider;
 
-  // Populate the registry picker, then seed defaults from "generic".
-  _loadRegistry().then(entries => {
-    const opts = ['<option value="">— pick to pre-fill, or type below —</option>'];
-    for (const e of entries) {
-      opts.push(`<option value="${esc(e.name)}">${esc(e.name)}${
-        e.default_base_url ? ' — ' + esc(e.default_base_url) : ''
-      }</option>`);
-    }
-    regSel.innerHTML = opts.join('');
-  });
+  if (!editing) {
+    // Populate the registry picker, then seed defaults from "generic".
+    _loadRegistry().then(entries => {
+      const opts = ['<option value="">— pick to pre-fill, or type below —</option>'];
+      for (const e of entries) {
+        opts.push(`<option value="${esc(e.name)}">${esc(e.name)}${
+          e.default_base_url ? ' — ' + esc(e.default_base_url) : ''
+        }</option>`);
+      }
+      const sel = document.getElementById('pf-registry');
+      if (sel) sel.innerHTML = opts.join('');
+    });
+  } else {
+    // Populate element values explicitly. A real browser derives these from
+    // the value="" attributes already in the HTML, but setting them here too
+    // is harmless and keeps the form testable without a browser-DOM that
+    // reflects attributes into properties. Prefill comes from the store row
+    // (the tier the PUT writes), not the env-merged effective view.
+    editingKeyMode = km;
+    editingAccount = existing.account != null ? existing.account : null;
+    editingTomlStored = tomlStored;
+    const setv = (id, val) => {
+      const e = document.getElementById(id);
+      if (e && val != null && val !== '') e.value = val;
+    };
+    setv('pf-name', existing.name);
+    setv('pf-base', existing.upstream);
+    setv('pf-target', existing.target);
+    setv('pf-auth-header', existing.auth_header);
+    setv('pf-type', ptype);
+    setv('pf-auth-prefix', existing.auth_prefix);
+    setv('pf-dashboard-url', existing.dashboard_url);
+    setv('pf-dashboard-token-env', existing.dashboard_token_env);
+    setv('pf-usage-key-env', existing.usage_key_env);
+    if (km === 'env') setv('pf-key-env', existing.api_key_env);
+    const enEl = document.getElementById('pf-enabled');
+    if (enEl) enEl.checked = existing.enabled !== false;
+    _refreshPreview();
+  }
 }
 
 function _applyRegistryPick(name) {
@@ -373,25 +555,140 @@ async function _saveProvider() {
   const upstream = (document.getElementById('pf-base') || {}).value.trim();
   const target = parseInt((document.getElementById('pf-target') || {}).value, 10) || 1;
   const auth_header = (document.getElementById('pf-auth-header') || {}).value.trim() || 'authorization';
-  const api_key_env = (document.getElementById('pf-key-env') || {}).value.trim();
+  const apiKeyEnvEl = document.getElementById('pf-key-env');
+  // pf-key-env only exists in add mode and the env-key edit branch; absent in
+  // stored/passthrough edit mode, so guard against a missing element.
+  const api_key_env = apiKeyEnvEl ? (apiKeyEnvEl.value || '').trim() : '';
   const errEl = document.getElementById('pf-error');
   errEl.textContent = '';
+  // Name is read-only in edit mode but still required; check both paths.
   if (!name) { errEl.textContent = 'name is required'; return; }
   if (!upstream) { errEl.textContent = 'base URL is required'; return; }
-  const body = { name, upstream, provider_type: 'generic', target, auth_header };
-  if (api_key_env) { body.key_mode = 'env'; body.api_key_env = api_key_env; }
+
+  // Edit mode requires both the freeze flag AND a target name. The Add
+  // button clears the edit vars, so a stale editingProviderName cannot route
+  // an Add-form save to a PUT (review finding 4: cross-provider clobber).
+  const editing = editingProvider && editingProviderName !== null;
+  let url, method, body;
+  if (editing) {
+    // Edit mode: PUT the full row. The store's upsert does not merge — it
+    // requires upstream/provider_type/target/key_mode verbatim — so every
+    // managed field is sent, locked ones at their prefilled (unchanged)
+    // value. Credential handling is write-only: api_key_stored is sent only
+    // when the operator typed a new one, otherwise the store keeps it.
+    const provider_type = (document.getElementById('pf-type') || {}).value.trim() || 'generic';
+    const auth_prefix = (document.getElementById('pf-auth-prefix') || {}).value.trim();
+    const dashboard_url = (document.getElementById('pf-dashboard-url') || {}).value.trim();
+    const dashboard_token_env = (document.getElementById('pf-dashboard-token-env') || {}).value.trim();
+    const usage_key_env = (document.getElementById('pf-usage-key-env') || {}).value.trim();
+    const enabledEl = document.getElementById('pf-enabled');
+    const enabled = enabledEl ? !!enabledEl.checked : true;
+    // Round-trip `account` so a non-default account is not silently reset to
+    // 'default' on edit (the store does not merge, and _build_row defaults a
+    // missing account). The form does not expose account editing yet.
+    body = {
+      provider_type, upstream, target, auth_header,
+      dashboard_url, dashboard_token_env, usage_key_env, enabled,
+    };
+    if (editingAccount != null) body.account = editingAccount;
+    if (auth_prefix) body.auth_prefix = auth_prefix;
+    // Credential handling follows the existing mode (the form does not switch
+    // modes). Write-only for stored: api_key_stored is sent only when the
+    // operator typed a new key, otherwise the store keeps it — UNLESS this is
+    // a TOML-only stored provider (no store row yet), where keep is
+    // impossible and the operator must re-enter the key.
+    if (editingKeyMode === 'env') {
+      body.key_mode = 'env';
+      body.api_key_env = api_key_env;
+    } else if (editingKeyMode === 'stored') {
+      body.key_mode = 'stored';
+      const keyNewEl = document.getElementById('pf-key-new');
+      const keyNew = keyNewEl ? (keyNewEl.value || '').trim() : '';
+      if (!keyNew && editingTomlStored) {
+        errEl.textContent = 'enter the API key — this TOML provider has no stored copy to keep';
+        return;
+      }
+      if (keyNew) body.api_key_stored = keyNew;
+    } else {
+      body.key_mode = 'passthrough';
+    }
+    url = '/admin/providers/' + encodeURIComponent(editingProviderName);
+    method = 'PUT';
+  } else {
+    // Add mode: only the env credential path is offered (recommended mode).
+    body = { name, upstream, provider_type: 'generic', target, auth_header };
+    if (api_key_env) { body.key_mode = 'env'; body.api_key_env = api_key_env; }
+    url = '/admin/providers';
+    method = 'POST';
+  }
   try {
-    const resp = await fetch('/admin/providers', {
-      method: 'POST',
+    const resp = await fetch(url, {
+      method,
       headers: { 'content-type': 'application/json' },
       credentials: 'same-origin',
       body: JSON.stringify(body),
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) { errEl.textContent = data.error || ('HTTP ' + resp.status); return; }
-    editingProvider = false;
+    editingProvider = false; editingProviderName = null;
+    editEnvLocked = null; editingKeyMode = null;
+    editingAccount = null; editingTomlStored = false;
     load();
   } catch (e) { errEl.textContent = String(e); }
+}
+
+// ── Edit Provider (Plan 020 WI-6) ─────────────────────────────────────────
+// Opens the provider form pre-filled with the store row (the tier the PUT
+// writes to), with env-owned fields disabled. The env-lock set comes from
+// /admin/config/effective (Plan 021 WI-7 provenance); the editable values
+// come from /admin/providers (masked store/toml row, not env-merged, so the
+// form edits exactly the tier it writes).
+async function _loadProviderForEdit(name) {
+  let existing = null;
+  try {
+    const resp = await fetch('/admin/providers', { credentials: 'same-origin' });
+    if (resp.ok) {
+      const all = (await resp.json()).providers || [];
+      existing = all.find(p => p.name === name) || null;
+    }
+  } catch (e) { existing = null; }
+  if (!existing) {
+    // The provider vanished between the click and the fetch (delete, drain,
+    // or a tombstone). Abort the edit rather than render a form for nothing.
+    editingProvider = false; editingProviderName = null;
+    editEnvLocked = null; editingKeyMode = null;
+    editingAccount = null; editingTomlStored = false;
+    load();
+    return null;
+  }
+  let lockedKeys = [];
+  try {
+    const resp = await fetch('/admin/config/effective', { credentials: 'same-origin' });
+    if (resp.ok) {
+      const all = (await resp.json()).providers || [];
+      const entry = all.find(p => p.name === name);
+      if (entry) {
+        // env_locked is the canonical list; fall back to field_sources keys.
+        lockedKeys = entry.env_locked || Object.keys(entry.field_sources || {});
+      }
+    }
+  } catch (e) { lockedKeys = []; }
+  editEnvLocked = new Set(lockedKeys);
+  return existing;
+}
+
+async function editProvider(name) {
+  // Reentrancy guard (review finding 4): two rapid Edit clicks start two
+  // async fetch sequences whose renders can land out of order, so a save
+  // could PUT one provider's form under another's name. A monotonic token
+  // makes the first click's late render a no-op: only the latest click wins.
+  editToken = (editToken || 0) + 1;
+  const myToken = editToken;
+  editingProvider = true;
+  editingProviderName = name;
+  const existing = await _loadProviderForEdit(name);
+  if (myToken !== editToken) return;  // a newer Edit (or Add) superseded this one
+  if (existing) renderProviderForm(existing);
 }
 
 // ── Keyed-route management (Plan 020 WI-8) ────────────────────────────────
@@ -554,11 +851,10 @@ async function deleteModel(model) {
 
 // Configuration provenance (Plan 021 WI-7). Which tier owns each provider,
 // and which fields an env var has taken over. Fields shown as env-locked are
-// owned by a Deployment variable: editing them here (once an edit-provider
-// form lands — Plan 020 WI-6) would be discarded at the next restart, so they
-// must render as locked. The Add Provider form above is the first writing
-// control this enables; the provenance it reports answers "why is this value
-// what it is" without reading the Deployment.
+// owned by a Deployment variable: the edit-provider form (Plan 020 WI-6)
+// renders them disabled, since editing them here would be discarded at the
+// next restart. The provenance it reports answers "why is this value what it
+// is" without reading the Deployment.
 function renderConfig(cfg) {
   if (!cfg) return '';
   let html = '<h2>Configuration</h2>';
@@ -651,11 +947,16 @@ async function load() {
   }
 
   let html = '<h2>Providers</h2><div class="grid">';
-  for (const [name, p] of Object.entries(data.providers || {})) {
+  const provNames = Object.keys(data.providers || {});
+  provNames.forEach((name, provIdx) => {
+    const p = data.providers[name];
     const reason = p.gate_closed_reason || 'open';
     const badgeCls = reason === 'open' ? 'open' : reason;
     html += `<div class="card">
       <h3>${name} <span class="badge ${badgeCls}">${reason}</span></h3>
+      <div style="margin:-0.3rem 0 0.6rem">
+        <button id="edit-prov-${provIdx}" class="mini-btn">Edit</button>
+      </div>
       <div class="stat"><span class="k">effective_permits</span><span class="v">${p.effective_permits}</span></div>
       <div class="stat"><span class="k">in_flight</span><span class="v">${p.in_flight}</span></div>
       <div class="stat"><span class="k">queue_depth</span><span class="v">${p.queue_depth}</span></div>
@@ -732,7 +1033,7 @@ async function load() {
     }
 
     html += `</div>`;
-  }
+  });
   html += '</div>';
 
   // Estimator
@@ -826,6 +1127,11 @@ async function load() {
 
   // Wire per-row Delete buttons now that the table HTML is in the DOM. The
   // 5 s poll rebuilds #app and re-runs this, so no stale-handler problem.
+  // The per-card Edit buttons follow the same pattern (Plan 020 WI-6).
+  provNames.forEach((name, i) => {
+    const btn = document.getElementById('edit-prov-' + i);
+    if (btn) btn.onclick = () => editProvider(name);
+  });
   keyedRoutes.forEach(([key], i) => {
     const btn = document.getElementById('del-route-' + i);
     if (btn) btn.onclick = () => deleteRoute(key);
