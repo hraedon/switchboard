@@ -29,7 +29,23 @@ author_email = ["plm@hraedon.com"]
 # so a repository awaiting publication review cannot reach a public remote by
 # accident. This is the correct default for a new project.
 #
-# public: the repo has been cleared by a publication review. The CI identifier
-# gate fails closed on a missing denylist secret once this is set, because a
-# public repo with an unconfigured gate is a silent pass.
+# public: the repo has been cleared by a publication review.
+#
+# This field changes NOTHING about CI. An earlier version of this comment
+# claimed the identifier gate "fails closed on a missing denylist secret once
+# this is set" — that is false, and was corrected 2026-08-08 after it was
+# repeated as the rationale for a public flip. Verified three ways:
+#
+#   1. scripts/check_committed_identifiers.py returns 0 ("skipping identifier
+#      gate") whenever <REPO>_FORBIDDEN_IDENTIFIERS is unset, unconditionally.
+#   2. That script contains no reference to this file or to visibility.
+#   3. The only reader of this field is scripts/check_publication_plumbing.py,
+#      a PRE-PUSH hook, and its `case Visibility.PUBLIC` branch is `pass`.
+#
+# So for a public repo the only thing between a work-domain identifier and
+# publication is the CI secret ACTUALLY BEING SET. Delete or rename it and CI
+# goes quiet and green. Believing otherwise is the false confidence that lets a
+# leak land — check `gh secret list` rather than trusting this field.
+#
+# The always-on samples/ guard is unaffected and still runs without any secret.
 visibility = "public"
