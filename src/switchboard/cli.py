@@ -11,11 +11,14 @@ import argparse
 import contextlib
 import logging
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
 
 from switchboard import __version__
+from switchboard.config_reset import ResetError, parse_sections, reset_sections
+from switchboard.env_config import EnvOverrideError, apply_overrides
 
 log = logging.getLogger("switchboard.cli")
 
@@ -634,6 +637,32 @@ def _build_serve_app(
             if isinstance(providers_list, list):
                 default_providers = tuple(providers_list)
 
+    # Boot reset (Plan 021 D7) MUST happen before any manager is constructed:
+    # RouteTableManager and ConfigStoreManager load their tables into memory in
+    # __init__, so clearing rows afterwards would leave the process running the
+    # state it was told to discard. Done on a throwaway connection for that
+    # reason.
+    reset_raw = os.environ.get(f"{_ENV_PREFIX}CONFIG_RESET")
+    if reset_raw and reset_raw.strip():
+        try:
+            sections = parse_sections(reset_raw)
+        except ResetError as exc:
+            raise _ConfigError(
+                f"{_ENV_PREFIX}CONFIG_RESET: {exc}"
+            ) from exc
+        if store_path is None:
+            log.warning(
+                "%sCONFIG_RESET=%s ignored: no route table store is "
+                "configured, so the declared config is already authoritative",
+                _ENV_PREFIX, reset_raw,
+            )
+        else:
+            reset_db = sqlite3.connect(store_path)
+            try:
+                reset_sections(reset_db, sections)
+            finally:
+                reset_db.close()
+
     try:
         route_table = RouteTableManager(
             default_providers=default_providers,
@@ -658,6 +687,17 @@ def _build_serve_app(
     # NOTE: `effective` sections carry raw credentials (construction path
     # only) — they are never serialized.
     effective = config_store.effective_providers(config_data)
+
+    # Env tier (Plan 021 D6): applied last so a Deployment outranks whatever
+    # the GUI wrote. Per-field, not wholesale — a deployment usually pins one
+    # value and has no business discarding the rest of a provider to do it.
+    try:
+        effective, env_field_sources, unmatched_env = apply_overrides(
+            effective, os.environ
+        )
+    except EnvOverrideError as exc:
+        raise _ConfigError(str(exc)) from exc
+
     tombstoned_providers = frozenset(
         str(row["name"])
         for row in config_store.list_providers()
@@ -980,6 +1020,8 @@ def _build_serve_app(
         config_store=config_store,
         toml_provider_names=frozenset(toml_provider_sections),
         toml_provider_sections=toml_provider_sections,
+        env_field_sources=env_field_sources,
+        unmatched_env=unmatched_env,
     )
 
     store_backed = {

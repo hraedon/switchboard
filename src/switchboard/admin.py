@@ -25,6 +25,12 @@ from urllib.parse import parse_qs
 import httpx
 
 from switchboard import __version__
+from switchboard.config_reset import (
+    SECTIONS,
+    ResetError,
+    parse_sections,
+    reset_sections,
+)
 from switchboard.config_store import ConfigStoreManager
 from switchboard.session import (
     SESSION_COOKIE,
@@ -2135,6 +2141,8 @@ async def handle_config_effective(
     toml_provider_names: frozenset[str],
     toml_provider_sections: dict[str, dict[str, Any]],
     cors_allow_origin: str | None = None,
+    env_field_sources: dict[str, dict[str, str]] | None = None,
+    unmatched_env: list[str] | None = None,
 ) -> None:
     """GET /admin/config/effective — the merged TOML+store view, MASKED.
 
@@ -2146,6 +2154,7 @@ async def handle_config_effective(
     ``api_key_set`` + a last-4 hint. Per D1, a store row shadows its TOML
     section wholesale, so store-named providers show the store's row.
     """
+    env_field_sources = env_field_sources or {}
     entries: list[dict[str, Any]] = []
     store_names: set[str] = set()
     for masked in config_store.list_providers():
@@ -2160,13 +2169,171 @@ async def handle_config_effective(
         entry: dict[str, Any] = {"name": name, "source": "toml", "enabled": True}
         entry.update(_masked_toml_section(section))
         entries.append(entry)
+
+    # Per-field provenance (Plan 021 D6). The row-level `source` says which
+    # tier owns the provider; this says which tier owns each FIELD, because
+    # env merges per field rather than replacing the row. It is what lets the
+    # GUI lock an input instead of accepting an edit it cannot honour, and
+    # what lets an operator answer "why is it this value" without reading the
+    # Deployment.
+    for entry in entries:
+        owned = env_field_sources.get(str(entry["name"]))
+        if owned:
+            entry["field_sources"] = dict(owned)
+            for field in owned:
+                if field in entry:
+                    entry["env_locked"] = sorted(
+                        set(entry.get("env_locked", [])) | {field}
+                    )
+
     entries.sort(key=lambda e: str(e["name"]))
+    body: dict[str, Any] = {"providers": entries}
+    if unmatched_env:
+        # Inert overrides are reported rather than only logged: an operator who
+        # typoed a provider name otherwise believes the deployment controls a
+        # field it does not, and a log line scrolls away.
+        body["unmatched_env_overrides"] = list(unmatched_env)
     await send_json(
-        send, 200, {"providers": entries},
+        send, 200, body,
         extra_headers=[
             *cors_extra_headers(cors_allow_origin, None),
             (b"cache-control", b"no-store"),
         ],
+    )
+
+
+async def handle_config_reset(
+    send: Send,
+    receive: Receive,
+    route_table: RouteTableManager,
+    admin_token: str | None,
+    scope: Scope,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """POST /admin/config/reset — clear store rows so declared config wins.
+
+    Body: ``{"sections": ["model-map", "providers"]}`` or
+    ``{"sections": ["all"]}``.
+
+    Plan 021 D7. The store outranks the mounted TOML, which is what makes GUI
+    edits survive a restart — and also what makes a bad one unfixable by
+    editing the configmap and rolling the pod. This is the way back: delete
+    the rows, and the declared configuration becomes authoritative on the next
+    load.
+
+    Deliberately NOT a wildcard by default, and deliberately not idempotent-
+    by-silence: the response names every row deleted, because an operator
+    reaching for this is already having a bad day and "it said OK" is not
+    enough to know what was discarded.
+
+    The reset takes effect for the sections whose managers reload from the
+    store; a restart is the honest way to guarantee the whole process reflects
+    it, and the response says so.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(
+            send, 405,
+            {"error": "mutations disabled — set --admin-token to enable"},
+            extra_headers=cors,
+        )
+        return
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    ct = next(
+        (
+            v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+            if k == b"content-type"
+        ),
+        "",
+    )
+    if not ct.lower().startswith("application/json"):
+        await send_json(
+            send, 415,
+            {"error": "Content-Type must be application/json"},
+            extra_headers=cors,
+        )
+        return
+
+    try:
+        body = await read_body(receive)
+    except ValueError:
+        await send_json(
+            send, 413, {"error": "request body too large"}, extra_headers=cors
+        )
+        return
+    except ConnectionError:
+        return
+
+    try:
+        data = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        await send_json(
+            send, 400, {"error": "invalid JSON body"}, extra_headers=cors
+        )
+        return
+
+    if not isinstance(data, dict):
+        await send_json(
+            send, 400, {"error": "body must be a JSON object"}, extra_headers=cors
+        )
+        return
+
+    raw_sections = data.get("sections")
+    if not isinstance(raw_sections, list) or not raw_sections:
+        await send_json(
+            send, 400,
+            {
+                "error": "missing required field 'sections' (non-empty list)",
+                "valid_sections": sorted(SECTIONS),
+            },
+            extra_headers=cors,
+        )
+        return
+    if not all(isinstance(s, str) for s in raw_sections):
+        await send_json(
+            send, 400, {"error": "sections must be a list of strings"},
+            extra_headers=cors,
+        )
+        return
+
+    try:
+        sections = parse_sections(",".join(raw_sections))
+    except ResetError as exc:
+        await send_json(
+            send, 400,
+            {"error": str(exc), "valid_sections": sorted(SECTIONS)},
+            extra_headers=cors,
+        )
+        return
+
+    deleted = reset_sections(route_table.db, sections)
+
+    log.warning(
+        "config reset via admin API: %s",
+        ", ".join(f"{s}={len(rows)}" for s, rows in sorted(deleted.items())),
+    )
+
+    await send_json(
+        send, 200,
+        {
+            "reset": sections,
+            "deleted": deleted,
+            "persisted": route_table.db is not None,
+            "note": (
+                "restart to guarantee every in-memory manager reflects this"
+            ),
+        },
+        extra_headers=cors,
     )
 
 

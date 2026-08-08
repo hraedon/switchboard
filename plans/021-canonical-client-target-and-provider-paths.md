@@ -1,6 +1,6 @@
 # Plan 021 — One canonical client target, per-provider paths
 
-Status: Wave 1 landed; Waves 2-3 proposed
+Status: Wave 1 landed; Wave 3 WI-6+WI-8 landed; WI-7 and Wave 2 proposed
 Supersedes: the "clients must omit the version prefix" contract in
 `k8s/configmap.yaml` and `docs/deployment.md`.
 
@@ -211,12 +211,33 @@ surprise on the next rollout.
   before saving. Seeing `…/zen/go/v1/chat/completions` render as you
   type is worth more than any validation message.
 
-**Wave 3 — precedence and recovery**
-- **WI-6**: Env tier per D6 for every provider field, with `source`
+**Wave 3 — precedence and recovery — WI-6 and WI-8 done 2026-08-08**
+- **WI-6 (done)**: Env tier per D6 for every provider field, with `source`
   reporting through `/admin/config/effective`.
 - **WI-7**: GUI lock indicators for env-owned fields.
-- **WI-8**: `POST /admin/config/reset` + `SWITCHBOARD_CONFIG_RESET` per
-  D7, with the store rows it deletes logged by name.
+- **WI-8 (done)**: `POST /admin/config/reset` + `SWITCHBOARD_CONFIG_RESET`
+  per D7, with the store rows it deletes logged by name.
+
+  Env overrides merge **per field**, deliberately unlike D1's wholesale
+  store-replaces-TOML rule: a Deployment usually pins one value and has
+  no business discarding the rest of a provider to do it. Providers
+  whose names collide on an env stem (`opencode-go` / `opencode_go` both
+  give `OPENCODE_GO`) refuse to start rather than guess which one an
+  override meant. `api_key` is deliberately NOT overridable — a raw
+  credential must arrive by `api_key_env` indirection so it is never a
+  value this path could echo into a config dump or an error message.
+
+  The recovery loop was proven end to end against the live divergence
+  reproduced locally: boot with the bad store state and the configmap
+  cannot fix it; boot with `SWITCHBOARD_CONFIG_RESET=model-map` and the
+  declared config is reclaimed; boot again normally and it stays
+  reclaimed.
+
+  Still open: **WI-7**, the GUI lock indicators. Until it lands the
+  `field_sources` / `env_locked` data is served by
+  `/admin/config/effective` but nothing renders it, so a GUI edit to an
+  env-owned field will still appear to succeed and then be ignored at
+  the next boot.
 
 ## 5. What must not break
 

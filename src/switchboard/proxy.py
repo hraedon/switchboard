@@ -46,6 +46,7 @@ import httpx
 from switchboard.admin import (
     handle_config_effective,
     handle_config_get,
+    handle_config_reset,
     handle_healthz,
     handle_login_get,
     handle_login_post,
@@ -386,6 +387,8 @@ class ProxyApp:
         config_store: ConfigStoreManager | None = None,
         toml_provider_names: frozenset[str] | None = None,
         toml_provider_sections: dict[str, dict[str, Any]] | None = None,
+        env_field_sources: dict[str, dict[str, str]] | None = None,
+        unmatched_env: list[str] | None = None,
     ) -> None:
         self._provider_manager = ProviderManager(
             providers, drain_timeout=drain_timeout
@@ -400,6 +403,12 @@ class ProxyApp:
         )
         self._toml_provider_names = toml_provider_names or frozenset()
         self._toml_provider_sections = toml_provider_sections or {}
+        # Per-field env provenance (Plan 021 D6), computed once at boot: env
+        # cannot change under a running process, so recomputing per request
+        # would only invite drift between what routing uses and what the
+        # config surface reports.
+        self._env_field_sources = env_field_sources or {}
+        self._unmatched_env = unmatched_env or []
         self._route_table = route_table
         self._routing_config = routing_config or RoutingConfig()
         self._admin_token = admin_token
@@ -482,7 +491,7 @@ class ProxyApp:
                 path in (
                     "/", "/status.json", "/metrics",
                     "/admin/routes", "/admin/config",
-                    "/admin/config/effective",
+                    "/admin/config/effective", "/admin/config/reset",
                     "/admin/model-map", "/admin/providers",
                     "/admin/threshold-events", "/admin/usage-history",
                     "/login", "/logout",
@@ -671,6 +680,16 @@ class ProxyApp:
             )
             return
 
+        if path == "/admin/config/reset":
+            if method == "POST":
+                await handle_config_reset(
+                    send, receive, self._route_table,
+                    self._admin_token, scope, self._cors_allow_origin,
+                )
+                return
+            await send_text(send, 405, "Method not allowed")
+            return
+
         if path == "/admin/config/effective" and method == "GET":
             authed = check_admin_auth(scope, self._admin_token)
             if not authed and self._admin_token:
@@ -685,6 +704,7 @@ class ProxyApp:
                 send, self._config_store,
                 self._toml_provider_names, self._toml_provider_sections,
                 self._cors_allow_origin,
+                self._env_field_sources, self._unmatched_env,
             )
             return
 
