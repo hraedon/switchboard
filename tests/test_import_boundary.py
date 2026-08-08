@@ -108,25 +108,51 @@ def test_no_sluice_imports_at_all() -> None:
 
 
 def test_pure_modules_import_stdlib_only() -> None:
-    """overload.py, threshold.py, and budget.py are pure cores: stdlib only,
-    no httpx/asyncio/sluice — like control.py."""
-    for mod_name in (
-        "switchboard.overload",
-        "switchboard.threshold",
-        "switchboard.budget",
-    ):
-        mod = importlib.import_module(mod_name)
-        assert not hasattr(mod, "httpx"), f"{mod_name} must not import httpx"
-        assert not hasattr(mod, "asyncio"), f"{mod_name} must not import asyncio"
-        src = Path(mod.__file__).read_text()  # type: ignore[arg-type]
-        tree = ast.parse(src)
+    """The pure cores are stdlib-only, no I/O, no clock, no network.
+
+    AST-scanned (robust against the ``dir()``-based check's blind spot for
+    module objects) for: control, limit, overload, threshold, budget. Each
+    must import only stdlib modules — never httpx/asyncio/sluice and never
+    another switchboard submodule (the shell imports the core one-way).
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "switchboard"
+    pure_modules = ("control", "limit", "overload", "threshold", "budget", "speed")
+    forbidden_prefixes = ("httpx", "sluice", "switchboard")
+    for mod_name in pure_modules:
+        src = (root / f"{mod_name}.py").read_text()
+        tree = ast.parse(src, filename=f"{mod_name}.py")
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
-                assert not node.module.startswith(("httpx", "sluice", "switchboard")), (
-                    f"{mod_name} imports non-stdlib/shell module: {node.module}"
+                imported = node.module
+                assert not imported.startswith(forbidden_prefixes), (
+                    f"switchboard.{mod_name} imports non-stdlib/shell "
+                    f"module: {imported}"
                 )
+                _assert_stdlib(imported, mod_name)
             elif isinstance(node, ast.Import):
                 for alias in node.names:
-                    assert not alias.name.startswith(("httpx", "sluice", "switchboard")), (
-                        f"{mod_name} imports non-stdlib/shell module: {alias.name}"
+                    imported = alias.name
+                    assert not imported.startswith(forbidden_prefixes), (
+                        f"switchboard.{mod_name} imports non-stdlib/shell "
+                        f"module: {imported}"
                     )
+                    _assert_stdlib(imported, mod_name)
+
+
+def _assert_stdlib(imported: str, mod_name: str) -> None:
+    """Assert a top-level module name is part of the stdlib."""
+    top = imported.split(".")[0]
+    stdlib_names = getattr(sys, "stdlib_module_names", None)
+    if stdlib_names is not None:
+        assert top in stdlib_names or top in sys.builtin_module_names, (
+            f"switchboard.{mod_name} imports non-stdlib module: {imported}"
+        )
+        return
+    # Python < 3.10 fallback: resolve by location.
+    spec = importlib.util.find_spec(top)
+    if spec is not None and spec.origin and (
+        "site-packages" in spec.origin or "dist-packages" in spec.origin
+    ):
+        raise AssertionError(
+            f"switchboard.{mod_name} imports non-stdlib module: {imported}"
+        )

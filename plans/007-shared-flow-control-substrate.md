@@ -1,8 +1,11 @@
 # Plan 007 — Stable shared flow-control substrate
 
-Status: **partially implemented** — the coupling rules shipped and are
-enforced; the substrate extraction (snapshots, lease protocol, shared
-streaming lifecycle) did not land as a separate package
+Status: **obsolete — superseded by Plan 018.** This plan was authored when
+sluice was an external dependency; Plan 018 vendored the flow-control core
+into switchboard-owned modules and deleted the dependency entirely, so there
+is no shared substrate to extract and no second consumer to share with. The
+coupling rules it specified (shell→core one-way, enforced by
+`tests/test_import_boundary.py`) did ship and remain in force.
 
 Landed:
 

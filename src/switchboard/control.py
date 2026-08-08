@@ -100,6 +100,11 @@ class ProviderState:
     # Seconds until the quota window this headroom refers to resets.
     # None = unknown (never promotes -- fail safe).
     token_utilization: float | None = None
+    # Per-provider token-budget soft threshold (Plan 012 §4): the utilization
+    # fraction at which this provider starts bleeding traffic to alternatives.
+    # When set, it overrides the global ``token_budget_threshold`` for this
+    # provider.  None = fall back to the global threshold (default 0.0 = off).
+    token_soft_threshold: float | None = None
     usage_24h_utilization: float | None = None
     # tokens_24h / cap_tokens (Plan 013). 0.0 = none used; 1.0 = at cap.
     # None = no 24h budget configured or no data (no filtering).
@@ -200,6 +205,18 @@ class RoutingConfig:
     # seconds; only inside the last 6 h
     opportunistic_margin: float = 0.10
     # winner must lead the runner-up by this
+    pin_conversations: bool = False
+    # When True, the proxy pins each conversation (by a fingerprint of its
+    # first user message) to the selected provider and does NOT fail back to
+    # the primary while the pinned provider stays in ``immediate`` (FRESH and
+    # not demoted to queue-eligible).  When the pinned provider drops to
+    # BUSY/CLOSED/UNKNOWN (or is demoted by headroom/budget/24h signals),
+    # normal failover selects the next best and re-pins.  The affinity key is
+    # the conversation fingerprint, not the API-key hash (Plan 019 §6).
+    affinity_max_entries: int = 1024
+    # Bounded LRU affinity table size.  API-key-hash mode (default) needs ~1k;
+    # conversation pinning (many concurrent conversations) benefits from 8k+.
+    # An eviction counter is surfaced so operators can detect pin loss.
 
 
 @dataclass(frozen=True)
@@ -228,6 +245,53 @@ class AdmissionPlan:
 def hash_route_key(raw_key: str) -> str:
     """SHA-256 hash of the raw API key. Pure, deterministic."""
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+def extract_conversation_fingerprint(body: bytes) -> str | None:
+    """Extract a stable fingerprint from the first user message in a request body.
+
+    Plan 019 §6.2 — all sessions from one opencode instance share an API key,
+    so the API-key hash groups every conversation under one affinity entry.
+    The stable per-conversation identifier is the first user message's text
+    content; this returns its SHA-256 hash (or None when no user message with
+    text is present, in which case the caller falls back to the route-key hash).
+
+    Pure and stdlib-only: ``json`` + ``hashlib``, no I/O.  The body is only
+    read when ``pin_conversations`` is opt-in, and bytes forwarded upstream
+    are never altered.
+    """
+    import json
+
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError: deeply-nested JSON (e.g. 300k nested arrays) is
+        # valid syntax that overflows the parser — catch it so a crafted
+        # body cannot crash the request path.  Returns None (fall back to
+        # the route-key hash), never raises.
+        return None
+    if not isinstance(data, dict):
+        return None
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, str):
+                return hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if isinstance(content, list):
+                # Multi-modal: hash the first text part.
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text = part.get("text", "")
+                        if isinstance(text, str):
+                            return hashlib.sha256(
+                                text.encode("utf-8")
+                            ).hexdigest()
+    return None
 
 
 #: A path segment that names an API version: v1, v2, v1beta, v1alpha2.
@@ -357,33 +421,51 @@ def route_decision(
     now: float,
     affinity: RouteAffinity | None = None,
     servable_providers: frozenset[str] | None = None,
-    primary_healthy_since: float | None = None,
+    healthy_since: dict[str, float] | None = None,
 ) -> AdmissionPlan:
     """Pure routing decision. Returns an :class:`AdmissionPlan`.
 
     The decision proceeds in this order (Plans 006, 008, 014, 015, 016):
 
     1. Resolve the route key to an ordered candidate list.
-    2. Filter out candidates whose capabilities don't satisfy the route's
+    2. Filter out candidates that do not serve the request's model when a model
+       map is configured (Plan 010 Feature B).
+    3. Filter out candidates whose capabilities don't satisfy the route's
        required capabilities (Plan 008 §4).
-    3. Reject missing and closed candidates.
-    4. Separate fresh candidates from unknown/stale candidates.
-    5. Place candidates with immediate permits first.
-    6. Order immediate candidates by ``usage_headroom`` descending when
+    4. Reject missing and closed candidates.
+    5. Separate fresh candidates from unknown/stale candidates and demote
+       pressured non-primary candidates to queue-eligible (headroom, token
+       budget, trailing-24h usage; Plan 013 allows the last to demote the
+       primary).
+    6. Place candidates with immediate permits (AVAILABLE) first.
+    7. Order immediate candidates by ``usage_headroom`` descending when
        ``headroom_ranking`` is enabled (Plan 015); data-bearing candidates
        precede ones without headroom data; ties break on table order.
-    7. Apply affinity stickiness / dwell / failback logic (Plan 008 §5).
-       When ``failback_delay`` is configured and the primary has not been
-       continuously FRESH+AVAILABLE for that duration, the affinity pin is
-       held past ``dwell_interval`` (Plan 014).  Subordinate to an active
-       affinity pin, opportunistically front a qualifying quota-burn
-       fallback (Plan 016); the primary stays immediate-eligible and the
-       terminal fallback.
-    8. Preserve primary preference among equally admissible candidates when
+    8. Apply affinity stickiness / dwell / failback logic (Plan 008 §5).
+       After ``dwell_interval``, if the primary is in immediate and
+       ``failback_delay`` is configured, failback requires the primary to have
+       been continuously FRESH+AVAILABLE for at least ``failback_delay``
+       seconds (Plan 014).  When no affinity pin is active, opportunistically
+       front a qualifying quota-burn fallback carrying measured headroom above
+       ``opportunistic_min_headroom`` and a reset within
+       ``opportunistic_reset_window`` (Plan 016); subordinate to affinity,
+       de-preference only.
+    9. Preserve primary preference among equally admissible candidates when
        neither an affinity pin nor an opportunistic target pinned the front.
-    9. Select at most one explicit queue candidate.
-    10. Preserve the configured primary as the terminal safe-failure target
+    10. Select at most one explicit queue candidate.
+    11. Preserve the configured primary as the terminal safe-failure target
         so its gate can provide the canonical rejection when nothing is usable.
+        (When model or capability filtering removes the configured primary,
+        the terminal fallback is the first *surviving* candidate, so the
+        canonical rejection comes from a provider that can actually serve the
+        request — and the queue backstop tracks that same effective primary.)
+
+    ``healthy_since`` maps provider name → the monotonic instant that provider
+    first became continuously FRESH+AVAILABLE.  It is consulted by name for the
+    *effective* primary (post-filtering), so a model map that excludes the
+    configured primary does not leave the hysteresis check reading the wrong
+    provider's clock.  ``None`` or a missing entry means "never observed
+    healthy" and holds the affinity pin until a clock is established.
 
     Guarantees:
 
@@ -392,6 +474,9 @@ def route_decision(
       its gate return 503.  Never silently drop a request.
     * **Stale data never improves preference** — unknown/stale providers are
       excluded from failover by default (``fresh-only-for-failover`` policy).
+    * **Model-servability filtering** — when the requested model is mapped in
+      a configured model map, only providers that declare an alias for it are
+      eligible.
     * **Capability filtering** — providers whose declared surfaces don't
       include all required surfaces are excluded before admission ranking.
     * **Bounded stickiness** — after failover, the routing core prefers the
@@ -409,8 +494,8 @@ def route_decision(
       active affinity pin; de-preference only: the primary remains
       immediate-eligible, queue backstop, and terminal fallback.  Stale or
       unmeasured data never promotes.
-    * **Pure** — ``now``, ``primary_healthy_since``, and all states are
-      arguments.  No I/O, no clock.
+    * **Pure** — ``now``, ``healthy_since``, and all states are arguments.  No
+      I/O, no clock.
     * **Deterministic** — same inputs produce the same plan.
     """
     entry = table.entries.get(route_key)
@@ -485,12 +570,23 @@ def route_decision(
                 and state.usage_headroom is not None
                 and state.usage_headroom < config.headroom_threshold
             )
+            # Per-provider soft_threshold (Plan 012 §4) overrides the global
+            # token_budget_threshold when set; None falls back to the global,
+            # whose default 0.0 disables the signal entirely.  This is what
+            # makes an operator's ``[token_budget.<p>] soft_threshold = 0.85``
+            # actually take effect — previously it was parsed, validated, and
+            # displayed but never consumed (dead config).
+            budget_threshold = (
+                state.token_soft_threshold
+                if state.token_soft_threshold is not None
+                else config.token_budget_threshold
+            )
             over_budget = (
                 not is_primary
-                and config.token_budget_threshold > 0
+                and budget_threshold > 0
                 and state.token_utilization is not None
                 and state.token_utilization
-                >= config.token_budget_threshold
+                >= budget_threshold
             )
             # Plan 013: trailing-24h usage — the ONE proactive signal that
             # may demote the primary (no `not is_primary` guard).  Demotion
@@ -539,12 +635,15 @@ def route_decision(
             immediate.remove(affinity.provider)
             immediate.insert(0, affinity.provider)
             affinity_reason = "affinity_dwell"
-        elif primary in immediate:
+        elif primary in immediate and not config.pin_conversations:
+            primary_clock = (
+                healthy_since.get(primary) if healthy_since else None
+            )
             hysteresis = (
                 config.failback_delay > 0
                 and (
-                    primary_healthy_since is None
-                    or (now - primary_healthy_since) < config.failback_delay
+                    primary_clock is None
+                    or (now - primary_clock) < config.failback_delay
                 )
             )
             if hysteresis:
@@ -555,17 +654,36 @@ def route_decision(
                 immediate.remove(primary)
                 immediate.insert(0, primary)
         else:
+            # No failback: either the primary is not in immediate, or
+            # conversation pinning (Plan 019 §6) holds the pin past dwell
+            # as long as the pinned provider stays FRESH + AVAILABLE.
             immediate.remove(affinity.provider)
             immediate.insert(0, affinity.provider)
+            affinity_reason = (
+                "affinity_pinned" if config.pin_conversations else ""
+            )
     else:
-        target = _opportunistic_target(immediate, primary, states, config)
-        if target is not None:
-            immediate.remove(target)
-            immediate.insert(0, target)
-            affinity_reason = "opportunistic"
-        elif primary in immediate:
-            immediate.remove(primary)
-            immediate.insert(0, primary)
+        # Conversation pinning (Plan 019 §6): when a pin is active on the
+        # *primary* (the if-block's `affinity.provider != primary` guard
+        # routed us here), hold it — do NOT let opportunistic quota-burn
+        # front a fallback and permanently migrate a pinned conversation.
+        if (
+            config.pin_conversations
+            and affinity is not None
+            and affinity.provider in immediate
+        ):
+            immediate.remove(affinity.provider)
+            immediate.insert(0, affinity.provider)
+            affinity_reason = "affinity_pinned"
+        else:
+            target = _opportunistic_target(immediate, primary, states, config)
+            if target is not None:
+                immediate.remove(target)
+                immediate.insert(0, target)
+                affinity_reason = "opportunistic"
+            elif primary in immediate:
+                immediate.remove(primary)
+                immediate.insert(0, primary)
 
     # Select at most one queue candidate: prefer primary if eligible.
     queue_candidate: str | None = None

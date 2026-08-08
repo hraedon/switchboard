@@ -32,6 +32,7 @@ _DEFAULTS: dict[str, Any] = {
     "queue_timeout": 30.0,
     "drain_timeout": 25.0,
     "route_table_store": None,
+    "max_request_body_bytes": None,
 }
 
 _LOG_LEVEL_CHOICES = ("DEBUG", "INFO", "WARNING", "ERROR")
@@ -305,6 +306,21 @@ def _validate_config(
                 errors.append("routing.dwell_interval must be a number")
             elif dwell < 0:
                 errors.append("routing.dwell_interval must be >= 0")
+        failback = routing_section.get("failback_delay")
+        if failback is not None:
+            if not isinstance(failback, (int, float)) or isinstance(failback, bool):
+                errors.append("routing.failback_delay must be a number")
+            elif failback < 0:
+                errors.append("routing.failback_delay must be >= 0")
+        pin = routing_section.get("pin_conversations")
+        if pin is not None and not isinstance(pin, bool):
+            errors.append("routing.pin_conversations must be a boolean")
+        aff_max = routing_section.get("affinity_max_entries")
+        if aff_max is not None:
+            if not isinstance(aff_max, int) or isinstance(aff_max, bool):
+                errors.append("routing.affinity_max_entries must be an integer")
+            elif aff_max < 1:
+                errors.append("routing.affinity_max_entries must be >= 1")
         headroom = routing_section.get("headroom_threshold")
         if headroom is not None:
             if not isinstance(headroom, (int, float)) or isinstance(headroom, bool):
@@ -561,6 +577,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds to wait for in-flight on shutdown (default: 25)",
     )
     serve.add_argument(
+        "--max-request-body-bytes",
+        type=int,
+        default=None,
+        help="cap buffered request bodies (required for pin_conversations)",
+    )
+    serve.add_argument(
         "--route-table-store",
         default=None,
         help="path to SQLite file for route table persistence (default: in-memory)",
@@ -612,6 +634,7 @@ def _build_serve_app(
     from switchboard.providers import build_provider_contexts_from_config
     from switchboard.proxy import ProxyApp
     from switchboard.route_table import RouteTableManager
+    from switchboard.speed import SpeedSampler
     from switchboard.token_budget import TokenBudgetTracker
     from switchboard.usage_history import UsageHistoryTracker
 
@@ -841,6 +864,16 @@ def _build_serve_app(
             opportunistic_margin, bool
         ):
             rc_kwargs["opportunistic_margin"] = float(opportunistic_margin)
+        pin_conversations = routing_section.get("pin_conversations")
+        if isinstance(pin_conversations, bool):
+            rc_kwargs["pin_conversations"] = pin_conversations
+        affinity_max = routing_section.get("affinity_max_entries")
+        if (
+            isinstance(affinity_max, int)
+            and not isinstance(affinity_max, bool)
+            and affinity_max >= 1
+        ):
+            rc_kwargs["affinity_max_entries"] = affinity_max
         if rc_kwargs:
             routing_config = RoutingConfig(**rc_kwargs)
 
@@ -919,6 +952,19 @@ def _build_serve_app(
 
     queue_timeout = _resolve_float("queue_timeout", args, config_data)
     drain_timeout = _resolve_float("drain_timeout", args, config_data)
+    max_body_raw = _resolve("max_request_body_bytes", args, config_data)
+    max_request_body_bytes: int | None = None
+    if max_body_raw is not None:
+        try:
+            max_request_body_bytes = int(max_body_raw)
+        except (TypeError, ValueError) as exc:
+            raise _ConfigError(
+                "max_request_body_bytes must be an integer"
+            ) from exc
+        if max_request_body_bytes <= 0:
+            raise _ConfigError(
+                "max_request_body_bytes must be > 0"
+            )
 
     listen = _resolve("listen", args, config_data)
     host, port = _parse_listen(str(listen))
@@ -1002,6 +1048,20 @@ def _build_serve_app(
             if isinstance(prov_section, dict):
                 toml_provider_sections[str(prov_name)] = dict(prov_section)
 
+    # Per-provider speed statistics (Plan 020 Wave 3): always-on display data
+    # — TTFB / duration / tokens-per-second feed /status.json, /metrics, and
+    # the dashboard. It never influences a routing decision (Wave 4 would).
+    speed_sampler = SpeedSampler()
+
+    # Conversation pinning (Plan 019 §6) buffers the request body to extract a
+    # fingerprint — an unbounded buffer is a memory-exhaustion vector, so a
+    # finite max_request_body_bytes is required when the feature is opt-in.
+    if routing_config.pin_conversations and max_request_body_bytes is None:
+        raise _ConfigError(
+            "pin_conversations requires max_request_body_bytes to be set "
+            "to a finite limit (unbounded buffering is a memory risk)"
+        )
+
     app = ProxyApp(
         providers=providers,
         route_table=route_table,
@@ -1009,6 +1069,7 @@ def _build_serve_app(
         admin_token=admin_token if isinstance(admin_token, str) else None,
         queue_timeout=queue_timeout,
         drain_timeout=drain_timeout,
+        max_request_body_bytes=max_request_body_bytes,
         overload_config=overload_config,
         overload_statuses=overload_statuses,
         reroute_statuses=reroute_statuses,
@@ -1017,6 +1078,7 @@ def _build_serve_app(
         estimator=estimator,
         budget_tracker=budget_tracker,
         usage_history_tracker=usage_history_tracker,
+        speed_sampler=speed_sampler,
         config_store=config_store,
         toml_provider_names=frozenset(toml_provider_sections),
         toml_provider_sections=toml_provider_sections,

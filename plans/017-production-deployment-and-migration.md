@@ -1,6 +1,12 @@
 # Plan 017 — Production deployment and OSS-provider migration
 
-Status: proposed execution plan (authored 2026-08-06)
+Status: **substantially implemented.** Wave 0 (reroute review) and Wave 1
+(Dockerfile, listen-precedence fix, strict config validation,
+exhausted-estate observability, k8s manifests, image CI, model-map admin API
++ dashboard + WI-12b follow-ups) have landed on main. Still open: WI-9
+(alerting), WI-10 (soak/chaos harness), WI-11 (operator runbook), and the
+operational WIs (WI-7 deploy proof, WI-8 opencode migration) that live
+outside this repo. Originally authored 2026-08-06.
 
 Depends on: nothing new. Every routing capability this plan deploys is
 already implemented and tested.

@@ -54,8 +54,11 @@ from switchboard.admin import (
     handle_model_map_delete,
     handle_model_map_list,
     handle_model_map_set,
+    handle_preview_path,
     handle_provider_create,
     handle_provider_delete,
+    handle_provider_discover,
+    handle_provider_registry,
     handle_provider_test,
     handle_provider_update,
     handle_providers_list,
@@ -82,6 +85,7 @@ from switchboard.control import (
     RoutingConfig,
     SignalFreshness,
     compose_upstream_path,
+    extract_conversation_fingerprint,
     hash_route_key,
     route_decision,
     should_reroute,
@@ -97,6 +101,7 @@ from switchboard.session import (
     SESSION_COOKIE,
     LoginThrottle,
 )
+from switchboard.speed import SpeedSampler
 from switchboard.token_budget import TokenBudgetTracker
 from switchboard.usage_history import UsageHistoryTracker
 from switchboard.usage_observer import UsageObserver
@@ -119,7 +124,6 @@ _DRAIN_POLL_INTERVAL = 0.1
 _QUEUE_TIMEOUT_DEFAULT = 30.0
 _DRAIN_TIMEOUT_DEFAULT = 25.0
 _RECENT_DECISIONS_MAX = 128
-_AFFINITY_MAX = 1024
 _OVERLOAD_STATUSES_DEFAULT = frozenset({503, 529})
 
 
@@ -289,6 +293,7 @@ class RoutingMetrics:
     evicted_decisions: int = 0
     affinity_pins_total: int = 0
     affinity_failbacks_total: int = 0
+    affinity_evictions_total: int = 0
     usage_reroutes_total: int = 0
     usage_reroutes_from: dict[str, int] = field(default_factory=dict)
     usage_giveups_total: int = 0
@@ -300,6 +305,10 @@ class RoutingMetrics:
     def record_affinity_failback(self) -> None:
         """Record a return to the primary that popped an affinity pin."""
         self.affinity_failbacks_total += 1
+
+    def record_affinity_eviction(self) -> None:
+        """Record an LRU eviction of an affinity entry (pin loss)."""
+        self.affinity_evictions_total += 1
 
     def record_decision(
         self, route_key: str, selected: str, primary: str
@@ -382,6 +391,7 @@ class ProxyApp:
         estimator: ThresholdEstimator | None = None,
         budget_tracker: TokenBudgetTracker | None = None,
         usage_history_tracker: UsageHistoryTracker | None = None,
+        speed_sampler: SpeedSampler | None = None,
         reroute_statuses: frozenset[int] | None = None,
         reroute_max_attempts: int = 0,
         config_store: ConfigStoreManager | None = None,
@@ -437,6 +447,7 @@ class ProxyApp:
         self._reroute_max_attempts = max(0, int(reroute_max_attempts))
         self._estimator = estimator
         self._budget_tracker = budget_tracker
+        self._speed_sampler = speed_sampler
         self._usage_history_tracker = usage_history_tracker
         self._build_sha = os.environ.get("SWITCHBOARD_BUILD_SHA") or None
         self._login_throttle = LoginThrottle()
@@ -493,6 +504,7 @@ class ProxyApp:
                     "/admin/routes", "/admin/config",
                     "/admin/config/effective", "/admin/config/reset",
                     "/admin/model-map", "/admin/providers",
+                    "/admin/preview-path",
                     "/admin/threshold-events", "/admin/usage-history",
                     "/login", "/logout",
                 )
@@ -568,6 +580,7 @@ class ProxyApp:
                     budget_tracker=self._budget_tracker,
                     usage_history_tracker=self._usage_history_tracker,
                     model_map_mgr=self._model_map_mgr,
+                    speed_sampler=self._speed_sampler,
                 )
                 return
             if path == "/metrics":
@@ -578,6 +591,7 @@ class ProxyApp:
                     budget_tracker=self._budget_tracker,
                     usage_history_tracker=self._usage_history_tracker,
                     estimator=self._estimator,
+                    speed_sampler=self._speed_sampler,
                 )
                 return
 
@@ -733,6 +747,46 @@ class ProxyApp:
                 )
                 return
             await send_text(send, 405, "Method not allowed")
+            return
+
+        # Plan 021 Wave 2: registry + discovery. MUST precede the generic
+        # /admin/providers/<name> branch below, or "registry"/"discover" would
+        # be treated as a provider name.
+        if path == "/admin/providers/registry" and method == "GET":
+            authed = check_admin_auth(scope, self._admin_token)
+            if not authed and self._admin_token:
+                await send_json(
+                    send, 401, {"error": "unauthorized"},
+                    extra_headers=cors_extra_headers(
+                        self._cors_allow_origin, None
+                    ),
+                )
+                return
+            await handle_provider_registry(
+                send, self._cors_allow_origin,
+            )
+            return
+
+        if path == "/admin/providers/discover" and method == "POST":
+            await handle_provider_discover(
+                send, receive, self._admin_token, scope,
+                self._cors_allow_origin,
+            )
+            return
+
+        if path == "/admin/preview-path" and method == "GET":
+            authed = check_admin_auth(scope, self._admin_token)
+            if not authed and self._admin_token:
+                await send_json(
+                    send, 401, {"error": "unauthorized"},
+                    extra_headers=cors_extra_headers(
+                        self._cors_allow_origin, None
+                    ),
+                )
+                return
+            await handle_preview_path(
+                send, scope, self._cors_allow_origin,
+            )
             return
 
         if path == "/admin/usage-history" and method == "GET":
@@ -958,9 +1012,11 @@ class ProxyApp:
         model_map = self._model_map_mgr.get_model_map()
         has_model_map = bool(model_map.routes)
 
-        # Buffer the body when either feature needs it: model rewriting reads
-        # it, and usage-error reroute must be able to replay it.
-        if has_model_map or self._reroute_max_attempts > 0:
+        # Buffer the body when any feature needs it: model rewriting reads it,
+        # usage-error reroute must replay it, and conversation pinning reads
+        # the first user message for a fingerprint (Plan 019 §6).
+        pin_conversations = self._routing_config.pin_conversations
+        if has_model_map or self._reroute_max_attempts > 0 or pin_conversations:
             buffered_body, overflow = await self._buffer_request_body(receive)
             if overflow:
                 await send_json(
@@ -979,6 +1035,16 @@ class ProxyApp:
                 servable_providers = model_map.providers_for(
                     request_model
                 )
+
+        # Affinity key: the conversation fingerprint when pinning is opt-in
+        # (Plan 019 §6.4), else the API-key hash.  route_key (hashed_key)
+        # stays the API-key hash for table lookup + metrics — never mix the
+        # two (review finding 12).
+        if pin_conversations and buffered_body is not None:
+            fingerprint = extract_conversation_fingerprint(buffered_body)
+            affinity_key: str = fingerprint or hashed_key
+        else:
+            affinity_key = hashed_key
 
         now_mono = time.monotonic()
 
@@ -1020,25 +1086,30 @@ class ProxyApp:
 
         primary = candidates[0]
 
-        st = states.get(primary)
-        healthy = (
-            st is not None
-            and st.signal_freshness is SignalFreshness.FRESH
-            and st.availability is Availability.AVAILABLE
-        )
-        if healthy:
-            self._provider_healthy_since.setdefault(primary, now_mono)
-        else:
-            self._provider_healthy_since.pop(primary, None)
+        # Track a continuous-healthy clock per provider, not just the
+        # configured primary: when a model map excludes the original primary,
+        # route_decision re-derives the effective primary and needs *that*
+        # provider's clock for the failback-hysteresis check (Plan 014).
+        for cand in candidates:
+            cst = states.get(cand)
+            cand_healthy = (
+                cst is not None
+                and cst.signal_freshness is SignalFreshness.FRESH
+                and cst.availability is Availability.AVAILABLE
+            )
+            if cand_healthy:
+                self._provider_healthy_since.setdefault(cand, now_mono)
+            else:
+                self._provider_healthy_since.pop(cand, None)
 
         table = self._route_table.get_route_table()
-        affinity = self._affinity.get(hashed_key)
+        affinity = self._affinity.get(affinity_key)
         plan = route_decision(
             states, table, hashed_key, self._routing_config,
             now=now_mono,
             affinity=affinity,
             servable_providers=servable_providers,
-            primary_healthy_since=self._provider_healthy_since.get(primary),
+            healthy_since=dict(self._provider_healthy_since),
         )
 
         admitted: tuple[str, ProviderContext] | None = None
@@ -1128,17 +1199,28 @@ class ProxyApp:
 
         if acquired_provider != primary:
             select_time = time.monotonic()
-            self._affinity[hashed_key] = RouteAffinity(
+            self._affinity[affinity_key] = RouteAffinity(
                 provider=acquired_provider,
                 selected_at=select_time,
                 failover_reason=plan.reason,
             )
-            self._affinity.move_to_end(hashed_key)
-            if len(self._affinity) > _AFFINITY_MAX:
-                self._affinity.popitem(last=False)
+            self._affinity.move_to_end(affinity_key)
+            self._evict_affinity()
             self._metrics.record_affinity_pin()
+        elif pin_conversations and affinity is None:
+            # Conversation pinning (Plan 019 §6.4): pin the FIRST request to
+            # whichever provider served it — including the primary — so the
+            # conversation stays there until the provider drops.
+            select_time = time.monotonic()
+            self._affinity[affinity_key] = RouteAffinity(
+                provider=acquired_provider,
+                selected_at=select_time,
+                failover_reason=plan.reason,
+            )
+            self._affinity.move_to_end(affinity_key)
+            self._evict_affinity()
         elif affinity is not None and affinity.provider != primary:
-            if self._affinity.pop(hashed_key, None) is not None:
+            if self._affinity.pop(affinity_key, None) is not None:
                 self._metrics.record_affinity_failback()
 
         # Usage-error reroute loop (Plan 010, reactive half). One pass per
@@ -1219,14 +1301,13 @@ class ProxyApp:
                     # This attempt served. Re-pin so later requests in the
                     # conversation go straight here instead of repaying the
                     # exhausted provider's failed round trip.
-                    self._affinity[hashed_key] = RouteAffinity(
+                    self._affinity[affinity_key] = RouteAffinity(
                         provider=rerouted_to,
                         selected_at=time.monotonic(),
                         failover_reason="usage_error_reroute",
                     )
-                    self._affinity.move_to_end(hashed_key)
-                    if len(self._affinity) > _AFFINITY_MAX:
-                        self._affinity.popitem(last=False)
+                    self._affinity.move_to_end(affinity_key)
+                    self._evict_affinity()
                     self._metrics.record_affinity_pin()
                 if (
                     not forward_failed
@@ -1291,17 +1372,17 @@ class ProxyApp:
         if (
             not forward_failed
             and acquired_provider != primary
-            and hashed_key in self._affinity
+            and affinity_key in self._affinity
         ):
-            old = self._affinity[hashed_key]
+            old = self._affinity[affinity_key]
             if old.provider == acquired_provider:
-                self._affinity[hashed_key] = RouteAffinity(
+                self._affinity[affinity_key] = RouteAffinity(
                     provider=old.provider,
                     selected_at=old.selected_at,
                     failover_reason=old.failover_reason,
                     healthy_observations=old.healthy_observations + 1,
                 )
-                self._affinity.move_to_end(hashed_key)
+                self._affinity.move_to_end(affinity_key)
 
     def _record_usage_give_up(
         self, tried: set[str], statuses: Mapping[str, int]
@@ -1645,6 +1726,10 @@ class ProxyApp:
                 method, url, headers=headers, content=content
             )
 
+            # Speed statistics (Plan 020 Wave 3): request-open timestamp for
+            # TTFB/duration. Timing only — no body content read for this.
+            req_start = time.monotonic()
+
             entry_task = asyncio.ensure_future(stream_cm.__aenter__())
             disconnect_task = asyncio.ensure_future(disconnect.wait())
             await asyncio.wait(
@@ -1684,6 +1769,7 @@ class ProxyApp:
                     await disconnect_task
 
             response = entry_task.result()
+            ttfb_ms = (time.monotonic() - req_start) * 1000.0
 
             try:
                 if response.status_code == 429:
@@ -1888,6 +1974,28 @@ class ProxyApp:
                                 usage[1],
                                 now=time.monotonic(),
                             )
+
+                    # Speed statistics (Plan 020 Wave 3): record TTFB +
+                    # duration for every successful, fully-served response.
+                    # Completion tokens ride along only when the opt-in usage
+                    # observer already parsed them — no extra body reading.
+                    if (
+                        self._speed_sampler is not None
+                        and 200 <= response.status_code < 300
+                        and not upstream_idle
+                        and not disconnect.is_set()
+                    ):
+                        comp_tokens: int | None = None
+                        if observer is not None:
+                            ou = observer.usage
+                            comp_tokens = ou[1] if ou is not None else None
+                        self._speed_sampler.record(
+                            ctx.name,
+                            ttfb_ms=ttfb_ms,
+                            duration_ms=(time.monotonic() - req_start)
+                            * 1000.0,
+                            completion_tokens=comp_tokens,
+                        )
             finally:
                 with contextlib.suppress(Exception):
                     await stream_cm.__aexit__(None, None, None)
@@ -1915,6 +2023,15 @@ class ProxyApp:
                 watcher_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await watcher_task
+
+    def _evict_affinity(self) -> None:
+        """Evict the oldest affinity entry if the LRU table exceeds its
+        configured bound, counting the eviction so operators can detect
+        pin loss (Plan 019 §6.6)."""
+        bound = self._routing_config.affinity_max_entries
+        if len(self._affinity) > bound:
+            self._affinity.popitem(last=False)
+            self._metrics.record_affinity_eviction()
 
     def _build_url(self, ctx: ProviderContext, scope: Scope) -> str:
         """Build the upstream URL from the provider's base URL + path + query.
