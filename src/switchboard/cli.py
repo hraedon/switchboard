@@ -682,26 +682,48 @@ def _build_serve_app(
             ctx.reconcile._stopped = True
         raise
 
-    if not default_providers:
-        default_providers = tuple(providers.keys())
-        route_table.set_default_providers(default_providers)
-
-    for name in default_providers:
-        if name not in providers and name not in tombstoned_providers:
-            raise _ConfigError(
-                f"default route references unknown provider: {name}"
-            )
-
     route_table.load_from_config(config_data, overwrite=store_path is None)
+
+    # Resolve the default route only AFTER load_from_config: that call is the
+    # last writer of the default before this point (it installs the TOML
+    # default, unless an operator-set default in the store outranks it — Plan
+    # 020 WI-8, D1). Reading the route table's own view rather than the local
+    # TOML-derived tuple is what lets a stored default survive to here; an
+    # earlier version filtered the local copy and was clobbered (cycle-2
+    # review, finding 1).
+    declared_default = tuple(route_table.default_providers)
+    default_from_store = route_table.default_from_store
+
+    unknown = [
+        name for name in declared_default
+        if name not in providers and name not in tombstoned_providers
+    ]
+    if unknown:
+        if not default_from_store:
+            raise _ConfigError(
+                f"default route references unknown provider: {unknown[0]}"
+            )
+        # A stored default naming providers this config no longer defines is
+        # the one case that must NOT be fatal: the operator set it through the
+        # GUI, so crashing here would let a GUI edit brick the next boot with
+        # no way back in except hand-editing SQLite. Drop the dead names and
+        # carry on, matching WI-0's log-and-skip precedent for model-map rows.
+        log.warning(
+            "default route: dropping provider(s) %s from the stored default "
+            "— not defined by the current config",
+            ", ".join(unknown),
+        )
+        declared_default = tuple(
+            name for name in declared_default if name not in unknown
+        )
+
+    if not declared_default:
+        declared_default = tuple(providers.keys())
 
     # A tombstoned name in the declared default would just be dead weight in
     # every routing decision (admission skips it) — drop it and say so, so
     # the operator sees the default that actually fires (wave 0+1 review,
-    # finding 6). MUST run after load_from_config: that call re-sets the
-    # default from the TOML unconditionally and would clobber the filter
-    # (cycle-2 review, finding 1). Filter the route table's own view, which
-    # includes whatever load_from_config just installed.
-    declared_default = tuple(route_table.default_providers)
+    # finding 6).
     live_default = tuple(
         name for name in declared_default if name not in tombstoned_providers
     )
@@ -713,13 +735,17 @@ def _build_serve_app(
             ", ".join(dropped),
             list(live_default),
         )
-        if not live_default:
-            raise _ConfigError(
-                "default route has no live providers — every declared "
-                "provider is disabled in the config store"
-            )
-        default_providers = live_default
-        route_table.set_default_providers(default_providers)
+    if not live_default:
+        raise _ConfigError(
+            "default route has no live providers — every declared "
+            "provider is disabled in the config store"
+        )
+
+    default_providers = live_default
+    # persist=False: everything derived above is a conclusion about THIS boot
+    # (the all-providers fallback, the unknown/tombstone filters), not operator
+    # intent. Writing it back would freeze a transient condition on disk.
+    route_table.set_default_providers(default_providers)
 
     routing_config = RoutingConfig()
     routing_section = config_data.get("routing", {})

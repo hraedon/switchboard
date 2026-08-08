@@ -830,6 +830,144 @@ async def handle_route_delete(
     await send_json(send, 200, {"removed": True}, extra_headers=cors)
 
 
+async def handle_route_default_set(
+    send: Send,
+    receive: Receive,
+    route_table: RouteTableManager,
+    admin_token: str | None,
+    scope: Scope,
+    cors_allow_origin: str | None = None,
+    providers: dict[str, ProviderContext] | None = None,
+) -> None:
+    """PUT /admin/routes/default — replace the default route.
+
+    Body: ``{"providers": ["umans", "ollama"]}``, ordered by preference.
+
+    This is what makes GUI provider management useful (Plan 020 WI-8): the
+    model map only *filters* a route's candidate list, it never adds to it,
+    so a provider that no route names is unreachable no matter how it was
+    created. Before this endpoint the default route was boot-only, which made
+    "add provider" in the GUI a dead end.
+
+    The write persists, so it outranks the TOML default on the next restart
+    (D1: the store wins wholesale).
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(
+            send, 405,
+            {"error": "mutations disabled — set --admin-token to enable"},
+            extra_headers=cors,
+        )
+        return
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    ct = next(
+        (
+            v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+            if k == b"content-type"
+        ),
+        "",
+    )
+    if not ct.lower().startswith("application/json"):
+        await send_json(
+            send, 415,
+            {"error": "Content-Type must be application/json"},
+            extra_headers=cors,
+        )
+        return
+
+    try:
+        body = await read_body(receive)
+    except ValueError:
+        await send_json(
+            send, 413, {"error": "request body too large"},
+            extra_headers=cors,
+        )
+        return
+    except ConnectionError:
+        return
+
+    try:
+        data = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        await send_json(
+            send, 400, {"error": "invalid JSON body"},
+            extra_headers=cors,
+        )
+        return
+
+    if not isinstance(data, dict):
+        await send_json(
+            send, 400, {"error": "body must be a JSON object"},
+            extra_headers=cors,
+        )
+        return
+
+    providers_raw = data.get("providers")
+    if not isinstance(providers_raw, list) or not providers_raw:
+        # An empty default is not a valid state: unkeyed traffic would have no
+        # candidates and every request would 503. Removing the default is not
+        # an operation this API offers.
+        await send_json(
+            send, 400,
+            {"error": "missing required field 'providers' (must be non-empty)"},
+            extra_headers=cors,
+        )
+        return
+    if not all(isinstance(p, str) for p in providers_raw):
+        await send_json(
+            send, 400, {"error": "providers must be a list of strings"},
+            extra_headers=cors,
+        )
+        return
+
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for p in providers_raw:
+        if p in seen:
+            duplicates.add(p)
+        seen.add(p)
+    if duplicates:
+        # Order is preference order; a repeated name has no meaning and most
+        # likely means the operator edited the wrong row.
+        await send_json(
+            send, 400,
+            {"error": f"duplicate provider(s): {', '.join(sorted(duplicates))}"},
+            extra_headers=cors,
+        )
+        return
+
+    if providers is not None:
+        unknown = [p for p in providers_raw if p not in providers]
+        if unknown:
+            await send_json(
+                send, 400,
+                {"error": f"unknown provider(s): {', '.join(unknown)}"},
+                extra_headers=cors,
+            )
+            return
+
+    route_table.set_default_providers(tuple(providers_raw), persist=True)
+
+    log.info("default route set: %s", " -> ".join(providers_raw))
+
+    await send_json(
+        send, 200,
+        {"default": list(providers_raw), "persisted": route_table.db is not None},
+        extra_headers=cors,
+    )
+
+
 async def handle_model_map_list(
     send: Send,
     model_map_mgr: ModelMapManager,

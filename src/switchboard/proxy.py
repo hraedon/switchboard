@@ -60,6 +60,7 @@ from switchboard.admin import (
     handle_providers_list,
     handle_readyz,
     handle_route_add,
+    handle_route_default_set,
     handle_route_delete,
     handle_route_list,
     handle_threshold_events,
@@ -486,6 +487,9 @@ class ProxyApp:
                     "/login", "/logout",
                 )
                 or (
+                    path == "/admin/routes/default"
+                )
+                or (
                     path.startswith("/admin/providers/")
                 )
                 or (
@@ -584,6 +588,20 @@ class ProxyApp:
                 return
             if method == "POST":
                 await handle_route_add(
+                    send, receive, self._route_table,
+                    self._admin_token, scope, self._cors_allow_origin,
+                    self._providers,
+                )
+                return
+            await send_text(send, 405, "Method not allowed")
+            return
+
+        # MUST precede the generic /admin/routes/<key> branch below: "default"
+        # is not a hashed key, and letting DELETE fall through would answer
+        # "route not found" for an entry that cannot be deleted at all.
+        if path == "/admin/routes/default":
+            if method == "PUT":
+                await handle_route_default_set(
                     send, receive, self._route_table,
                     self._admin_token, scope, self._cors_allow_origin,
                     self._providers,

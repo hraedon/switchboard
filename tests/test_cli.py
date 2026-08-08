@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 
 import pytest
 
@@ -438,6 +439,100 @@ class TestConfigStoreBootMerge:
         assert set(app._providers) == {"umans"}
         # The store row won: upstream comes from the row, not the TOML.
         assert app._providers["umans"].upstream_url == "http://127.0.0.1:9009"
+
+
+class TestDefaultRouteBootMerge:
+    """Plan 020 WI-8: an operator-set default route survives a restart."""
+
+    _TWO_PROVIDERS = _SERVE_PROVIDER + (
+        "[provider.ollama]\n"
+        'upstream = "http://127.0.0.1:11434"\n'
+        "target = 1\n"
+    )
+
+    def _seed_default(self, store_file: str, providers: tuple[str, ...]) -> None:
+        from switchboard.route_table import RouteTableManager
+
+        seed = RouteTableManager(sqlite_path=store_file)
+        seed.set_default_providers(providers, persist=True)
+        seed.close()
+
+    def test_stored_default_outranks_toml_at_boot(self, tmp_path) -> None:
+        store_file = str(tmp_path / "rt.db")
+        self._seed_default(store_file, ("ollama", "umans"))
+
+        cfg = _write_serve_config(
+            tmp_path,
+            self._TWO_PROVIDERS
+            + "[route.default]\nproviders = [\"umans\"]\n",
+        )
+        app, _, _, _, _ = _build_serve_app(
+            _serve_args(config=cfg, route_table_store=store_file)
+        )
+        assert app._route_table.default_providers == ("ollama", "umans")
+
+    def test_toml_default_used_when_store_has_none(self, tmp_path) -> None:
+        store_file = str(tmp_path / "rt.db")
+        cfg = _write_serve_config(
+            tmp_path,
+            self._TWO_PROVIDERS
+            + "[route.default]\nproviders = [\"umans\"]\n",
+        )
+        app, _, _, _, _ = _build_serve_app(
+            _serve_args(config=cfg, route_table_store=store_file)
+        )
+        assert app._route_table.default_providers == ("umans",)
+
+    def test_stored_default_naming_a_gone_provider_warns_not_bricks(
+        self, tmp_path, caplog
+    ) -> None:
+        """The asymmetry that matters: a GUI-set default must never make the
+        process unbootable. The operator cannot fix an unbootable process
+        through the GUI — the only way back in would be hand-editing SQLite.
+        """
+        store_file = str(tmp_path / "rt.db")
+        self._seed_default(store_file, ("ollama", "ghost"))
+
+        cfg = _write_serve_config(tmp_path, self._TWO_PROVIDERS)
+        with caplog.at_level("WARNING"):
+            app, _, _, _, _ = _build_serve_app(
+                _serve_args(config=cfg, route_table_store=store_file)
+            )
+        assert app._route_table.default_providers == ("ollama",)
+        assert "ghost" in caplog.text
+
+    def test_toml_default_naming_an_unknown_provider_still_fails(
+        self, tmp_path
+    ) -> None:
+        """The TOML side keeps its hard error — a typo in a hand-edited file
+        should be caught loudly, and the operator has an editor to fix it."""
+        cfg = _write_serve_config(
+            tmp_path,
+            self._TWO_PROVIDERS
+            + "[route.default]\nproviders = [\"ghost\"]\n",
+        )
+        with pytest.raises(_ConfigError, match="unknown provider"):
+            _build_serve_app(_serve_args(config=cfg))
+
+    def test_boot_does_not_persist_its_derived_default(self, tmp_path) -> None:
+        """The all-providers fallback is a conclusion about this boot, not
+        operator intent — it must not be written back to the store."""
+        store_file = str(tmp_path / "rt.db")
+        cfg = _write_serve_config(tmp_path, self._TWO_PROVIDERS)
+        app, _, _, _, _ = _build_serve_app(
+            _serve_args(config=cfg, route_table_store=store_file)
+        )
+        assert app._route_table.default_providers == ("umans", "ollama")
+        assert app._route_table.default_from_store is False
+
+        db = sqlite3.connect(store_file)
+        try:
+            row = db.execute(
+                "SELECT COUNT(*) FROM route_default"
+            ).fetchone()
+        finally:
+            db.close()
+        assert row[0] == 0
 
 
 def test_tombstoned_provider_reference_warns_not_bricks(

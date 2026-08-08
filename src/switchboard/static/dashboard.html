@@ -90,8 +90,117 @@ button {
 </head>
 <body>
 <h1>switchboard</h1>
+<div id="default-route"></div>
 <div id="app">Loading...</div>
 <script>
+// The default route is the only control on this page that WRITES, so it lives
+// outside #app: the 5 s poll replaces #app wholesale and would wipe a
+// half-typed edit. `editingDefault` additionally freezes this section while a
+// form is open, so a poll landing mid-edit cannot discard what was typed.
+let editingDefault = false;
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+function renderDefaultRoute(data) {
+  if (editingDefault) return;
+  const el = document.getElementById('default-route');
+  const current = (data.route_table || {})['default'] || [];
+  const known = Object.keys(data.providers || {}).sort();
+  el.innerHTML = `
+    <h2>Default Route</h2>
+    <div class="card">
+      <p style="margin:0 0 0.6rem;color:var(--muted);font-size:0.85rem">
+        Where requests go when no route key matches, in preference order.
+        A provider that no route names is never selected &mdash; the model map
+        filters a route's candidates, it never adds to them.
+      </p>
+      <div class="stat">
+        <span class="k">current</span>
+        <span class="v">${current.length ? esc(current.join(' → ')) : '<em>none</em>'}</span>
+      </div>
+      <div style="margin-top:0.6rem">
+        <button id="edit-default">Edit</button>
+      </div>
+    </div>`;
+  document.getElementById('edit-default').onclick = () => {
+    editingDefault = true;
+    renderDefaultRouteForm(current, known);
+  };
+}
+
+function renderDefaultRouteForm(current, known) {
+  const el = document.getElementById('default-route');
+  el.innerHTML = `
+    <h2>Default Route</h2>
+    <div class="card">
+      <div class="form-row">
+        <label for="default-input">
+          Providers, comma-separated, most preferred first
+        </label>
+        <input id="default-input" list="known-providers"
+               value="${esc(current.join(', '))}" autocomplete="off">
+        <datalist id="known-providers">
+          ${known.map(n => `<option value="${esc(n)}">`).join('')}
+        </datalist>
+      </div>
+      <p style="margin:0.3rem 0 0.6rem;color:var(--muted);font-size:0.8rem">
+        Configured: ${known.length ? known.map(esc).join(', ') : '<em>none</em>'}
+      </p>
+      <div id="default-error" style="color:var(--red);font-size:0.85rem;
+           margin-bottom:0.5rem"></div>
+      <button id="save-default">Save</button>
+      <button id="cancel-default"
+              style="background:transparent;border:1px solid var(--border)">
+        Cancel
+      </button>
+    </div>`;
+
+  document.getElementById('cancel-default').onclick = () => {
+    editingDefault = false;
+    load();
+  };
+
+  document.getElementById('save-default').onclick = async () => {
+    const raw = document.getElementById('default-input').value;
+    const providers = raw.split(',').map(s => s.trim()).filter(s => s);
+    const errEl = document.getElementById('default-error');
+    errEl.textContent = '';
+    try {
+      // Same-origin fetch: the browser attaches the session cookie and
+      // Sec-Fetch-Site: same-origin, which is what the CSRF check wants.
+      const resp = await fetch('/admin/routes/default', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ providers }),
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        // Surface the server's message verbatim — it names the offending
+        // provider, which is the whole reason validation lives server-side.
+        errEl.textContent = body.error || `request failed (${resp.status})`;
+        return;
+      }
+      if (body.persisted === false) {
+        errEl.style.color = 'var(--amber)';
+        errEl.textContent =
+          'Saved, but not persisted: no route table store is configured, ' +
+          'so this reverts on restart.';
+        setTimeout(() => { editingDefault = false; load(); }, 4000);
+        return;
+      }
+      editingDefault = false;
+      load();
+    } catch (e) {
+      errEl.textContent = String(e);
+    }
+  };
+}
+
 function fmtTokens(n) {
   if (n == null) return '-';
   if (n >= 1e9) return (n/1e9).toFixed(1)+'B';
@@ -118,6 +227,8 @@ async function load() {
   }
   const data = await resp.json();
   const el = document.getElementById('app');
+
+  renderDefaultRoute(data);
 
   let html = '<h2>Providers</h2><div class="grid">';
   for (const [name, p] of Object.entries(data.providers || {})) {
@@ -215,11 +326,22 @@ async function load() {
     html += `</div></div>`;
   }
 
-  html += '<h2>Route Table</h2><table><thead><tr><th>Key (truncated)</th><th>Providers</th></tr></thead><tbody>';
-  for (const [key, providers] of Object.entries(data.route_table || {})) {
-    html += `<tr><td><code>${key.substring(0, 16)}...</code></td><td>${providers.join(' &rarr; ')}</td></tr>`;
+  // "default" is a reserved key in this payload, not a hashed route key —
+  // it has its own editable section above, and truncating it here rendered a
+  // phantom "default..." row alongside real keys.
+  const keyedRoutes = Object.entries(data.route_table || {})
+    .filter(([key]) => key !== 'default');
+  html += '<h2>Route Table</h2>';
+  if (keyedRoutes.length === 0) {
+    html += '<p style="color:var(--muted)">No keyed routes — all traffic '
+         +  'follows the default route.</p>';
+  } else {
+    html += '<table><thead><tr><th>Key (truncated)</th><th>Providers</th></tr></thead><tbody>';
+    for (const [key, providers] of keyedRoutes) {
+      html += `<tr><td><code>${key.substring(0, 16)}...</code></td><td>${providers.join(' &rarr; ')}</td></tr>`;
+    }
+    html += '</tbody></table>';
   }
-  html += '</tbody></table>';
 
   // Model Map — the operator question is "who can serve this model", so the
   // matrix shows every configured provider per model, with the alias filled in

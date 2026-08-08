@@ -180,6 +180,31 @@ are so Plans 015/016 behavior is unchanged.
   GUI is a dead end until this lands. Persist the default in the store
   alongside keyed routes.
 
+  **WI-8a (default route) DONE 2026-08-07.** `route_default` table in the
+  route-table store, `PUT /admin/routes/default`, and a dashboard editor.
+  Precedence per D1: a persisted default outranks TOML; `load_from_config`
+  now respects a store-sourced default the same way it already respected
+  persisted keyed entries. Boot-derived values (the all-providers fallback,
+  the unknown/tombstone filters) are applied with `persist=False` so a
+  transient condition never gets frozen on disk.
+
+  Asymmetry worth keeping in mind for the rest of Wave 2: **an unknown
+  provider in a TOML default is fatal, in a stored default it is a warning.**
+  A GUI edit must never be able to make the process unbootable, because the
+  GUI is then unreachable — the same rule should govern WI-6's provider forms
+  and WI-7's model aliases.
+
+  **Not done, still WI-8:** the strategy selector and pace knobs (correctly
+  gated on Wave 4), and keyed-route CRUD in the GUI — the API exists but the
+  panel does not.
+
+  Left behind for WI-6/7: `tests/gui/default_route.mjs`, a DOM-shim harness
+  that drives dashboard JS under node with no browser dependency, wrapped by
+  `tests/test_gui_default_route.py` (skips when node is absent). It pins the
+  behaviours a GUI regression actually loses — a poll landing mid-edit
+  discarding typed input, a 400 not surfacing the rejected name, an
+  unescaped provider name. Extend it rather than starting a browser stack.
+
 **Wave 3 — statistics (#2)**
 - **WI-9**: Speed sampling per D4 (TTFB, duration, tokens/sec) into
   per-provider rings; unit tests with the mock-stream harness (mock
@@ -221,6 +246,15 @@ Carried forward deliberately, not forgotten:
   Tighten estate-wide in Wave 2 (all modern browsers send
   `Sec-Fetch-Site`; the permissive branch exists for curl workflows —
   decide whether to keep it for token-authed requests only).
+
+  Still open, and now inherited by `PUT /admin/routes/default` as well
+  (WI-8a review, GLM). Deliberately NOT fixed there: it is pre-existing
+  and estate-wide, so fixing it inside one WI would change the auth
+  posture of every mutating endpoint under cover of a routing change.
+  The count of endpoints riding on it grows with each Wave 2 panel —
+  the longer this waits, the larger the blast radius of the eventual
+  fix, which argues for taking it as its own WI early in Wave 2 rather
+  than as a rider on the last one.
 - **First PUT of a TOML-only provider** (finding 3, residual): the list
   now exposes `key_mode`/`api_key_set` so the GUI can pre-fill, but the
   API itself still accepts a full-row PUT that changes key_mode without
