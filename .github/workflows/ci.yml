@@ -44,3 +44,10 @@ jobs:
         run: .venv/bin/mypy src
       - name: pytest
         run: .venv/bin/pytest -q
+      # Plan 017 WI-10. In-process fake upstreams, no network. Kept out of
+      # pytest deliberately: it asserts estate-level properties (no leaked
+      # permits, no hung requests) under concurrent load, which is a slower
+      # and coarser thing than a unit test, and it must stay runnable as one
+      # command by an operator.
+      - name: chaos harness
+        run: .venv/bin/python scripts/chaos_harness.py
