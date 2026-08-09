@@ -421,6 +421,14 @@ def coerce_routing_value(field: str, value: Any) -> Any:
     Call only after :func:`validate_routing_field` has returned ``None`` — this
     trusts the value's shape and decides its type from the same table.
 
+    **It does not police field names, and validation alone is not enough to
+    make it safe.** ``validate_routing_field`` returns ``None`` for a name it
+    has never heard of (no bounds entry means "not range-checked here"), so an
+    unknown name arrives looking validated and falls through to ``float()``.
+    Every caller today iterates :data:`MUTABLE_ROUTING_FIELDS`, which is what
+    actually enforces the contract; a future caller that takes field names from
+    a request body must do the same rather than trusting the validator.
+
     The reason it exists: both runtime surfaces (``PUT /admin/config/routing``
     and the persisted store overlay) used to cast every non-boolean,
     non-strategy field with ``float()``.  That is correct for the ratio knobs
