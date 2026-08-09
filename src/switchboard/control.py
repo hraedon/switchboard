@@ -17,6 +17,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 
 class Availability(Enum):
@@ -412,6 +413,31 @@ def validate_routing_field(field: str, value: object) -> str | None:
         elif numeric >= bound.maximum:
             return f"{field} must be {bound.describe()}"
     return None
+
+
+def coerce_routing_value(field: str, value: Any) -> Any:
+    """Convert a validated routing value to the type ``RoutingConfig`` declares.
+
+    Call only after :func:`validate_routing_field` has returned ``None`` — this
+    trusts the value's shape and decides its type from the same table.
+
+    The reason it exists: both runtime surfaces (``PUT /admin/config/routing``
+    and the persisted store overlay) used to cast every non-boolean,
+    non-strategy field with ``float()``.  That is correct for the ratio knobs
+    and wrong for the integer ones — ``quarantine_threshold = 3`` became
+    ``3.0``, so a field the dataclass declares ``int`` held a float, and every
+    surface that reported it showed ``3.0``.  TOML did not have the bug, which
+    is the worse shape of it: the same value read back differently depending on
+    which door it came through.
+    """
+    if field == "strategy":
+        return RoutingStrategy(str(value))
+    if field in ROUTING_BOOL_FIELDS:
+        return bool(value)
+    bound = ROUTING_FIELD_BOUNDS.get(field)
+    if bound is not None and bound.integer:
+        return int(value)
+    return float(value)
 
 
 @dataclass(frozen=True)

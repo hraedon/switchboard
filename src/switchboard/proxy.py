@@ -540,8 +540,16 @@ class ProxyApp:
         Strategy, pace knobs, and dwell/failback intervals are all mutable;
         ``affinity_max_entries`` is NOT (resizing the live table would evict
         active pins) — pass the same value back.
+
+        ``quarantine_threshold`` lives on this config but is *held* by the
+        quarantine tracker, so it is pushed across here. Without that the knob
+        was mutable in name only: the PUT was accepted and persisted, the
+        tracker kept counting to the old number, and the change appeared at the
+        next restart instead.
         """
         self._routing_config = config
+        if self._quarantine is not None:
+            self._quarantine.set_threshold(config.quarantine_threshold)
 
     async def __call__(
         self, scope: Scope, receive: Receive, send: Send

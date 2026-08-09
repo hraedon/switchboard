@@ -280,6 +280,32 @@ def _provider_status(
     return status
 
 
+def routing_config_payload(routing_config: Any) -> dict[str, Any]:
+    """Serialise a ``RoutingConfig`` for every surface that reports one.
+
+    ``/status.json``, ``GET /admin/config`` and the ``PUT /admin/config/routing``
+    response each used to hand-list the fields they cared about. Three
+    hand-lists is three chances to forget one, and ``quarantine_threshold``
+    (Plan 023) was forgotten by two of them: it was settable and persisted but
+    invisible everywhere an operator would look to confirm it.
+
+    So the enumeration lives here once, derived from
+    ``MUTABLE_ROUTING_FIELDS`` plus the display-only fields, and
+    ``test_config_surfaces`` asserts every mutable field appears — a new knob
+    that skips a surface fails the test instead of going quiet in production.
+    """
+    payload: dict[str, Any] = {}
+    for name in _MUTABLE_ROUTING_FIELDS:
+        value = getattr(routing_config, name)
+        payload[name] = value.value if name == "strategy" else value
+    # Retained for display; not settable at runtime (see MUTABLE_ROUTING_FIELDS).
+    payload["failover_threshold_seconds"] = routing_config.failover_threshold_seconds
+    payload["failover_margin"] = routing_config.failover_margin
+    payload["pin_conversations"] = routing_config.pin_conversations
+    payload["affinity_max_entries"] = routing_config.affinity_max_entries
+    return payload
+
+
 def _build_status_payload(
     providers: dict[str, ProviderContext],
     route_table: RouteTableManager,
@@ -338,14 +364,7 @@ def _build_status_payload(
         }
 
     if routing_config is not None:
-        payload["routing_config"] = {
-            "strategy": routing_config.strategy.value,
-            "dwell_interval": routing_config.dwell_interval,
-            "failback_delay": routing_config.failback_delay,
-            "pace_burn_rate_per_day": routing_config.pace_burn_rate_per_day,
-            "pace_flap_margin": routing_config.pace_flap_margin,
-            "headroom_ranking": routing_config.headroom_ranking,
-        }
+        payload["routing_config"] = routing_config_payload(routing_config)
 
     if estimator is not None:
         est = estimator.state().estimate
@@ -1316,17 +1335,8 @@ async def handle_config_get(
     routing_config: Any,
     cors_allow_origin: str | None = None,
 ) -> None:
-    """GET /admin/config — current routing config."""
-    body = {
-        "failover_threshold_seconds": routing_config.failover_threshold_seconds,
-        "failover_margin": routing_config.failover_margin,
-        "dwell_interval": routing_config.dwell_interval,
-        "headroom_threshold": routing_config.headroom_threshold,
-        "token_budget_threshold": routing_config.token_budget_threshold,
-        "strategy": routing_config.strategy.value,
-        "pace_burn_rate_per_day": routing_config.pace_burn_rate_per_day,
-        "pace_flap_margin": routing_config.pace_flap_margin,
-    }
+    """GET /admin/config — current routing config, in full."""
+    body = routing_config_payload(routing_config)
     await send_json(
         send, 200, body,
         extra_headers=cors_extra_headers(cors_allow_origin, None),
@@ -1436,7 +1446,8 @@ async def handle_routing_config_update(
     ``dwell_interval``, ``failback_delay``, ``headroom_threshold``,
     ``headroom_ranking``, ``token_budget_threshold``, ``usage_24h_threshold``,
     ``opportunistic_enabled``, ``opportunistic_min_headroom``,
-    ``opportunistic_reset_window``, ``opportunistic_margin``.
+    ``opportunistic_reset_window``, ``opportunistic_margin``,
+    ``quarantine_threshold``.
 
     NOT mutable: ``affinity_max_entries`` (resizing the live table would evict
     active pins), ``pin_conversations`` (requires a body-buffering restart to
@@ -1444,9 +1455,9 @@ async def handle_routing_config_update(
     (retained for display only).
     """
     from switchboard.control import (
-        ROUTING_BOOL_FIELDS,
         RoutingConfig,
         RoutingStrategy,
+        coerce_routing_value,
         validate_routing_field,
     )
 
@@ -1528,12 +1539,9 @@ async def handle_routing_config_update(
         if message is not None:
             errors.append(message)
             continue
-        if field_name == "strategy":
-            kwargs["strategy"] = RoutingStrategy(value)
-        elif field_name in ROUTING_BOOL_FIELDS:
-            kwargs[field_name] = value
-        else:
-            kwargs[field_name] = float(value)
+        # Typed from the same bounds table that validated it, so an integer
+        # knob stays an integer (`quarantine_threshold` used to arrive as 3.0).
+        kwargs[field_name] = coerce_routing_value(field_name, value)
 
     # Reject strategy + headroom_ranking conflict
     final_strategy = kwargs.get("strategy")
@@ -1586,22 +1594,7 @@ async def handle_routing_config_update(
                 exc_info=True,
             )
 
-    body_out = {
-        "persisted": persisted,
-        "strategy": new_config.strategy.value,
-        "dwell_interval": new_config.dwell_interval,
-        "failback_delay": new_config.failback_delay,
-        "pace_burn_rate_per_day": new_config.pace_burn_rate_per_day,
-        "pace_flap_margin": new_config.pace_flap_margin,
-        "headroom_ranking": new_config.headroom_ranking,
-        "headroom_threshold": new_config.headroom_threshold,
-        "token_budget_threshold": new_config.token_budget_threshold,
-        "usage_24h_threshold": new_config.usage_24h_threshold,
-        "opportunistic_enabled": new_config.opportunistic_enabled,
-        "opportunistic_min_headroom": new_config.opportunistic_min_headroom,
-        "opportunistic_reset_window": new_config.opportunistic_reset_window,
-        "opportunistic_margin": new_config.opportunistic_margin,
-    }
+    body_out = {"persisted": persisted, **routing_config_payload(new_config)}
     await send_json(send, 200, body_out, extra_headers=cors)
 
 

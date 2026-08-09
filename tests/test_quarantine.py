@@ -183,6 +183,43 @@ def test_threshold_zero_disables_quarantining() -> None:
     assert t.counters()["p/m"] == 20
 
 
+# ── changing the threshold at runtime ──────────────────────────────────────
+
+
+def test_a_lowered_threshold_applies_to_the_next_failure() -> None:
+    t = _tracker(threshold=5)
+    for _ in range(2):
+        t.record("p", "m", FailureAttribution.PROVIDER, status=500)
+    t.set_threshold(3)
+    assert t.threshold == 3
+    assert t.record("p", "m", FailureAttribution.PROVIDER, status=500) is True
+    assert t.is_quarantined("p", "m") is True
+
+
+def test_lowering_the_threshold_does_not_quarantine_retroactively() -> None:
+    """A pair already past the new threshold stays in service until it fails
+    again. Editing a config value must not take a provider out by itself."""
+    t = _tracker(threshold=10)
+    for _ in range(4):
+        t.record("p", "m", FailureAttribution.PROVIDER, status=500)
+    t.set_threshold(2)
+    assert t.is_quarantined("p", "m") is False
+    assert t.record("p", "m", FailureAttribution.PROVIDER, status=500) is True
+
+
+def test_raising_the_threshold_does_not_release_anything() -> None:
+    """Only a human releases (Plan 023 §6); a config edit must not clear a
+    standing alarm nobody has looked at."""
+    t = _tracker(threshold=5)
+    for _ in range(5):
+        t.record("p", "m", FailureAttribution.PROVIDER, status=500)
+    assert t.is_quarantined("p", "m") is True
+    t.set_threshold(50)
+    assert t.is_quarantined("p", "m") is True
+    t.set_threshold(0)
+    assert t.is_quarantined("p", "m") is True
+
+
 def test_entry_carries_enough_to_decide_without_logs() -> None:
     t = _tracker()
     for _ in range(5):

@@ -1,6 +1,7 @@
 # Plan 023 — Provider/model quarantine
 
-Status: **Wave 1 proposed.** Authored 2026-08-09.
+Status: **WI-1 – WI-3 landed; WI-4 landed except the dashboard panel (WI-006);
+WI-5 live-validated 2026-08-09.** Authored 2026-08-09.
 
 Depends on: the model map (Plan 010 Feature B) for the (provider, model) pair,
 and the config store (Plan 020 Wave 1) for persistence.
@@ -116,10 +117,60 @@ traffic for others, and an all-quarantined model says so.
 **Done when:** an operator can see what is quarantined and why, and release it,
 without a restart or a shell.
 
-### WI-5 — Live validation (open)
+**Status: API done, dashboard panel open.** The endpoints, the `/status.json`
+section and the operator runbook (§12) landed. The dashboard panel with a
+Release button did not — releasing still needs a `curl`, which fails the
+"without a shell" half of the bar above.
 
-Force a real provider-attributable failure against the deployed instance and
-watch a pair quarantine, then release it.
+### WI-4a — `quarantine_threshold` reaches every surface
+
+The knob was validated, mutable and persisted, but missing from `/status.json`
+and `GET /admin/config` (both hand-listed their fields), coerced to a float on
+both runtime paths despite being declared `int`, and never pushed to the live
+tracker — so a `PUT` was accepted, persisted, and inert until the next restart
+replayed the overlay. One shared `routing_config_payload()` now feeds all three
+reporting surfaces, `coerce_routing_value()` types values from the same bounds
+table that validated them, and `update_routing_config` pushes the threshold
+into the tracker.
+
+**Done:** `test_config_surfaces` fails if a mutable knob misses a surface or
+changes type, and `test_quarantine_e2e` drives the real `PUT` and then counts
+real failures against the new threshold.
+
+### WI-5 — Live validation — **DONE 2026-08-09**
+
+Executed against the deployed pod (`978bc300`) once PR #12 gave it an admin
+token. A throwaway provider pointed at the pod-local discard port
+(`http://127.0.0.1:9/v1`) made every attempt a connect refusal — a real
+transport error, not a simulated one — reached through a dedicated route key so
+the probe could not touch the default route or real traffic.
+
+| Step | Result |
+|---|---|
+| requests 1–4 | `502`, counter `wi5-probe/wi5-probe-model` → 1,2,3,4; no entry |
+| request 5 | quarantined at exactly 5; `ERROR ... QUARANTINED` names the release command |
+| request 6 | `503` with `reason: quarantined`, the pair listed, and `release_with` |
+| `DELETE /admin/quarantine/…` | `200`; entry **and** counter cleared |
+| request 7 | back to `502` — the pair takes traffic again |
+| second `DELETE` | `404`, not a silent `200` |
+| **pod restart while quarantined** | entry survived a full pod replacement with original timestamps; counters correctly did not (in-memory by design) |
+
+Teardown verified against a pre-run snapshot: providers, route table, model map
+and quarantine all byte-identical to baseline.
+
+**Two findings came out of the run, neither visible from the tests.**
+
+1. **The entry carries no evidence for a transport failure** — `last_status:
+   null`, `last_detail: ""`. `_forward` catches `httpx.RequestError` itself
+   (`proxy.py:2191`) and never re-raises, so `forward_failed` is False and the
+   `detail = "forward failed"` branch at `proxy.py:1457` is dead for the whole
+   transport-failure class. §4's "everything a human needs to decide, without
+   going to the logs" is unmet for the first row of §3's own table. Attribution
+   is unaffected. **WI-007.**
+2. Confirmed as suspected: quarantine records only when `request_model` is
+   non-None, and that is extracted **only when a model map is configured**
+   (`proxy.py:1146`). An instance with no model map quarantines nothing at all.
+   Not hit here (the deployed instance has a map), still undocumented.
 
 ## 6. Deliberate non-goals
 

@@ -229,6 +229,35 @@ class QuarantineTracker:
     def threshold(self) -> int:
         return self._threshold
 
+    def set_threshold(self, threshold: int) -> None:
+        """Adopt a new threshold at runtime (``PUT /admin/config/routing``).
+
+        The knob is listed as runtime-mutable, but the tracker is built once at
+        boot from ``RoutingConfig.quarantine_threshold``, so without this the
+        new value only reached the config object: the operator's change looked
+        applied, changed nothing, and then took effect at the next restart when
+        the persisted overlay was read — a delayed effect with no visible cause.
+
+        Two deliberate non-behaviours:
+
+        - **No retroactive quarantine.** Lowering the threshold below a pair's
+          current streak does not quarantine it on the spot; the next
+          provider-attributable failure does. Editing a config value must not
+          take a provider out of service by itself.
+        - **No retroactive release.** Raising the threshold, or setting 0 to
+          disable, leaves existing entries quarantined. Only a human releases
+          (Plan 023 §6) — otherwise a config edit silently clears a standing
+          alarm nobody looked at.
+        """
+        if threshold == self._threshold:
+            return
+        log.info(
+            "quarantine threshold %d -> %d (existing entries are unaffected; "
+            "release them with DELETE /admin/quarantine/<provider>/<model>)",
+            self._threshold, threshold,
+        )
+        self._threshold = threshold
+
     # -- releasing -----------------------------------------------------------
 
     def release(self, provider: str, model: str) -> bool:
