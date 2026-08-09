@@ -102,6 +102,7 @@ button {
 <div id="add-provider"></div>
 <div id="route-add"></div>
 <div id="model-add"></div>
+<div id="routing-config-editor"></div>
 <div id="app">Loading...</div>
 <script>
 // The default route is the only control on this page that WRITES, so it lives
@@ -919,6 +920,162 @@ function fmtDuration(sec) {
   if(m>0) return m+'m '+s+'s';
   return s+'s';
 }
+
+// ── Routing Config editor (Plan 020 WI-14 runtime swap) ──────────────────
+// Lives outside #app for the same reason the default-route editor does: the
+// 5 s poll rebuilds #app wholesale. `editingRouting` freezes this section
+// while the form is open.
+let editingRouting = false;
+
+function renderRoutingConfigEditor(data) {
+  if (editingRouting) return;
+  const el = document.getElementById('routing-config-editor');
+  const rc = data.routing_config;
+  if (!rc) { el.innerHTML = ''; return; }
+
+  // Pace surplus ranking (only meaningful when strategy is pace)
+  let surplusHtml = '';
+  if (rc.strategy === 'pace') {
+    const provNames = Object.keys(data.providers || {});
+    const scored = [];
+    for (const name of provNames) {
+      const p = data.providers[name];
+      if (p && p.weekly_remaining_fraction != null && p.weekly_reset_epoch != null && !p.stale) {
+        const resetIn = Math.max(0, (p.weekly_reset_epoch - Date.now()/1000));
+        const daysUntilReset = resetIn / 86400;
+        const burnRate = rc.pace_burn_rate_per_day != null ? rc.pace_burn_rate_per_day : 0.14;
+        const surplus = p.weekly_remaining_fraction - burnRate * daysUntilReset;
+        scored.push({name, surplus, remaining: p.weekly_remaining_fraction, resetIn});
+      }
+    }
+    scored.sort((a, b) => b.surplus - a.surplus);
+    if (scored.length > 0) {
+      surplusHtml = '<div class="card"><h3>Pace Surplus Ranking</h3>'
+        + '<p style="margin:0 0 0.5rem;color:var(--muted);font-size:0.8rem">'
+        + 'Higher surplus = more quota than needed before reset → burn first.</p>';
+      scored.forEach((s, i) => {
+        const cls = s.surplus > 0 ? 'token-warn' : 'token-crit';
+        surplusHtml += `<div class="stat"><span class="k">${i+1}. ${esc(s.name)}</span>`
+          + `<span class="v ${cls}">+${s.surplus.toFixed(3)}</span></div>`;
+      });
+      // Show unscored providers
+      const unscored = provNames.filter(n => !scored.find(s => s.name === n));
+      if (unscored.length > 0) {
+        surplusHtml += '<p style="margin:0.4rem 0 0.2rem;color:var(--muted);font-size:0.8rem">'
+          + 'Unscored (no fresh weekly data):</p>';
+        unscored.forEach(n => {
+          surplusHtml += `<div class="stat"><span class="k">${esc(n)}</span><span class="v" style="color:var(--muted)">unscored</span></div>`;
+        });
+      }
+      surplusHtml += '</div>';
+    }
+  }
+
+  el.innerHTML = `
+    <h2>Routing Config</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>Strategy</h3>
+        <div class="stat"><span class="k">strategy</span><span class="v">${esc(rc.strategy || 'ordered')}</span></div>
+        <div class="stat"><span class="k">dwell_interval</span><span class="v">${rc.dwell_interval || '-'}</span></div>
+        <div class="stat"><span class="k">failback_delay</span><span class="v">${rc.failback_delay != null ? rc.failback_delay : '-'}</span></div>
+        ${rc.strategy === 'pace' ? `
+          <div class="stat"><span class="k">burn_rate_per_day</span><span class="v">${rc.pace_burn_rate_per_day != null ? rc.pace_burn_rate_per_day : '-'}</span></div>
+          <div class="stat"><span class="k">flap_margin</span><span class="v">${rc.pace_flap_margin != null ? rc.pace_flap_margin : '-'}</span></div>` : ''}
+        <div style="margin-top:0.6rem"><button id="edit-routing">Edit Strategy</button></div>
+      </div>
+      ${surplusHtml}
+    </div>`;
+
+  const editBtn = document.getElementById('edit-routing');
+  if (editBtn) editBtn.onclick = () => {
+    editingRouting = true;
+    renderRoutingConfigForm(rc);
+  };
+}
+
+function renderRoutingConfigForm(rc) {
+  const el = document.getElementById('routing-config-editor');
+  el.innerHTML = `
+    <h2>Routing Config</h2>
+    <div class="card">
+      <div class="form-row">
+        <label for="rc-strategy">Strategy</label>
+        <select id="rc-strategy">
+          <option value="ordered" ${rc.strategy === 'ordered' ? 'selected' : ''}>ordered (table order)</option>
+          <option value="headroom" ${rc.strategy === 'headroom' ? 'selected' : ''}>headroom (session headroom ranking)</option>
+          <option value="pace" ${rc.strategy === 'pace' ? 'selected' : ''}>pace (weekly quota surplus)</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label for="rc-burn-rate">Pace burn rate per day (0–1)</label>
+        <input id="rc-burn-rate" type="number" step="0.01" min="0" max="1"
+               value="${rc.pace_burn_rate_per_day != null ? rc.pace_burn_rate_per_day : 0.14}">
+      </div>
+      <div class="form-row">
+        <label for="rc-flap-margin">Pace flap margin (0–1, exclusive of 1)</label>
+        <input id="rc-flap-margin" type="number" step="0.01" min="0" max="0.99"
+               value="${rc.pace_flap_margin != null ? rc.pace_flap_margin : 0.05}">
+      </div>
+      <div class="form-row">
+        <label for="rc-dwell">Dwell interval (seconds)</label>
+        <input id="rc-dwell" type="number" step="1" min="0"
+               value="${rc.dwell_interval != null ? rc.dwell_interval : 30}">
+      </div>
+      <div class="form-row">
+        <label for="rc-failback">Failback delay (seconds, 0 = off)</label>
+        <input id="rc-failback" type="number" step="1" min="0"
+               value="${rc.failback_delay != null ? rc.failback_delay : 0}">
+      </div>
+      <div id="rc-error" style="color:var(--red);font-size:0.85rem;margin-bottom:0.5rem"></div>
+      <p style="margin:0.3rem 0 0.6rem;color:var(--muted);font-size:0.8rem">
+        Changes take effect immediately on the next routing decision, and are
+        saved to the config store so they survive a restart. Only the fields
+        you change are saved; the rest keep following the config file.
+      </p>
+      <button id="save-routing">Save</button>
+      <button id="cancel-routing" style="background:transparent;border:1px solid var(--border)">Cancel</button>
+    </div>`;
+
+  document.getElementById('cancel-routing').onclick = () => {
+    editingRouting = false;
+    load();
+  };
+
+  document.getElementById('save-routing').onclick = async () => {
+    const body = {};
+    const strategy = document.getElementById('rc-strategy').value;
+    if (strategy) body.strategy = strategy;
+    const burnRate = parseFloat(document.getElementById('rc-burn-rate').value);
+    if (!isNaN(burnRate)) body.pace_burn_rate_per_day = burnRate;
+    const flapMargin = parseFloat(document.getElementById('rc-flap-margin').value);
+    if (!isNaN(flapMargin)) body.pace_flap_margin = flapMargin;
+    const dwell = parseFloat(document.getElementById('rc-dwell').value);
+    if (!isNaN(dwell)) body.dwell_interval = dwell;
+    const failback = parseFloat(document.getElementById('rc-failback').value);
+    if (!isNaN(failback)) body.failback_delay = failback;
+
+    const errEl = document.getElementById('rc-error');
+    errEl.textContent = '';
+    try {
+      const resp = await fetch('/admin/config/routing', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify(body),
+      });
+      const respBody = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        errEl.textContent = respBody.error || `request failed (${resp.status})`;
+        return;
+      }
+      editingRouting = false;
+      load();
+    } catch (e) {
+      errEl.textContent = String(e);
+    }
+  };
+}
 async function load() {
   const resp = await fetch('/status.json');
   if (!resp.ok) {
@@ -932,6 +1089,7 @@ async function load() {
   renderAddProvider(data);
   renderRouteAdd(data);
   renderModelAdd(data);
+  renderRoutingConfigEditor(data);
 
   // Separate surface from status.json, and optional: a dashboard served
   // without an admin token still renders everything else rather than failing
@@ -1019,6 +1177,36 @@ async function load() {
       html += `<div class="section-title">Usage Reading</div>`;
       html += `<div class="stat"><span class="k">tokens_in</span><span class="v">${fmtTokens(p.tokens_in)}</span></div>`;
       html += `<div class="stat"><span class="k">tokens_out</span><span class="v">${fmtTokens(p.tokens_out)}</span></div>`;
+    }
+
+    // Weekly-window quota (Plan 020 D6) — the pace strategy's signal.
+    // Shows remaining %, reset countdown, and estimated days until exhausted
+    // at the current burn rate.
+    if (p.weekly_remaining_fraction != null) {
+      html += `<div class="section-title">Weekly Quota</div>`;
+      const remaining = p.weekly_remaining_fraction;
+      const usedPct = (1 - remaining) * 100;
+      const cls = remaining <= 0.15 ? 'token-crit' : (remaining <= 0.30 ? 'token-warn' : '');
+      html += `<div class="stat"><span class="k">remaining</span><span class="v ${cls}">${fmtPct(remaining)}</span></div>`;
+      html += `<div class="stat"><span class="k">used</span><span class="v">${usedPct.toFixed(1)}%</span></div>`;
+      if (p.weekly_reset_epoch != null) {
+        const resetIn = Math.max(0, Math.floor(p.weekly_reset_epoch - Date.now()/1000));
+        html += `<div class="stat"><span class="k">resets_in</span><span class="v">${fmtDuration(resetIn)}</span></div>`;
+        // Estimated days until exhausted: if 40% used and reset_in is 1 day,
+        // burn rate = 0.40/day → remaining 0.60 / 0.40 = 1.5 days.
+        // Only show when the provider is actively consuming (used > 0).
+        if (usedPct > 0.5) {
+          const daysElapsed = (86400 * 7 - resetIn) / 86400;
+          if (daysElapsed > 0.01) {
+            const burnPerDay = (usedPct / 100) / daysElapsed;
+            if (burnPerDay > 0) {
+              const daysLeft = remaining / burnPerDay;
+              const estCls = daysLeft < 1 ? 'token-crit' : (daysLeft < 3 ? 'token-warn' : '');
+              html += `<div class="stat"><span class="k">est_exhaustion</span><span class="v ${estCls}">${daysLeft.toFixed(1)} days</span></div>`;
+            }
+          }
+        }
+      }
     }
 
     // Per-provider speed (Plan 020 Wave 3)

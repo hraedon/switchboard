@@ -1,18 +1,26 @@
 # Plan 020 — GUI-managed configuration, per-provider statistics, pace-based routing
 
-Status: **Waves 0–1 landed; Wave 2 mostly landed; Wave 3 landed; Wave 4
-proposed.** Wave 1 (ConfigStoreManager, ProviderManager, admin provider CRUD
-+ test probe, `/admin/config/effective`, k8s PVC) is on main. Wave 2 delivered
-the runtime-editable default route (WI-8a), the Add-Provider form (Plan 021
-WI-5), and keyed-route + model-map CRUD from the dashboard (WI-7 + the
-keyed-route half of WI-8). Wave 3 (per-provider speed statistics — TTFB,
-duration, tokens/sec) is landed: a `SpeedSampler` records timing per
-successful streamed response and feeds `/status.json`, `/metrics`, and the
-dashboard (WI-9 + WI-10; WI-11 persistence deferred). Still open: the
-edit-provider form (WI-6, completes WI-7's env-lock input-disabling), the
-strategy selector (blocked on Wave 4), and Wave 4 (pace-based routing,
-depends on external usage-dashboard monitoring). Originally authored
-2026-08-06.
+Status: **Waves 0–3 landed; Wave 4 code complete, unvalidated.** Wave 1
+(ConfigStoreManager, ProviderManager, admin provider CRUD + test probe,
+`/admin/config/effective`, k8s PVC) is on main. Wave 2 delivered the
+runtime-editable default route (WI-8a), the Add-Provider form (Plan 021
+WI-5), keyed-route + model-map CRUD from the dashboard (WI-7 + the
+keyed-route half of WI-8), and the edit-provider form (WI-6). Wave 3
+(per-provider speed statistics — TTFB, duration, tokens/sec) is landed.
+
+Wave 4 pace routing: WI-12 (weekly-window plumbing — `LimitState.weekly_*`,
+`ProviderState.weekly_*`, dashboard mapping, snapshot), WI-13 (pure-core
+`pace_surplus` + `pace_rank` scoring), and WI-14 (strategy enum, pace config
+knobs, both config surfaces, runtime swap + persistence, dashboard editor)
+are implemented and tested.
+
+**Nothing about pace routing has been observed against a live provider.**
+WI-15 (live validation) is the gate, and it is still open: it needs at least
+one provider reporting a real weekly window. Until then `strategy = "pace"`
+is opt-in, defaults off, and every provider without a fresh weekly signal is
+unscored — so an unvalidated formula cannot silently take over routing.
+
+Originally authored 2026-08-06.
 
 Depends on: Plan 018 (landed — switchboard is self-contained). Interacts
 with: Plan 019 (multi-account + conversation pinning, still draft — §9),

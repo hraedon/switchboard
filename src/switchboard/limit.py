@@ -60,6 +60,13 @@ class LimitState:
     age_seconds: float = 0.0
     provider: str = "umans"
 
+    # Weekly-window quota fields (Plan 020 D6). Mapped from the usage-dashboard
+    # reading's ``weekly_percent``/``weekly_resets_at`` by the dashboard truth
+    # source. In-memory only — no history schema change. None = no weekly
+    # signal (the pace strategy never scores these providers; fail safe).
+    weekly_remaining_fraction: float | None = None
+    weekly_reset_epoch: float | None = None
+
 
 UsageReading = LimitState
 

@@ -67,6 +67,7 @@ from switchboard.admin import (
     handle_route_default_set,
     handle_route_delete,
     handle_route_list,
+    handle_routing_config_update,
     handle_threshold_events,
     handle_usage_history,
     send_dashboard,
@@ -509,6 +510,27 @@ class ProxyApp:
         """Routing metrics for /status.json and /metrics."""
         return self._metrics
 
+    @property
+    def routing_config(self) -> RoutingConfig:
+        """The current routing config (Plan 020 WI-14 runtime swap)."""
+        return self._routing_config
+
+    @property
+    def config_store(self) -> ConfigStoreManager:
+        """The config store, where a routing change is persisted."""
+        return self._config_store
+
+    def update_routing_config(self, config: RoutingConfig) -> None:
+        """Swap the routing config at runtime (Plan 020 WI-14).
+
+        Replaces the frozen ``RoutingConfig`` wholesale — the proxy reads it
+        per-request so the change takes effect on the next routing decision.
+        Strategy, pace knobs, and dwell/failback intervals are all mutable;
+        ``affinity_max_entries`` is NOT (resizing the live table would evict
+        active pins) — pass the same value back.
+        """
+        self._routing_config = config
+
     async def __call__(
         self, scope: Scope, receive: Receive, send: Send
     ) -> None:
@@ -536,6 +558,7 @@ class ProxyApp:
                     "/", "/status.json", "/metrics",
                     "/admin/routes", "/admin/config",
                     "/admin/config/effective", "/admin/config/reset",
+                    "/admin/config/routing",
                     "/admin/model-map", "/admin/providers",
                     "/admin/preview-path",
                     "/admin/threshold-events", "/admin/usage-history",
@@ -614,6 +637,7 @@ class ProxyApp:
                     usage_history_tracker=self._usage_history_tracker,
                     model_map_mgr=self._model_map_mgr,
                     speed_sampler=self._speed_sampler,
+                    routing_config=self._routing_config,
                 )
                 return
             if path == "/metrics":
@@ -736,6 +760,13 @@ class ProxyApp:
                 )
                 return
             await send_text(send, 405, "Method not allowed")
+            return
+
+        if path == "/admin/config/routing" and method == "PUT":
+            await handle_routing_config_update(
+                send, receive, self,
+                self._admin_token, scope, self._cors_allow_origin,
+            )
             return
 
         if path == "/admin/config/effective" and method == "GET":

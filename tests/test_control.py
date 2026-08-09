@@ -13,8 +13,10 @@ from switchboard.control import (
     RouteEntry,
     RouteTable,
     RoutingConfig,
+    RoutingStrategy,
     SignalFreshness,
     hash_route_key,
+    pace_surplus,
     route_decision,
 )
 
@@ -33,6 +35,8 @@ def _state(
     token_utilization: float | None = None,
     token_soft_threshold: float | None = None,
     usage_24h_utilization: float | None = None,
+    weekly_remaining_fraction: float | None = None,
+    weekly_reset_in: float | None = None,
 ) -> ProviderState:
     return ProviderState(
         name=name,
@@ -47,6 +51,8 @@ def _state(
         token_utilization=token_utilization,
         token_soft_threshold=token_soft_threshold,
         usage_24h_utilization=usage_24h_utilization,
+        weekly_remaining_fraction=weekly_remaining_fraction,
+        weekly_reset_in=weekly_reset_in,
     )
 
 
@@ -1740,3 +1746,406 @@ def test_opportunistic_after_non_primary_affinity_failback() -> None:
     plan = route_decision(states, table, "k", config, now=100.0, affinity=None)
     assert plan.immediate_candidates[0] == "zai"
     assert plan.reason == "opportunistic"
+
+
+# --- Plan 020 Wave 4: pace routing tests (WI-13) ----------------------------
+
+_PACE_CONFIG = RoutingConfig(strategy=RoutingStrategy.PACE)
+
+
+def test_pace_surplus_none_without_weekly_data() -> None:
+    """A provider with no weekly signal is unscored (fail safe)."""
+    st = _state("zai")
+    assert pace_surplus(st, 0.14) is None
+
+
+def test_pace_surplus_none_when_stale() -> None:
+    """A non-FRESH provider is unscored — stale data never promotes."""
+    st = _state(
+        "zai",
+        signal_freshness=SignalFreshness.DEGRADED,
+        weekly_remaining_fraction=0.8,
+        weekly_reset_in=86400.0,
+    )
+    assert pace_surplus(st, 0.14) is None
+
+
+def test_pace_surplus_worked_example_a() -> None:
+    """Plan 020 D5 worked example A: 80% remaining, resets in 5 days.
+
+    expected_burn = 0.14 * 5 = 0.70 → surplus = 0.80 - 0.70 = +0.10
+    """
+    st = _state(
+        "zai",
+        weekly_remaining_fraction=0.80,
+        weekly_reset_in=5 * 86400.0,
+    )
+    assert pace_surplus(st, 0.14) == pytest.approx(0.10)
+
+
+def test_pace_surplus_worked_example_b() -> None:
+    """Plan 020 D5 worked example B: 40% remaining, resets in 1 day.
+
+    expected_burn = 0.14 * 1 = 0.14 → surplus = 0.40 - 0.14 = +0.26
+    B wins (higher surplus).
+    """
+    st = _state(
+        "ollama",
+        weekly_remaining_fraction=0.40,
+        weekly_reset_in=86400.0,
+    )
+    assert pace_surplus(st, 0.14) == pytest.approx(0.26)
+
+
+def test_pace_surplus_negative_when_burning_fast() -> None:
+    """90% remaining but resets in 8 days → surplus = 0.90 - 1.12 = -0.22."""
+    st = _state(
+        "zai",
+        weekly_remaining_fraction=0.90,
+        weekly_reset_in=8 * 86400.0,
+    )
+    assert pace_surplus(st, 0.14) == pytest.approx(-0.22)
+
+
+def test_pace_surplus_zero_at_nominal_burn() -> None:
+    """50% remaining, resets in ~3.57 days → surplus ≈ 0."""
+    st = _state(
+        "zai",
+        weekly_remaining_fraction=0.50,
+        weekly_reset_in=0.50 / 0.14 * 86400.0,
+    )
+    assert pace_surplus(st, 0.14) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_pace_ranks_by_surplus_descending() -> None:
+    """B (surplus +0.26) outranks A (surplus +0.10) → B fronts."""
+    config = RoutingConfig(strategy=RoutingStrategy.PACE)
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.80, weekly_reset_in=5 * 86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.40, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    assert plan.immediate_candidates[0] == "ollama"
+    assert plan.reason == "pace_failover"
+
+
+def test_pace_unscored_ranks_after_scored() -> None:
+    """An unscored provider (no weekly data) is never starved — it ranks
+    after scored providers in table order but stays immediate-eligible."""
+    config = RoutingConfig(strategy=RoutingStrategy.PACE)
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans"),  # no weekly data → unscored
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.40, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    # zai has a positive surplus, umans is unscored → zai fronts.
+    assert plan.immediate_candidates[0] == "zai"
+    # Both are immediate candidates (unscored is not excluded).
+    assert "umans" in plan.immediate_candidates
+
+
+def test_pace_flap_margin_preserves_table_order() -> None:
+    """When the leader's surplus advantage < pace_flap_margin, table order is
+    preserved to avoid per-request flapping between near-equal providers.
+
+    Discriminating case: the runner-up (ollama) has the HIGHER surplus. If
+    hysteresis works, table-order-first zai fronts; if hysteresis is removed,
+    ollama would front (it has the higher surplus)."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE, pace_flap_margin=0.10,
+    )
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    # zai surplus = 0.06; ollama surplus = 0.14; advantage = 0.08 < 0.10.
+    # ollama has higher surplus, so without hysteresis it would front.
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.20, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.28, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    # Hysteresis keeps table order → zai fronts despite lower surplus.
+    assert plan.immediate_candidates[0] == "zai"
+
+    # With margin=0.0, hysteresis fires only on exact ties (0 < 0 is false),
+    # so the re-rank should produce ollama first.
+    config_no_margin = RoutingConfig(
+        strategy=RoutingStrategy.PACE, pace_flap_margin=0.0,
+    )
+    plan2 = route_decision(states, table, "k", config_no_margin, now=100.0)
+    assert plan2.immediate_candidates[0] == "ollama"
+
+
+def test_pace_flap_margin_allows_rerank() -> None:
+    """When the leader's surplus advantage >= pace_flap_margin, re-rank fires."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE, pace_flap_margin=0.05,
+    )
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    # zai surplus = 0.10; ollama surplus = 0.26; advantage = 0.16 > 0.05.
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.80, weekly_reset_in=5 * 86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.40, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    assert plan.immediate_candidates[0] == "ollama"
+
+
+def test_pace_does_not_demote_primary() -> None:
+    """Pace is a ranking signal, not a demotion: the primary stays
+    immediate-eligible, queue backstop, and terminal fallback even when it has
+    the worst surplus. It may lose the *front* but it is not demoted."""
+    config = RoutingConfig(strategy=RoutingStrategy.PACE)
+    table = RouteTable(entries={}, default_providers=("umans", "ollama"))
+    states = {
+        "umans": _state(
+            "umans", weekly_remaining_fraction=0.10, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.90, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    # ollama has higher surplus → fronts. umans is still a candidate.
+    assert plan.immediate_candidates[0] == "ollama"
+    assert "umans" in plan.immediate_candidates
+    # terminal_fallback is still the primary (fail safe).
+    assert plan.terminal_fallback == "umans"
+
+
+def test_pace_with_affinity_still_pins() -> None:
+    """Pace ranking is subordinate to affinity: an active dwell pin is not
+    overridden by the pace ranking."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE, dwell_interval=30.0,
+    )
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.90, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.10, weekly_reset_in=86400.0,
+        ),
+    }
+    affinity = _affinity("ollama", selected_at=0.0)
+    plan = route_decision(states, table, "k", config, now=10.0, affinity=affinity)
+    # ollama has worse surplus, but the dwell pin holds it at front.
+    assert plan.immediate_candidates[0] == "ollama"
+    assert plan.reason == "affinity_dwell"
+
+
+def test_pace_strategy_default_is_ordered() -> None:
+    """Default strategy is ORDERED — pace does not fire unless opted in."""
+    config = RoutingConfig()  # default strategy
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.10, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.90, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    # Without pace, table order → zai (primary) fronts.
+    assert plan.immediate_candidates[0] == "zai"
+    assert plan.reason == "primary_available"
+
+
+def test_pace_custom_burn_rate() -> None:
+    """A custom burn_rate_per_day changes the surplus and thus the ranking."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE, pace_burn_rate_per_day=0.30,
+    )
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    # zai: 0.80 - 0.30*5 = 0.80 - 1.50 = -0.70
+    # ollama: 0.40 - 0.30*1 = 0.10
+    # ollama wins.
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.80, weekly_reset_in=5 * 86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.40, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    assert plan.immediate_candidates[0] == "ollama"
+
+
+def test_pace_all_unscored_preserves_table_order() -> None:
+    """When no provider has weekly data, pace is a no-op (table order)."""
+    config = RoutingConfig(strategy=RoutingStrategy.PACE)
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    states = {"zai": _state("zai"), "ollama": _state("ollama")}
+    plan = route_decision(states, table, "k", config, now=100.0)
+    assert plan.immediate_candidates[0] == "zai"
+    assert plan.reason == "primary_available"
+
+
+def test_pace_hysteresis_still_enforces_scored_first() -> None:
+    """Under hysteresis (margin too small), scored providers still rank before
+    unscored ones — the plan's "unscored ranks after scored" guardrail holds
+    even when surplus re-ranking is suppressed."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE, pace_flap_margin=0.50,
+    )
+    table = RouteTable(entries={}, default_providers=("umans", "zai", "ollama"))
+    # umans is table-first but unscored; zai and ollama are scored with
+    # near-equal surplus (advantage < 0.50). Without the scored-first guard,
+    # umans would front (table order). With it, zai/ollama front.
+    states = {
+        "umans": _state("umans"),  # unscored, table-first
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.50, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.55, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    # umans (unscored) must NOT front — scored providers rank first.
+    assert plan.immediate_candidates[0] != "umans"
+    assert "umans" in plan.immediate_candidates  # still immediate-eligible
+
+
+def test_pace_does_not_fire_opportunism() -> None:
+    """PACE subsumes Plan 016 opportunism: when strategy=pace, the
+    session-window opportunistic target does not fire (pace uses the weekly
+    window instead)."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE,
+        opportunistic_enabled=True,
+        opportunistic_min_headroom=0.5,
+        opportunistic_reset_window=21600.0,
+        opportunistic_margin=0.10,
+    )
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    # zai has weekly data (pace will rank it). ollama has session headroom
+    # that would trigger opportunism (headroom=0.9, reset_in=3600 < 21600).
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.50, weekly_reset_in=86400.0,
+            usage_headroom=0.2,  # low session headroom
+        ),
+        "ollama": _state(
+            "ollama",
+            usage_headroom=0.9,  # high session headroom → opportunistic candidate
+            quota_resets_in=3600.0,  # within opportunistic_reset_window
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    # Under PACE, opportunism does NOT fire (would be "opportunistic" reason).
+    # zai is the only scored provider → fronts.
+    assert plan.immediate_candidates[0] == "zai"
+    assert plan.reason != "opportunistic"
+
+
+def test_pace_reason_not_set_when_primary_absent_for_other_reasons() -> None:
+    """When the primary is BUSY (not pace-ranked out), the reason should be
+    'failover' not 'pace_failover' — pace didn't cause the failover."""
+    config = RoutingConfig(strategy=RoutingStrategy.PACE)
+    table = RouteTable(entries={}, default_providers=("umans", "ollama"))
+    # umans is BUSY -> not in immediate -> ollama fronts. Neither has weekly
+    # data, so pace didn't re-rank anything.
+    states = {
+        "umans": _state("umans", availability=Availability.BUSY),
+        "ollama": _state("ollama"),  # no weekly data
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    assert plan.immediate_candidates[0] == "ollama"
+    assert plan.reason == "failover"  # not pace_failover
+
+
+def test_pace_single_scored_preserves_no_margin_check() -> None:
+    """A single scored provider needs no margin check - it always fronts,
+    even when it is not table-order-first."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE, pace_flap_margin=0.50,
+    )
+    table = RouteTable(entries={}, default_providers=("ollama", "zai"))
+    # ollama is table-first but unscored; zai is scored.
+    # If a margin check were wrongly applied to a single scored provider,
+    # ollama would front. zai must front.
+    states = {
+        "ollama": _state("ollama"),  # unscored
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.50, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    # zai is the only scored provider -> fronts despite high flap_margin
+    # and despite not being table-order-first.
+    assert plan.immediate_candidates[0] == "zai"
+
+
+def test_pace_failover_reason_when_pace_reranks_primary() -> None:
+    """pace_failover fires only when pace re-ranked the primary off the front
+    AND the primary is still in immediate (pace moved it, not gate/24h)."""
+    config = RoutingConfig(strategy=RoutingStrategy.PACE)
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    # zai (primary) has lower surplus; ollama has higher surplus.
+    # pace re-ranks -> ollama fronts -> pace_failover.
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.10, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.90, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    assert plan.immediate_candidates[0] == "ollama"
+    assert plan.reason == "pace_failover"
+
+
+def test_pace_failover_reason_not_set_when_primary_busy() -> None:
+    """When the primary is BUSY and pace re-ranked the fallbacks, the reason
+    should be 'failover' not 'pace_failover' — pace didn't move the primary."""
+    config = RoutingConfig(strategy=RoutingStrategy.PACE)
+    table = RouteTable(entries={}, default_providers=("umans", "zai", "ollama"))
+    # umans (primary) is BUSY -> not in immediate. zai and ollama are scored
+    # with ollama having higher surplus -> pace re-ranks them.
+    states = {
+        "umans": _state("umans", availability=Availability.BUSY),
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.10, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.90, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    assert plan.immediate_candidates[0] == "ollama"
+    # Primary is not in immediate -> not pace_failover.
+    assert plan.reason == "failover"
+
+
+def test_headroom_strategy_equivalent_to_headroom_ranking() -> None:
+    """RoutingStrategy.HEADROOM produces the same ordering as
+    headroom_ranking=True."""
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    states = {
+        "zai": _state("zai", usage_headroom=0.2),
+        "ollama": _state("ollama", usage_headroom=0.9),
+    }
+    config_enum = RoutingConfig(strategy=RoutingStrategy.HEADROOM)
+    config_flag = RoutingConfig(headroom_ranking=True)
+    plan_enum = route_decision(states, table, "k", config_enum, now=100.0)
+    plan_flag = route_decision(states, table, "k", config_flag, now=100.0)
+    assert plan_enum.immediate_candidates == plan_flag.immediate_candidates

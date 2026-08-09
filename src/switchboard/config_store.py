@@ -35,6 +35,7 @@ raises and memory is unchanged, so what the admin sees is what persisted.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -66,6 +67,19 @@ CREATE TABLE IF NOT EXISTS provider_config (
     usage_key_env TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+)
+"""
+
+# The routing overlay (Plan 020 WI-14): the routing knobs an operator changed
+# through the admin API, stored as a single JSON row. It is an *overlay*, not a
+# full RoutingConfig — only the fields actually set are recorded, so a knob the
+# operator never touched keeps following TOML rather than being frozen at
+# whatever the default was on the day they first opened the GUI.
+_ROUTING_SCHEMA = """
+CREATE TABLE IF NOT EXISTS routing_config (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    overlay TEXT NOT NULL,
     updated_at REAL NOT NULL
 )
 """
@@ -155,6 +169,7 @@ class ConfigStoreManager:
         if self._db is not None:
             try:
                 self._db.execute(_SCHEMA)
+                self._db.execute(_ROUTING_SCHEMA)
                 self._db.commit()
             except sqlite3.Error:
                 # Boot must not crash on a bad store file; later writes will
@@ -441,6 +456,61 @@ class ConfigStoreManager:
             else:
                 effective.pop(name, None)
         return effective
+
+    # -- routing overlay (Plan 020 WI-14) ------------------------------------
+
+    def get_routing_overlay(self) -> dict[str, object]:
+        """The persisted routing knobs, or ``{}`` when none were ever set.
+
+        Read once at boot and layered over the TOML ``[routing]`` section, so
+        a strategy an operator selected in the GUI survives a restart — the
+        same store-wins rule the provider config and default route follow
+        (Plan 020 D1). A store that cannot be read yields ``{}``: falling back
+        to TOML is always safe, and a boot that dies on a corrupt overlay
+        would take routing down over a preference.
+        """
+        db = self._db
+        if db is None:
+            return {}
+        try:
+            row = db.execute(
+                "SELECT overlay FROM routing_config WHERE id = 1"
+            ).fetchone()
+        except sqlite3.Error:
+            log.warning(
+                "config store: could not read the routing overlay; "
+                "falling back to the TOML [routing] section",
+                exc_info=True,
+            )
+            return {}
+        if row is None:
+            return {}
+        try:
+            loaded = json.loads(row[0])
+        except (TypeError, ValueError):
+            log.warning(
+                "config store: routing overlay is not valid JSON; ignoring it"
+            )
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+
+    def set_routing_overlay(self, overlay: dict[str, object]) -> None:
+        """Persist the routing knobs an operator has changed.
+
+        Replaces the row wholesale — the caller passes the full overlay it
+        wants on disk, not a delta. No-op without persistence configured, in
+        which case the runtime swap is still live but does not survive a
+        restart (the admin response says so).
+        """
+        db = self._db
+        if db is None:
+            return
+        db.execute(
+            "INSERT OR REPLACE INTO routing_config (id, overlay, updated_at) "
+            "VALUES (1, ?, ?)",
+            (json.dumps(overlay), self._clock()),
+        )
+        db.commit()
 
     # -- misc ----------------------------------------------------------------
 
