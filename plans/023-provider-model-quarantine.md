@@ -140,9 +140,26 @@ real failures against the new threshold.
 ### WI-5 — Live validation (open)
 
 Force a real provider-attributable failure against the deployed instance and
-watch a pair quarantine, then release it. Blocked on the same thing as the rest
-of the k8s work: the deployed pod has no admin token set, so the release path
-cannot be exercised there yet.
+watch a pair quarantine, then release it.
+
+**Unblocked 2026-08-09** — the pod now has an admin token (PR #12), so
+`DELETE /admin/quarantine/<p>/<m>` answers 403-without-credentials rather than
+405-mutations-disabled. Not yet executed.
+
+Method, once run: create a throwaway provider whose upstream is the pod-local
+discard port (`http://127.0.0.1:9/v1`) so every attempt is a connect refusal —
+a transport error, which `classify_failure` attributes to `PROVIDER`. Reach it
+through a **dedicated route keyed on a throwaway client key**, never the default
+route, so the probe cannot touch real traffic. Five requests should quarantine
+the pair, the sixth should return the explicit all-quarantined error naming it,
+and the DELETE should restore service. Tear down the route and the provider
+afterwards.
+
+One thing to confirm while there: quarantine only records when `request_model`
+is non-None, and `request_model` is extracted **only when a model map is
+configured** (`proxy.py:1146`). The deployed instance has one, so the probe
+should record — but an instance with no model map quarantines nothing at all,
+which is worth either documenting or fixing.
 
 ## 6. Deliberate non-goals
 
