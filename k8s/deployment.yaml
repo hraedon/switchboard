@@ -19,6 +19,15 @@ metadata:
     app: switchboard
 spec:
   replicas: 1
+  # Recreate, not RollingUpdate. `replicas: 1` on a ReadWriteOnce PVC means the
+  # replacement pod cannot mount the volume the outgoing pod still holds, so a
+  # RollingUpdate deadlocks: the new pod sits Pending on the volume, the old one
+  # is never torn down, and the rollout reports progress it is not making. The
+  # old pod keeps serving, so this fails quietly — the symptom is a config
+  # change that never takes effect. Recreate costs a few seconds of downtime and
+  # actually completes.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: switchboard
@@ -60,6 +69,17 @@ spec:
             # writable mount in the pod.
             - name: SWITCHBOARD_ROUTE_TABLE_STORE
               value: /var/lib/switchboard/store.sqlite
+            # Gates every admin route. WITHOUT IT THE ADMIN SURFACE IS OPEN:
+            # `check_admin_auth` returns True when no token is configured, so
+            # /status.json, /metrics, /admin/routes and /admin/config are
+            # readable by anything that can reach the pod — while every mutating
+            # endpoint returns 405 "mutations disabled". Unset is not "secure by
+            # default"; it is readable by all and writable by none.
+            - name: SWITCHBOARD_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: switchboard-provider-keys
+                  key: SWITCHBOARD_ADMIN_TOKEN
             - name: SWITCHBOARD_OPENCODE_GO_KEY
               valueFrom:
                 secretKeyRef:
