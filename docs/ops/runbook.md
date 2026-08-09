@@ -192,6 +192,23 @@ anything that can reach the pod, while every mutating endpoint returns
 all, writable by none. Setting a token is what closes the reads *and* opens the
 writes.
 
+What that exposes, concretely: the route table, every provider name and
+upstream URL, per-provider quota and speed telemetry, and the full effective
+routing configuration (`routing_config` reports every runtime-settable knob,
+not a summary). No credential values — those are masked everywhere — but
+enough to map the estate.
+
+> ⚠️ **A fresh cluster comes up open.** `k8s/secret.yaml` carries no `data:`
+> entry for `SWITCHBOARD_ADMIN_TOKEN` — only instructions. A bring-up via
+> `kubectl apply -f k8s/` therefore starts with **no token and an open admin
+> surface**, and nothing fails or warns: the pod is healthy, `/readyz` is 200,
+> and the only signal is one INFO line reading `admin_token: disabled`. The
+> patch below is a **mandatory bring-up step, not an optional hardening one**.
+> The same hazard reaches a running cluster through a renamed or misspelled
+> Secret key: the `secretKeyRef` resolves to nothing and the surface reopens
+> silently. Tracked as WI-008 — the durable fix is to fail closed rather than
+> to remember.
+
 **Where it comes from.** `--admin-token` flag → `SWITCHBOARD_ADMIN_TOKEN` env →
 `admin_token` in TOML → unset. In k8s only the env var is viable; the TOML is a
 committed ConfigMap. It is wired as a `secretKeyRef` in `k8s/deployment.yaml`
@@ -240,6 +257,18 @@ revokes every outstanding session instantly, so the 30-day cookie is not a
 
 There are three equivalent ways; the config-store write (GUI or admin API)
 outranks TOML on the next restart (Plan 020 D1: store > TOML).
+
+**Which changes cost downtime.** Worth knowing before you pick a route, because
+the two categories look similar and are not:
+
+| Change | Path | Cost |
+|---|---|---|
+| Provider add/remove/update, route table, model map, routing knobs | admin API or GUI → config store | **None.** Applied in-process on the next routing decision. Provider removal drains in-flight requests first (`provider_manager`, 25 s budget); it does not restart anything. |
+| ConfigMap / TOML, the Secret (incl. admin-token rotation), the image | `kubectl` → pod rollout | **A few seconds of unavailability.** The deployment is `strategy: Recreate` — `replicas: 1` on an RWO PVC deadlocks a RollingUpdate — so the old pod is torn down before the new one starts. There is no overlap and no second replica to absorb traffic. |
+
+So: prefer the admin API for anything it can express. Reach for `kubectl` only
+for the things that genuinely live outside the config store, and expect the
+gap when you do.
 
 ### 5.1 Via the dashboard (GUI)
 
