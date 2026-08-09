@@ -339,6 +339,24 @@ The breaker opened after too many concurrency 429s. It will transition to
 response. If it never recovers, the provider is returning 429s on every
 request — an upstream health issue, not a switchboard issue.
 
+### switchboard refuses to start: "is not a top-level key and would be ignored"
+
+Working as intended. A key written in the wrong place in the config file used
+to be silently ignored — switchboard would start, report healthy, and simply
+not do the thing you configured. The classic is:
+
+```toml
+route_table_store = "/var/lib/switchboard/routes.sqlite3"   # WRONG — ignored
+```
+
+which is the spelling of the CLI flag and the env var, but not of the config
+key. switchboard reads `[route_table] store`, so the route table stayed
+in-memory and every runtime edit vanished at the next restart, with nothing
+in the logs to say so.
+
+The error names the correct form. Move the key and start again. The same check
+catches unknown sections and misspelled top-level keys.
+
 ### `in_flight` never returns to 0
 
 After all load stops, every provider's `in_flight` (held permits) must return
