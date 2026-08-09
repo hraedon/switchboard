@@ -292,6 +292,7 @@ def _build_status_payload(
     model_map_mgr: ModelMapManager | None = None,
     speed_sampler: Any | None = None,
     routing_config: Any | None = None,
+    quarantine: Any | None = None,
 ) -> dict[str, Any]:
     """Build the full status payload for /status.json."""
     provider_states: dict[str, Any] = {}
@@ -328,6 +329,13 @@ def _build_status_payload(
         "version": __version__,
         "build": build_sha,
     }
+
+    if quarantine is not None:
+        payload["quarantine"] = {
+            "threshold": quarantine.threshold,
+            "entries": [e.to_dict() for e in quarantine.entries()],
+            "counters": quarantine.counters(),
+        }
 
     if routing_config is not None:
         payload["routing_config"] = {
@@ -384,6 +392,7 @@ async def send_status_json(
     model_map_mgr: ModelMapManager | None = None,
     speed_sampler: Any | None = None,
     routing_config: Any | None = None,
+    quarantine: Any | None = None,
 ) -> None:
     """GET /status.json — per-provider state + route table + routing metrics."""
     payload = _build_status_payload(
@@ -395,6 +404,7 @@ async def send_status_json(
         model_map_mgr=model_map_mgr,
         speed_sampler=speed_sampler,
         routing_config=routing_config,
+        quarantine=quarantine,
     )
     await send_json(
         send, 200, payload,
@@ -1320,6 +1330,91 @@ async def handle_config_get(
     await send_json(
         send, 200, body,
         extra_headers=cors_extra_headers(cors_allow_origin, None),
+    )
+
+
+async def handle_quarantine_list(
+    send: Send,
+    quarantine: Any,
+    admin_token: str | None,
+    scope: Scope,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """GET /admin/quarantine — what is out of service, and why (Plan 023)."""
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if admin_token and not check_admin_auth(scope, admin_token):
+        await send_json(send, 401, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if quarantine is None:
+        await send_json(
+            send, 200,
+            {"enabled": False, "entries": [], "counters": {}},
+            extra_headers=cors,
+        )
+        return
+    await send_json(
+        send, 200,
+        {
+            "enabled": True,
+            "threshold": quarantine.threshold,
+            "entries": [e.to_dict() for e in quarantine.entries()],
+            # Pairs partway to the threshold: an operator watching a provider
+            # degrade should see it before it goes out, not after.
+            "counters": quarantine.counters(),
+        },
+        extra_headers=cors,
+    )
+
+
+async def handle_quarantine_release(
+    send: Send,
+    quarantine: Any,
+    admin_token: str | None,
+    scope: Scope,
+    provider: str,
+    model: str,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """DELETE /admin/quarantine/<provider>/<model> — the human's decision.
+
+    Releasing is the only way out by design (Plan 023 §6): the quarantine
+    fired because something needs looking at, and a timer would recreate the
+    flapping it exists to stop.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(
+            send, 405,
+            {"error": "mutations disabled — set --admin-token to enable"},
+            extra_headers=cors,
+        )
+        return
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+    if quarantine is None:
+        await send_json(
+            send, 404, {"error": "quarantine is not enabled"},
+            extra_headers=cors,
+        )
+        return
+    if not quarantine.release(provider, model):
+        await send_json(
+            send, 404,
+            {"error": f"{provider}/{model} is not quarantined"},
+            extra_headers=cors,
+        )
+        return
+    await send_json(
+        send, 200,
+        {"released": {"provider": provider, "model": model}},
+        extra_headers=cors,
     )
 
 

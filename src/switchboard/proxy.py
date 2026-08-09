@@ -62,6 +62,8 @@ from switchboard.admin import (
     handle_provider_test,
     handle_provider_update,
     handle_providers_list,
+    handle_quarantine_list,
+    handle_quarantine_release,
     handle_readyz,
     handle_route_add,
     handle_route_default_set,
@@ -85,6 +87,7 @@ from switchboard.control import (
     RouteAffinity,
     RoutingConfig,
     SignalFreshness,
+    classify_failure,
     compose_upstream_path,
     extract_conversation_fingerprint,
     hash_route_key,
@@ -97,6 +100,7 @@ from switchboard.model_map import ModelMapManager
 from switchboard.overload import OverloadConfig, OverloadTracker
 from switchboard.provider_manager import ProviderManager
 from switchboard.providers import ProviderContext, snapshot_provider_state
+from switchboard.quarantine import QuarantineTracker
 from switchboard.route_table import RouteTableManager
 from switchboard.session import (
     SESSION_COOKIE,
@@ -273,6 +277,11 @@ class _RerouteProbe:
     triggered: bool = False
     status: int | None = None
     retry_after: float | None = None
+    #: Response headers and the opening bytes of the body, captured only for
+    #: non-2xx. Quarantine attribution (Plan 023) needs both to tell "the
+    #: vendor refused our credential" from "an edge blocked the caller".
+    headers: dict[str, str] = field(default_factory=dict)
+    body_prefix: str = ""
 
 
 @dataclass
@@ -393,6 +402,7 @@ class ProxyApp:
         budget_tracker: TokenBudgetTracker | None = None,
         usage_history_tracker: UsageHistoryTracker | None = None,
         speed_sampler: SpeedSampler | None = None,
+        quarantine: QuarantineTracker | None = None,
         reroute_statuses: frozenset[int] | None = None,
         reroute_max_attempts: int = 0,
         config_store: ConfigStoreManager | None = None,
@@ -455,6 +465,8 @@ class ProxyApp:
         self._estimator = estimator
         self._budget_tracker = budget_tracker
         self._speed_sampler = speed_sampler
+        #: Plan 023. None disables the feature entirely.
+        self._quarantine = quarantine
         self._usage_history_tracker = usage_history_tracker
         self._build_sha = os.environ.get("SWITCHBOARD_BUILD_SHA") or None
         self._login_throttle = LoginThrottle()
@@ -638,6 +650,7 @@ class ProxyApp:
                     model_map_mgr=self._model_map_mgr,
                     speed_sampler=self._speed_sampler,
                     routing_config=self._routing_config,
+                    quarantine=self._quarantine,
                 )
                 return
             if path == "/metrics":
@@ -760,6 +773,35 @@ class ProxyApp:
                 )
                 return
             await send_text(send, 405, "Method not allowed")
+            return
+
+        if path == "/admin/quarantine" and method == "GET":
+            await handle_quarantine_list(
+                send, self._quarantine, self._admin_token, scope,
+                self._cors_allow_origin,
+            )
+            return
+
+        if path.startswith("/admin/quarantine/") and method == "DELETE":
+            from urllib.parse import unquote
+
+            rest = path[len("/admin/quarantine/"):]
+            # provider/model — the model may itself contain slashes
+            # ("vendor/name-v2"), so split once from the left only.
+            provider, _, model = rest.partition("/")
+            if not provider or not model:
+                await send_json(
+                    send, 400,
+                    {"error": "expected /admin/quarantine/<provider>/<model>"},
+                    extra_headers=cors_extra_headers(
+                        self._cors_allow_origin, None
+                    ),
+                )
+                return
+            await handle_quarantine_release(
+                send, self._quarantine, self._admin_token, scope,
+                unquote(provider), unquote(model), self._cors_allow_origin,
+            )
             return
 
         if path == "/admin/config/routing" and method == "PUT":
@@ -1171,6 +1213,46 @@ class ProxyApp:
             else:
                 self._provider_healthy_since.pop(cand, None)
 
+        # Quarantine (Plan 023): drop (provider, model) pairs a human has not
+        # cleared. Applied per model, so a pair broken for one model costs the
+        # provider nothing for the others it serves.
+        if self._quarantine is not None and request_model is not None:
+            blocked = self._quarantine.quarantined_for(request_model)
+            if blocked:
+                base = (
+                    servable_providers
+                    if servable_providers is not None
+                    else frozenset(candidates)
+                )
+                servable_providers = base - frozenset(blocked)
+                if not servable_providers:
+                    # Every provider for this model is quarantined. Say so
+                    # rather than returning a bare 503 that reads like quota
+                    # exhaustion — the operator needs to know a human decision
+                    # is what unblocks this, and which pairs to release.
+                    pairs = [f"{p}/{request_model}" for p in blocked]
+                    log.warning(
+                        "all providers for model '%s' are quarantined: %s",
+                        request_model, ", ".join(pairs),
+                    )
+                    await send_json(
+                        send, 503,
+                        {
+                            "error": (
+                                f"every provider for model "
+                                f"'{request_model}' is quarantined after "
+                                f"repeated failures; release one to resume"
+                            ),
+                            "reason": "quarantined",
+                            "quarantined": pairs,
+                            "release_with": (
+                                f"DELETE /admin/quarantine/<provider>/"
+                                f"{request_model}"
+                            ),
+                        },
+                    )
+                    return
+
         table = self._route_table.get_route_table()
         affinity = self._affinity.get(affinity_key)
         plan = route_decision(
@@ -1335,6 +1417,8 @@ class ProxyApp:
             )
             probe.triggered = False
             probe.status = None
+            probe.headers = {}
+            probe.body_prefix = ""
 
             acquire_mono = time.monotonic()
             forward_failed = False
@@ -1355,6 +1439,29 @@ class ProxyApp:
                 hold_seconds = time.monotonic() - acquire_mono
                 await ctx.gate.release(
                     hold_seconds=None if forward_failed else hold_seconds,
+                )
+
+            # Quarantine bookkeeping (Plan 023). Only failures attributable
+            # to the PROVIDER count; a caller-caused failure would reproduce
+            # on every provider, so counting it would walk the estate into
+            # quarantine one provider at a time.
+            if self._quarantine is not None and request_model is not None:
+                if forward_failed:
+                    attribution = classify_failure(None)
+                    status_for_q: int | None = None
+                    detail = "forward failed"
+                else:
+                    status_for_q = probe.status
+                    attribution = classify_failure(
+                        status_for_q, probe.headers, probe.body_prefix,
+                    )
+                    detail = (
+                        (probe.headers.get("content-type") or "")
+                        if status_for_q and status_for_q >= 400 else ""
+                    )
+                self._quarantine.record(
+                    acquired_provider, request_model, attribution,
+                    status=status_for_q, detail=detail,
                 )
 
             if not forward_failed and probe.status is not None:
@@ -1897,6 +2004,10 @@ class ProxyApp:
                 # that merely handed back an exhaustion response.
                 if probe is not None:
                     probe.status = response.status_code
+                    if response.status_code >= 400:
+                        probe.headers = {
+                            k.lower(): v for k, v in response.headers.items()
+                        }
                 if (
                     probe is not None
                     and probe.armed
