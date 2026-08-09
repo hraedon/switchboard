@@ -1,6 +1,7 @@
 # Plan 023 — Provider/model quarantine
 
-Status: **Wave 1 proposed.** Authored 2026-08-09.
+Status: **WI-1 – WI-3 landed; WI-4 landed except the dashboard panel; WI-5
+open.** Authored 2026-08-09.
 
 Depends on: the model map (Plan 010 Feature B) for the (provider, model) pair,
 and the config store (Plan 020 Wave 1) for persistence.
@@ -116,10 +117,32 @@ traffic for others, and an all-quarantined model says so.
 **Done when:** an operator can see what is quarantined and why, and release it,
 without a restart or a shell.
 
+**Status: API done, dashboard panel open.** The endpoints, the `/status.json`
+section and the operator runbook (§12) landed. The dashboard panel with a
+Release button did not — releasing still needs a `curl`, which fails the
+"without a shell" half of the bar above.
+
+### WI-4a — `quarantine_threshold` reaches every surface
+
+The knob was validated, mutable and persisted, but missing from `/status.json`
+and `GET /admin/config` (both hand-listed their fields), coerced to a float on
+both runtime paths despite being declared `int`, and never pushed to the live
+tracker — so a `PUT` was accepted, persisted, and inert until the next restart
+replayed the overlay. One shared `routing_config_payload()` now feeds all three
+reporting surfaces, `coerce_routing_value()` types values from the same bounds
+table that validated them, and `update_routing_config` pushes the threshold
+into the tracker.
+
+**Done:** `test_config_surfaces` fails if a mutable knob misses a surface or
+changes type, and `test_quarantine_e2e` drives the real `PUT` and then counts
+real failures against the new threshold.
+
 ### WI-5 — Live validation (open)
 
 Force a real provider-attributable failure against the deployed instance and
-watch a pair quarantine, then release it.
+watch a pair quarantine, then release it. Blocked on the same thing as the rest
+of the k8s work: the deployed pod has no admin token set, so the release path
+cannot be exercised there yet.
 
 ## 6. Deliberate non-goals
 

@@ -312,6 +312,56 @@ async def test_admin_can_see_and_release() -> None:
 
 
 @pytest.mark.asyncio
+async def test_changing_the_threshold_at_runtime_changes_the_behaviour() -> None:
+    """`quarantine_threshold` is advertised as runtime-mutable. The tracker is
+    built once at boot, so the PUT used to update the config object and nothing
+    else: accepted, persisted, and inert until a restart replayed the overlay —
+    the change appearing later, with no visible cause.
+
+    This drives the real PUT and then counts real failures.
+    """
+    app, tracker = await _build(_api_500)
+
+    body = json.dumps({"quarantine_threshold": 2}).encode()
+    scope = {
+        "type": "http",
+        "method": "PUT",
+        "path": "/admin/config/routing",
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"authorization", b"Bearer admin-secret"),
+            (b"sec-fetch-site", b"same-origin"),
+        ],
+        "query_string": b"",
+        "client": ("10.0.0.1", 1234),
+    }
+    sent: list[dict[str, Any]] = []
+    delivered = {"body": False}
+
+    async def receive() -> dict[str, Any]:
+        if not delivered["body"]:
+            delivered["body"] = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await asyncio.Future()
+        return {"type": "http.disconnect"}
+
+    async def send(m: dict[str, Any]) -> None:
+        sent.append(m)
+
+    await app(scope, receive, send)
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    assert start["status"] == 200
+    assert tracker.threshold == 2
+
+    # Two failures now suffice; under the boot-time 5 this would still be in
+    # service and the assertion below would fail.
+    await _post(app)
+    assert tracker.is_quarantined("alpha", "shared-model") is False
+    await _post(app)
+    assert tracker.is_quarantined("alpha", "shared-model") is True
+
+
+@pytest.mark.asyncio
 async def test_release_requires_auth() -> None:
     app, tracker = await _build(_api_500)
     for _ in range(5):

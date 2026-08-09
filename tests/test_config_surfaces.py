@@ -21,7 +21,11 @@ from typing import Any
 
 import pytest
 
-from switchboard.admin import handle_routing_config_update
+from switchboard.admin import (
+    handle_config_get,
+    handle_routing_config_update,
+    routing_config_payload,
+)
 from switchboard.cli import _ConfigError, _validate_config
 from switchboard.control import (
     MUTABLE_ROUTING_FIELDS,
@@ -29,6 +33,7 @@ from switchboard.control import (
     ROUTING_FIELD_BOUNDS,
     ROUTING_STRATEGIES,
     RoutingConfig,
+    coerce_routing_value,
 )
 
 
@@ -157,6 +162,106 @@ async def test_inclusive_maximum_is_accepted_by_both() -> None:
     for field in ("pace_burn_rate_per_day", "opportunistic_min_headroom"):
         assert _toml_accepts(field, 1.0), f"TOML rejected {field}=1.0"
         assert await _api_accepts(field, 1.0), f"admin API rejected {field}=1.0"
+
+
+async def _put(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """PUT the payload and return (status, decoded body)."""
+    app = _FakeProxyApp(RoutingConfig())
+    messages, send = _make_send()
+    await handle_routing_config_update(
+        send,
+        _make_receive(json.dumps(payload).encode()),
+        app,
+        "admin-secret",
+        _authed_scope(),
+    )
+    start = next(m for m in messages if m["type"] == "http.response.start")
+    body = b"".join(
+        m.get("body", b"") for m in messages if m["type"] == "http.response.body"
+    )
+    return int(start["status"]), json.loads(body)
+
+
+# ── reporting surfaces ─────────────────────────────────────────────────────
+#
+# Three surfaces report a RoutingConfig, and each used to hand-list its fields.
+# `quarantine_threshold` (Plan 023) was settable, validated and persisted but
+# missing from two of the three, so an operator had no way to read back what
+# the running proxy was actually using. These tests fail if a knob is added
+# without reaching every surface, which is the failure that happened.
+
+
+@pytest.mark.asyncio
+async def test_get_config_reports_every_mutable_field() -> None:
+    messages, send = _make_send()
+    await handle_config_get(send, RoutingConfig())
+    body = json.loads(
+        b"".join(
+            m.get("body", b"") for m in messages if m["type"] == "http.response.body"
+        )
+    )
+    missing = [f for f in MUTABLE_ROUTING_FIELDS if f not in body]
+    assert not missing, f"GET /admin/config does not report: {missing}"
+
+
+@pytest.mark.asyncio
+async def test_put_response_reports_every_mutable_field() -> None:
+    status, body = await _put({"dwell_interval": 12.0})
+    assert status == 200
+    missing = [f for f in MUTABLE_ROUTING_FIELDS if f not in body]
+    assert not missing, f"the PUT response does not report: {missing}"
+
+
+def test_status_json_reports_every_mutable_field() -> None:
+    """/status.json is the surface an operator reads first; a knob absent from
+    it is a knob they cannot confirm without shell access to the pod."""
+    payload = routing_config_payload(RoutingConfig())
+    missing = [f for f in MUTABLE_ROUTING_FIELDS if f not in payload]
+    assert not missing, f"/status.json routing_config does not report: {missing}"
+
+
+def test_the_reported_payload_is_json_serialisable() -> None:
+    """``strategy`` is an enum; every surface must emit its value, not repr."""
+    payload = routing_config_payload(RoutingConfig())
+    assert json.loads(json.dumps(payload))["strategy"] in ROUTING_STRATEGIES
+
+
+# ── value fidelity ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_an_integer_knob_survives_the_admin_api_as_an_integer() -> None:
+    """Both runtime paths cast with float() regardless of the declared type,
+    so `quarantine_threshold = 3` came back as 3.0 through the API while TOML
+    kept it an int — the same config value reading differently per door."""
+    status, body = await _put({"quarantine_threshold": 3})
+    assert status == 200
+    assert body["quarantine_threshold"] == 3
+    assert isinstance(body["quarantine_threshold"], int), (
+        f"got {body['quarantine_threshold']!r}, a "
+        f"{type(body['quarantine_threshold']).__name__}"
+    )
+
+
+@pytest.mark.parametrize("field", sorted(MUTABLE_ROUTING_FIELDS))
+def test_coercion_matches_the_type_the_dataclass_declares(field: str) -> None:
+    """Whatever `coerce_routing_value` returns is written straight into
+    RoutingConfig, so it must match the declared type of that field."""
+    declared = type(getattr(RoutingConfig(), field))
+    probe: object
+    if field == "strategy":
+        probe = ROUTING_STRATEGIES[0]
+    elif field in ROUTING_BOOL_FIELDS:
+        probe = True
+    elif ROUTING_FIELD_BOUNDS[field].integer:
+        probe = 2
+    else:
+        probe = 0.25
+    coerced = coerce_routing_value(field, probe)
+    assert isinstance(coerced, declared), (
+        f"{field}: coerced to {type(coerced).__name__}, "
+        f"RoutingConfig declares {declared.__name__}"
+    )
 
 
 def test_every_mutable_field_has_a_bound_or_is_typed() -> None:

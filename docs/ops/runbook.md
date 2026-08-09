@@ -40,10 +40,17 @@ see §9.
   "providers": { "<name>": { ... }, ... },
   "route_table": { "<hashed-key>": ["primary", "fallback"], "default": [...] },
   "routing_metrics": { ... },
+  "routing_config": { ... },
+  "quarantine": { ... },
   "version": "0.1.0",
   "build": "<sha|null>"
 }
 ```
+
+`routing_config` is the routing configuration the process is **actually**
+running — every runtime-settable knob, after TOML, the store overlay and any
+admin change have been resolved. Read it there rather than inferring it from
+the config file; the file is only one of the inputs. `quarantine` is §12.
 
 ### 2.1 Per-provider state (`providers.<name>`)
 
@@ -479,3 +486,64 @@ behaviour.
 (`direct_usage_cookie_env`) and are read at startup, so rotation is: update
 the Secret, roll the deployment. A cookie in the config file is rejected at
 startup — it is a whole-account credential and must not be committed.
+
+## 12. Quarantined provider/model pairs
+
+Five consecutive **provider-attributable** failures for one `(provider, model)`
+pair take that pair out of service until you release it (Plan 023). It is
+deliberately sticky: the trigger means something needs a person, and a timer
+would recreate the flapping it exists to stop.
+
+**It is per pair, not per provider.** A quarantined pair stops being a
+candidate for *that model only*. The provider keeps serving every other model
+it is mapped to — a map entry pointing at a model the vendor retired should not
+cost you the vendor.
+
+**What does not count.** Anything the *caller* caused: 4xx, and edge blocks
+(a Cloudflare block page, identified by `cf-ray` / `server: cloudflare` and a
+non-JSON body). Those reproduce on every provider, so counting them would walk
+the whole estate into quarantine one provider at a time. 429 does not count
+either — that is quota, not fault, and the breaker and quota routing own it.
+A 401/403 with a *JSON* body does count: that is your credential being
+rejected.
+
+**Reading it.** `GET /status.json` → `quarantine`, or `GET /admin/quarantine`:
+
+```json
+{
+  "threshold": 5,
+  "entries": [
+    {"provider": "opencode-go", "model": "glm-5.2", "failures": 5,
+     "first_failure_at": 1754700000.0, "last_failure_at": 1754700420.0,
+     "last_status": 502, "last_detail": "..."}
+  ],
+  "counters": {"zai/glm-5.2": 2}
+}
+```
+
+`counters` is the pairs partway there — a pair at 3 or 4 is worth looking at
+before it trips. Each entry carries the last status and a body excerpt, so you
+can usually decide without going to the logs.
+
+**Symptom if you miss it.** When *every* provider for a model is quarantined,
+requests for that model fail with an error naming the pairs and how to clear
+them — not a bare 503. If you see that, the model has been unservable since
+the last pair tripped.
+
+**Releasing.** Fix the cause first; releasing an unfixed pair just re-trips it.
+
+```
+curl -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
+  https://<switchboard>/admin/quarantine/<provider>/<model>
+```
+
+**Tuning.** `[routing] quarantine_threshold` (default 5; `0` disables
+quarantining while still counting, so the counters stay visible). It is
+runtime-mutable via `PUT /admin/config/routing` and takes effect on the next
+failure — it does **not** quarantine a pair retroactively for a streak it
+already has, and raising it or setting `0` does **not** release anything
+already quarantined. Only the DELETE above does that.
+
+**Quarantine survives a restart.** It is persisted to the config store, so a
+pod restart cannot silently un-quarantine a pair no one has looked at. If you
+want it gone, release it.

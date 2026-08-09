@@ -24,6 +24,7 @@ from switchboard.control import (
     ROUTING_FIELD_BOUNDS,
     ROUTING_STRATEGIES,
     RoutingStrategy,
+    coerce_routing_value,
     validate_routing_field,
 )
 from switchboard.env_config import EnvOverrideError, apply_overrides
@@ -962,12 +963,7 @@ def _build_serve_app(
             if message is not None:
                 log.warning("ignoring persisted routing.%s: %s", name, message)
                 continue
-            if name == "strategy":
-                overlay_kwargs["strategy"] = RoutingStrategy(str(value))
-            elif name in ROUTING_BOOL_FIELDS:
-                overlay_kwargs[name] = bool(value)
-            else:
-                overlay_kwargs[name] = float(value)  # type: ignore[arg-type]
+            overlay_kwargs[name] = coerce_routing_value(name, value)
             applied.append(name)
         if applied:
             routing_config = RoutingConfig(**overlay_kwargs)
