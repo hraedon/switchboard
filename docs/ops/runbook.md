@@ -14,9 +14,14 @@ each request, streams the response through untouched, and — when a provider
 runs out of quota — routes the request to somebody else instead of failing.
 
 **Where it runs.** Deployed to the existing k8s cluster, namespace
-`usage-dashboard`, internal-only ingress via `traefik-internal`. It is **not**
-reachable from outside the LAN: it holds every provider credential. Image
-`ghcr.io/hraedon/switchboard:main`.
+`switchboard`, at `switchboard.k8s.hraedon.com` — internal-only ingress. It is
+**not** reachable from outside the LAN: it holds every provider credential.
+
+The manifest names `ghcr.io/hraedon/switchboard:main`, but the running
+deployment is pinned to an explicit **sha tag** so a rebuild of `:main` cannot
+change what is running underneath you. Those two disagree by design; read
+`kubectl -n switchboard get deploy switchboard -o jsonpath='{...image}'` for the
+truth, and note that a bare `kubectl apply -f k8s/` un-pins it.
 
 **How to check it is healthy.**
 
@@ -166,6 +171,63 @@ each returned.
 Do **not** restart switchboard to "clear" exhaustion — the upstreams are still
 out of quota. Do **not** keep the estate in a state where give-ups are the
 norm; that is a capacity signal.
+
+## 4a. The admin token
+
+Every `Authorization: Bearer <admin-token>` in this runbook refers to one
+shared secret. There are no users and no roles.
+
+**Unset is not "secure by default" — it is the worst of both.**
+`check_admin_auth` returns `True` when no token is configured, so
+`/status.json`, `/metrics`, `/admin/routes` and `/admin/config` are readable by
+anything that can reach the pod, while every mutating endpoint returns
+`405 {"error": "mutations disabled — set --admin-token to enable"}`. Readable by
+all, writable by none. Setting a token is what closes the reads *and* opens the
+writes.
+
+**Where it comes from.** `--admin-token` flag → `SWITCHBOARD_ADMIN_TOKEN` env →
+`admin_token` in TOML → unset. In k8s only the env var is viable; the TOML is a
+committed ConfigMap. It is wired as a `secretKeyRef` in `k8s/deployment.yaml`
+pointing at the `switchboard-provider-keys` Secret — **both halves are
+required**, since a Secret key nothing references never reaches the process.
+
+**Setting or rotating it.**
+
+```
+kubectl -n switchboard patch secret switchboard-provider-keys \
+  --type=merge -p "{\"stringData\":{\"SWITCHBOARD_ADMIN_TOKEN\":\"$(openssl rand -base64 39)\"}}"
+kubectl -n switchboard rollout restart deployment/switchboard
+```
+
+A Secret change does **not** restart the pod on its own — the running process
+keeps the old value until it is rolled. The deployment is `Recreate` (see the
+manifest comment: `replicas: 1` on an RWO PVC deadlocks a RollingUpdate), so
+expect a few seconds of downtime.
+
+**Verifying.** Three independent checks, in increasing order of trust:
+
+```
+kubectl -n switchboard logs deploy/switchboard | grep admin_token   # → "set", not "disabled"
+curl -s -o /dev/null -w '%{http_code}\n' https://switchboard.k8s.hraedon.com/status.json
+                                                                     # → 401, not 200
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TOKEN" \
+     https://switchboard.k8s.hraedon.com/status.json                 # → 200
+```
+
+If the first two disagree, the env var did not reach the process.
+
+**How it is presented.** `Authorization: Bearer <token>`, or HTTP Basic (only
+the *password* half is compared; the username is ignored), or the dashboard
+session cookie.
+
+**The dashboard session.** `GET /` serves a login page rather than a 401. The
+cookie is `expiry.HMAC-SHA256`, signed with a key derived from the token —
+30-day TTL, `HttpOnly`, `SameSite=Strict`, `Secure` behind TLS, and **no
+server-side session store**. Consequence worth knowing: rotating the token
+revokes every outstanding session instantly, so the 30-day cookie is not a
+30-day exposure. Cookie-authenticated *mutations* additionally require
+`Sec-Fetch-Site: same-origin`; a `Bearer` request skips that check, which is why
+`curl` works and a hostile page cannot ride your cookie.
 
 ## 5. Adding a provider
 
