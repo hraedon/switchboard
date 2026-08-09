@@ -48,13 +48,13 @@ def test_the_correct_form_is_accepted() -> None:
 def test_non_string_store_is_rejected() -> None:
     """Same failure in a different costume: the store looks configured and
     isn't."""
-    with pytest.raises(_ConfigError, match="route_table.store"):
+    with pytest.raises(_ConfigError, match=r"route_table\.store"):
         _validate({"route_table": {"store": 1234}})
 
 
 def test_typo_inside_route_table_is_rejected() -> None:
     """`path` instead of `store` would otherwise be silently ignored."""
-    with pytest.raises(_ConfigError, match="route_table.path"):
+    with pytest.raises(_ConfigError, match=r"route_table\.path"):
         _validate({"route_table": {"path": "/tmp/x.sqlite3"}})
 
 
