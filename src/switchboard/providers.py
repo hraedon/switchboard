@@ -93,27 +93,76 @@ def build_provider_context(
     api_key: str = "",
     auth_header_name: str = "authorization",
     auth_prefix: str | None = None,
+    direct_usage_enabled: bool = False,
+    direct_usage_workspace_id: str = "",
+    direct_usage_cookie: str = "",
+    direct_usage_stale_ttl: float = 900.0,
+    direct_usage_poll_interval: float = 30.0,
 ) -> ProviderContext:
     """Construct a :class:`ProviderContext` from the vendored building blocks.
 
     Resolves the provider type via :func:`switchboard.truth.get_provider`,
-    constructs the appropriate :class:`~switchboard.truth.TruthSource` via
-    :func:`switchboard.truth.make_truth_source`, creates a
-    :class:`~switchboard.gate.PermitGate` (initial capacity 0 — the reconcile
+    constructs the appropriate :class:`~switchboard.truth.TruthSource`, creates
+    a :class:`~switchboard.gate.PermitGate` (initial capacity 0 — the reconcile
     loop resizes it), and wires a :class:`~switchboard.reconcile.ReconciliationLoop`
     sized by the provider's target concurrency.
+
+    Truth source precedence, first match wins:
+
+    1. ``direct_usage_enabled`` — fetch usage from the provider's own surface,
+       no usage-dashboard required (Plan 022). Only provider types with a
+       fetcher and configured credentials are affected; anything else falls
+       through rather than failing, so a half-configured provider loses its
+       weekly signal instead of the boot.
+    2. ``dashboard_url`` + ``dashboard_token`` — the usage-dashboard
+       ``/readings`` API.
+    3. The provider-type default (``PolledTruthSource`` for umans,
+       ``HeaderTruthSource`` for anthropic/openai, ``NullTruthSource`` for
+       generic).
     """
+    # Imported here rather than at module scope: direct_usage pulls in httpx
+    # and is optional, and providers.py is imported by paths that never touch
+    # a network.
+    from switchboard.direct_usage import (
+        DirectUsageTruthSource,
+        make_direct_fetcher,
+    )
+
     provider: Provider = get_provider(provider_type)
 
-    if dashboard_url is not None and dashboard_token is not None:
-        truth_source: TruthSource = DashboardTruthSource(
+    truth_source: TruthSource | None = None
+
+    if direct_usage_enabled:
+        fetcher = make_direct_fetcher(
+            provider_type,
+            api_key=api_key,
+            usage_key=usage_key,
+            workspace_id=direct_usage_workspace_id,
+            cookie=direct_usage_cookie,
+            name=name,
+        )
+        if fetcher is not None:
+            truth_source = DirectUsageTruthSource(
+                fetcher,
+                stale_ttl=direct_usage_stale_ttl,
+                poll_interval=direct_usage_poll_interval,
+            )
+            poll_interval = direct_usage_poll_interval
+
+    if (
+        truth_source is None
+        and dashboard_url is not None
+        and dashboard_token is not None
+    ):
+        truth_source = DashboardTruthSource(
             dashboard_url=dashboard_url,
             bearer_token=dashboard_token,
             provider_name=name,
             stale_ttl=dashboard_stale_ttl,
         )
         poll_interval = dashboard_poll_interval
-    else:
+
+    if truth_source is None:
         truth_source = make_truth_source(
             provider,
             base_url=upstream_url,
@@ -243,6 +292,37 @@ def build_provider_contexts_from_config(
             provider_cfg, "dashboard_poll_interval", 30.0
         )
 
+        # Direct usage solicitation (Plan 022): fetch usage from the provider's
+        # own surface instead of a usage-dashboard. Opt-in per provider; types
+        # without a fetcher fall through to the default truth source. The
+        # cookie is env-only — it is a session credential for a whole account
+        # and must not sit in a config file that gets committed.
+        direct_usage_enabled = bool(provider_cfg.get("direct_usage", False))
+        direct_usage_workspace_id = _str_or(
+            provider_cfg, "direct_usage_workspace_id", ""
+        )
+        direct_usage_workspace_id_env = _optional_str(
+            provider_cfg, "direct_usage_workspace_id_env"
+        )
+        if direct_usage_workspace_id_env:
+            direct_usage_workspace_id = os.environ.get(
+                direct_usage_workspace_id_env, ""
+            )
+        direct_usage_cookie_env = _optional_str(
+            provider_cfg, "direct_usage_cookie_env"
+        )
+        direct_usage_cookie = (
+            os.environ.get(direct_usage_cookie_env, "")
+            if direct_usage_cookie_env
+            else ""
+        )
+        direct_usage_stale_ttl = _float_or(
+            provider_cfg, "direct_usage_stale_ttl", 900.0
+        )
+        direct_usage_poll_interval = _float_or(
+            provider_cfg, "direct_usage_poll_interval", 30.0
+        )
+
         poll_interval_idle = _optional_float(provider_cfg, "poll_interval_idle")
 
         history_store: HistoryStore | None = None
@@ -276,6 +356,11 @@ def build_provider_contexts_from_config(
             api_key=api_key,
             auth_header_name=auth_header_name,
             auth_prefix=auth_prefix,
+            direct_usage_enabled=direct_usage_enabled,
+            direct_usage_workspace_id=direct_usage_workspace_id,
+            direct_usage_cookie=direct_usage_cookie,
+            direct_usage_stale_ttl=direct_usage_stale_ttl,
+            direct_usage_poll_interval=direct_usage_poll_interval,
         )
 
     return contexts

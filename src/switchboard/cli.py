@@ -140,6 +140,27 @@ def _validate_provider_config(
     elif not isinstance(target, int) or isinstance(target, bool):
         errors.append(f"provider '{name}': 'target' must be an integer")
 
+    direct_usage = cfg.get("direct_usage")
+    if direct_usage is not None and not isinstance(direct_usage, bool):
+        errors.append(f"provider '{name}': direct_usage must be a boolean")
+
+    for key in ("direct_usage_stale_ttl", "direct_usage_poll_interval"):
+        val = cfg.get(key)
+        if val is not None and (
+            not isinstance(val, (int, float)) or isinstance(val, bool)
+        ):
+            errors.append(f"provider '{name}': {key} must be a number")
+
+    # A cookie in the config file would be committed. It is a session
+    # credential for a whole account, broader than the API key beside it, so
+    # the only accepted form is an environment variable name (Plan 022 WI-2).
+    if cfg.get("direct_usage_cookie") is not None:
+        errors.append(
+            f"provider '{name}': direct_usage_cookie must not be set in "
+            "config — use direct_usage_cookie_env to name an environment "
+            "variable instead"
+        )
+
     return errors
 
 
