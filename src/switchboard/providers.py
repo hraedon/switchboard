@@ -381,6 +381,23 @@ def snapshot_provider_state(
             if reset_in > 0:
                 quota_resets_in = reset_in
 
+    # Weekly-window quota (Plan 020 D6) — the pace strategy's signal, mapped
+    # from the reading's weekly fields. Only read from a fresh reading (``ok``):
+    # the pace strategy must never score a provider on stale quota data, and
+    # leaving these None is what makes it rank that provider in table order
+    # instead.
+    weekly_remaining_fraction: float | None = None
+    weekly_reset_in: float | None = None
+    if cached_reading is not None and cached_reading.ok:
+        limit_state = cached_reading.reading
+        if limit_state.weekly_remaining_fraction is not None:
+            weekly_remaining_fraction = limit_state.weekly_remaining_fraction
+        wre = limit_state.weekly_reset_epoch
+        if wre is not None and wre > 0:
+            w_reset_in = wre - _time.time()
+            if w_reset_in > 0:
+                weekly_reset_in = w_reset_in
+
     # Token-budget utilization (Plan 012 Feature B).
     token_utilization: float | None = None
     token_soft_threshold: float | None = None
@@ -405,6 +422,8 @@ def snapshot_provider_state(
         token_utilization=token_utilization,
         token_soft_threshold=token_soft_threshold,
         usage_24h_utilization=usage_24h_utilization,
+        weekly_remaining_fraction=weekly_remaining_fraction,
+        weekly_reset_in=weekly_reset_in,
     )
 
 

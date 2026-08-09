@@ -67,6 +67,22 @@ def _reading_to_limit_state(
     concurrent_sessions = _coerce_int(reading.get("concurrent_sessions")) or 0
     session_resets_at = _parse_timestamp(reading.get("session_resets_at"))
 
+    # Weekly-window mapping (Plan 020 D6). The usage-dashboard's
+    # ``Reading.to_dict()`` emits ``weekly_percent`` and ``weekly_resets_at``
+    # for providers that report a weekly quota (z.ai, opencode-go).  The
+    # percentage is *used* (consumed), so remaining = 1 - percent/100.
+    weekly_pct_raw = reading.get("weekly_percent")
+    weekly_pct: float | None = None
+    if weekly_pct_raw is not None:
+        try:
+            weekly_pct = float(weekly_pct_raw)
+        except (ValueError, TypeError):
+            weekly_pct = None
+    weekly_remaining: float | None = None
+    if weekly_pct is not None:
+        weekly_remaining = max(0.0, min(1.0, 1.0 - weekly_pct / 100.0))
+    weekly_reset_epoch = _parse_timestamp(reading.get("weekly_resets_at"))
+
     return LimitState(
         concurrent_sessions=concurrent_sessions,
         limit=1,
@@ -78,6 +94,8 @@ def _reading_to_limit_state(
         bucket_reset_epoch=session_resets_at,
         provider=provider_name,
         age_seconds=0.0,
+        weekly_remaining_fraction=weekly_remaining,
+        weekly_reset_epoch=weekly_reset_epoch,
     )
 
 

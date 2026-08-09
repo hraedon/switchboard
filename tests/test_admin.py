@@ -19,8 +19,9 @@ from switchboard.admin import (
     handle_route_add,
     handle_route_delete,
     handle_route_list,
+    handle_routing_config_update,
 )
-from switchboard.control import RoutingConfig
+from switchboard.control import RoutingConfig, RoutingStrategy
 from switchboard.gate import PermitGate
 from switchboard.limit import BreakerConfig
 from switchboard.model_map import ModelMapManager
@@ -939,3 +940,198 @@ async def test_override_umans_at_hard_cap_boundary_accepted() -> None:
     assert data["applied"] is True
     assert "above limit" in data["warning"]
     assert ctx.reconcile.max_concurrency == 8
+
+
+# --- Routing config runtime swap (Plan 020 WI-14) ---
+
+
+class _FakeProxyApp:
+    """Minimal proxy stand-in for routing config swap tests."""
+
+    def __init__(self, config: RoutingConfig) -> None:
+        self._routing_config = config
+
+    @property
+    def routing_config(self) -> RoutingConfig:
+        return self._routing_config
+
+    def update_routing_config(self, config: RoutingConfig) -> None:
+        self._routing_config = config
+
+
+def _routing_authed_scope() -> dict[str, Any]:
+    return _make_scope(
+        method="PUT",
+        headers=[
+            (b"content-type", b"application/json"),
+            (b"authorization", b"Bearer admin-secret"),
+            (b"sec-fetch-site", b"same-origin"),
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_routing_config_update_changes_strategy() -> None:
+    app = _FakeProxyApp(RoutingConfig())
+    scope = _routing_authed_scope()
+    body = json.dumps({"strategy": "pace"}).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_routing_config_update(
+        send, receive, app, "admin-secret", scope,
+    )
+    status, resp_body = _parse_response(messages)
+    assert status == 200
+    data = json.loads(resp_body)
+    assert data["strategy"] == "pace"
+    assert app.routing_config.strategy == RoutingStrategy.PACE
+
+
+@pytest.mark.asyncio
+async def test_routing_config_update_preserves_unchanged_fields() -> None:
+    original = RoutingConfig(
+        strategy=RoutingStrategy.ORDERED,
+        dwell_interval=60.0,
+        failback_delay=30.0,
+        pace_burn_rate_per_day=0.20,
+    )
+    app = _FakeProxyApp(original)
+    scope = _routing_authed_scope()
+    body = json.dumps({"strategy": "pace"}).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_routing_config_update(
+        send, receive, app, "admin-secret", scope,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 200
+    # Unchanged fields preserved
+    assert app.routing_config.dwell_interval == 60.0
+    assert app.routing_config.failback_delay == 30.0
+    assert app.routing_config.pace_burn_rate_per_day == 0.20
+    # Changed field applied
+    assert app.routing_config.strategy == RoutingStrategy.PACE
+
+
+@pytest.mark.asyncio
+async def test_routing_config_update_pace_knobs() -> None:
+    app = _FakeProxyApp(RoutingConfig())
+    scope = _routing_authed_scope()
+    body = json.dumps({
+        "pace_burn_rate_per_day": 0.30,
+        "pace_flap_margin": 0.10,
+    }).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_routing_config_update(
+        send, receive, app, "admin-secret", scope,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 200
+    assert app.routing_config.pace_burn_rate_per_day == 0.30
+    assert app.routing_config.pace_flap_margin == 0.10
+
+
+@pytest.mark.asyncio
+async def test_routing_config_update_invalid_strategy() -> None:
+    app = _FakeProxyApp(RoutingConfig())
+    scope = _routing_authed_scope()
+    body = json.dumps({"strategy": "invalid"}).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_routing_config_update(
+        send, receive, app, "admin-secret", scope,
+    )
+    status, resp_body = _parse_response(messages)
+    assert status == 400
+    assert b"strategy" in resp_body
+
+
+@pytest.mark.asyncio
+async def test_routing_config_update_rejects_immutable_field() -> None:
+    app = _FakeProxyApp(RoutingConfig())
+    scope = _routing_authed_scope()
+    body = json.dumps({"pin_conversations": True}).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_routing_config_update(
+        send, receive, app, "admin-secret", scope,
+    )
+    status, resp_body = _parse_response(messages)
+    assert status == 400
+    assert b"pin_conversations" in resp_body
+
+
+@pytest.mark.asyncio
+async def test_routing_config_update_requires_auth() -> None:
+    app = _FakeProxyApp(RoutingConfig())
+    scope = _routing_authed_scope()
+    body = json.dumps({"strategy": "pace"}).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_routing_config_update(
+        send, receive, app, "wrong-token", scope,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 403
+
+
+@pytest.mark.asyncio
+async def test_routing_config_update_no_admin_token_405() -> None:
+    app = _FakeProxyApp(RoutingConfig())
+    scope = _routing_authed_scope()
+    body = json.dumps({"strategy": "pace"}).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_routing_config_update(
+        send, receive, app, None, scope,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 405
+
+
+@pytest.mark.asyncio
+async def test_routing_config_update_invalid_json() -> None:
+    app = _FakeProxyApp(RoutingConfig())
+    scope = _routing_authed_scope()
+    receive = _make_receive(b"not json")
+    messages, send = _make_send()
+    await handle_routing_config_update(
+        send, receive, app, "admin-secret", scope,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 400
+
+
+@pytest.mark.asyncio
+async def test_routing_config_update_wrong_content_type() -> None:
+    app = _FakeProxyApp(RoutingConfig())
+    scope = _make_scope(
+        method="PUT",
+        headers=[
+            (b"content-type", b"text/plain"),
+            (b"authorization", b"Bearer admin-secret"),
+            (b"sec-fetch-site", b"same-origin"),
+        ],
+    )
+    receive = _make_receive(b"{}")
+    messages, send = _make_send()
+    await handle_routing_config_update(
+        send, receive, app, "admin-secret", scope,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 400
+
+
+@pytest.mark.asyncio
+async def test_routing_config_update_out_of_bounds() -> None:
+    app = _FakeProxyApp(RoutingConfig())
+    scope = _routing_authed_scope()
+    body = json.dumps({"pace_burn_rate_per_day": 1.5}).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_routing_config_update(
+        send, receive, app, "admin-secret", scope,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 400

@@ -18,6 +18,14 @@ from typing import Any
 
 from switchboard import __version__
 from switchboard.config_reset import ResetError, parse_sections, reset_sections
+from switchboard.control import (
+    MUTABLE_ROUTING_FIELDS,
+    ROUTING_BOOL_FIELDS,
+    ROUTING_FIELD_BOUNDS,
+    ROUTING_STRATEGIES,
+    RoutingStrategy,
+    validate_routing_field,
+)
 from switchboard.env_config import EnvOverrideError, apply_overrides
 
 log = logging.getLogger("switchboard.cli")
@@ -288,119 +296,36 @@ def _validate_config(
 
     routing_section = config_data.get("routing", {})
     if isinstance(routing_section, dict):
-        threshold = routing_section.get("failover_threshold_seconds")
-        if threshold is not None:
-            if not isinstance(threshold, int) or isinstance(threshold, bool):
-                errors.append("routing.failover_threshold_seconds must be an integer")
-            elif threshold < 0:
-                errors.append("routing.failover_threshold_seconds must be >= 0")
-        margin = routing_section.get("failover_margin")
-        if margin is not None:
-            if not isinstance(margin, int) or isinstance(margin, bool):
-                errors.append("routing.failover_margin must be an integer")
-            elif margin < 0:
-                errors.append("routing.failover_margin must be >= 0")
-        dwell = routing_section.get("dwell_interval")
-        if dwell is not None:
-            if not isinstance(dwell, (int, float)) or isinstance(dwell, bool):
-                errors.append("routing.dwell_interval must be a number")
-            elif dwell < 0:
-                errors.append("routing.dwell_interval must be >= 0")
-        failback = routing_section.get("failback_delay")
-        if failback is not None:
-            if not isinstance(failback, (int, float)) or isinstance(failback, bool):
-                errors.append("routing.failback_delay must be a number")
-            elif failback < 0:
-                errors.append("routing.failback_delay must be >= 0")
-        pin = routing_section.get("pin_conversations")
-        if pin is not None and not isinstance(pin, bool):
-            errors.append("routing.pin_conversations must be a boolean")
-        aff_max = routing_section.get("affinity_max_entries")
-        if aff_max is not None:
-            if not isinstance(aff_max, int) or isinstance(aff_max, bool):
-                errors.append("routing.affinity_max_entries must be an integer")
-            elif aff_max < 1:
-                errors.append("routing.affinity_max_entries must be >= 1")
-        headroom = routing_section.get("headroom_threshold")
-        if headroom is not None:
-            if not isinstance(headroom, (int, float)) or isinstance(headroom, bool):
-                errors.append("routing.headroom_threshold must be a number")
-            elif headroom < 0.0 or headroom > 1.0:
-                errors.append(
-                    "routing.headroom_threshold must be between 0.0 and 1.0"
-                )
-        token_thresh = routing_section.get("token_budget_threshold")
-        if token_thresh is not None:
-            if not isinstance(token_thresh, (int, float)) or isinstance(token_thresh, bool):
-                errors.append(
-                    "routing.token_budget_threshold must be a number"
-                )
-            elif token_thresh < 0.0 or token_thresh > 1.0:
-                errors.append(
-                    "routing.token_budget_threshold must be "
-                    "between 0.0 and 1.0"
-                )
-        usage_24h_thresh = routing_section.get("usage_24h_threshold")
-        if usage_24h_thresh is not None:
-            if not isinstance(usage_24h_thresh, (int, float)) or isinstance(usage_24h_thresh, bool):
-                errors.append(
-                    "routing.usage_24h_threshold must be a number"
-                )
-            elif usage_24h_thresh < 0.0 or usage_24h_thresh > 1.0:
-                errors.append(
-                    "routing.usage_24h_threshold must be "
-                    "between 0.0 and 1.0"
-                )
-        opportunistic_enabled = routing_section.get("opportunistic_enabled")
-        if opportunistic_enabled is not None and not isinstance(
-            opportunistic_enabled, bool
+        # Every routing field is range-checked against the single shared
+        # table in control.ROUTING_FIELD_BOUNDS, which the admin API
+        # (PUT /admin/config/routing) also reads.  These two surfaces used to
+        # carry independent copies of the bounds and had drifted apart;
+        # test_config_surfaces asserts they agree.
+        for field_name in (
+            *ROUTING_FIELD_BOUNDS,
+            *sorted(ROUTING_BOOL_FIELDS),
+            "strategy",
         ):
-            errors.append("routing.opportunistic_enabled must be a boolean")
-        opportunistic_min_headroom = routing_section.get(
-            "opportunistic_min_headroom"
-        )
-        if opportunistic_min_headroom is not None:
-            if (
-                not isinstance(opportunistic_min_headroom, (int, float))
-                or isinstance(opportunistic_min_headroom, bool)
-            ):
+            value = routing_section.get(field_name)
+            if value is None:
+                continue
+            message = validate_routing_field(field_name, value)
+            if message is not None:
+                errors.append(f"routing.{message}")
+        # Individually valid but mutually exclusive: strategy="headroom"
+        # already means what headroom_ranking=true means, and strategy="pace"
+        # contradicts it. Fail rather than silently pick one.
+        strategy = routing_section.get("strategy")
+        if (
+            isinstance(strategy, str)
+            and strategy in ROUTING_STRATEGIES
+            and strategy != "ordered"
+        ):
+            hr = routing_section.get("headroom_ranking")
+            if isinstance(hr, bool) and hr:
                 errors.append(
-                    "routing.opportunistic_min_headroom must be a number"
-                )
-            elif (
-                opportunistic_min_headroom <= 0.0
-                or opportunistic_min_headroom > 1.0
-            ):
-                errors.append(
-                    "routing.opportunistic_min_headroom must be in (0.0, 1.0]"
-                )
-        opportunistic_reset_window = routing_section.get(
-            "opportunistic_reset_window"
-        )
-        if opportunistic_reset_window is not None:
-            if (
-                not isinstance(opportunistic_reset_window, (int, float))
-                or isinstance(opportunistic_reset_window, bool)
-            ):
-                errors.append(
-                    "routing.opportunistic_reset_window must be a number"
-                )
-            elif opportunistic_reset_window <= 0.0:
-                errors.append(
-                    "routing.opportunistic_reset_window must be > 0"
-                )
-        opportunistic_margin = routing_section.get("opportunistic_margin")
-        if opportunistic_margin is not None:
-            if (
-                not isinstance(opportunistic_margin, (int, float))
-                or isinstance(opportunistic_margin, bool)
-            ):
-                errors.append(
-                    "routing.opportunistic_margin must be a number"
-                )
-            elif opportunistic_margin < 0.0 or opportunistic_margin >= 1.0:
-                errors.append(
-                    "routing.opportunistic_margin must be in [0.0, 1.0)"
+                    f"routing.strategy={strategy} and headroom_ranking=true "
+                    "are mutually exclusive — use strategy alone"
                 )
 
     usage_24h_budget_section = config_data.get("usage_24h_budget", {})
@@ -874,8 +799,55 @@ def _build_serve_app(
             and affinity_max >= 1
         ):
             rc_kwargs["affinity_max_entries"] = affinity_max
+        strategy = routing_section.get("strategy")
+        if isinstance(strategy, str) and strategy in (
+            "ordered",
+            "headroom",
+            "pace",
+        ):
+            rc_kwargs["strategy"] = RoutingStrategy(strategy)
+        pace_burn_rate = routing_section.get("pace_burn_rate_per_day")
+        if isinstance(pace_burn_rate, (int, float)) and not isinstance(
+            pace_burn_rate, bool
+        ):
+            rc_kwargs["pace_burn_rate_per_day"] = float(pace_burn_rate)
+        pace_flap = routing_section.get("pace_flap_margin")
+        if isinstance(pace_flap, (int, float)) and not isinstance(pace_flap, bool):
+            rc_kwargs["pace_flap_margin"] = float(pace_flap)
         if rc_kwargs:
             routing_config = RoutingConfig(**rc_kwargs)
+
+    # A routing knob changed through the admin API outranks TOML on the next
+    # boot (Plan 020 D1: the store wins), so that a strategy an operator
+    # selected in the GUI is not silently undone by the next pod restart.
+    # Only the fields they actually set are overlaid; everything else keeps
+    # following the file. A value that no longer validates is dropped with a
+    # warning rather than failing the boot — a stale preference must never
+    # cost availability.
+    stored_overlay = config_store.get_routing_overlay()
+    if stored_overlay:
+        overlay_kwargs = dict(rc_kwargs) if isinstance(routing_section, dict) else {}
+        applied: list[str] = []
+        for name, value in stored_overlay.items():
+            if name not in MUTABLE_ROUTING_FIELDS:
+                continue
+            message = validate_routing_field(name, value)
+            if message is not None:
+                log.warning("ignoring persisted routing.%s: %s", name, message)
+                continue
+            if name == "strategy":
+                overlay_kwargs["strategy"] = RoutingStrategy(str(value))
+            elif name in ROUTING_BOOL_FIELDS:
+                overlay_kwargs[name] = bool(value)
+            else:
+                overlay_kwargs[name] = float(value)  # type: ignore[arg-type]
+            applied.append(name)
+        if applied:
+            routing_config = RoutingConfig(**overlay_kwargs)
+            log.info(
+                "  routing overlay:   %s (from the config store)",
+                ", ".join(sorted(applied)),
+            )
 
     # valid_providers guards SQLite-loaded aliases against providers that
     # were since removed from the config — without it a stale row makes its
@@ -1167,6 +1139,11 @@ def _build_serve_app(
             routing_config.opportunistic_min_headroom,
             routing_config.opportunistic_reset_window,
             routing_config.opportunistic_margin,
+        )
+    if routing_config.strategy != RoutingStrategy.ORDERED:
+        log.info(
+            "  strategy:          %s",
+            routing_config.strategy.value,
         )
     if model_map_mgr is not None and model_map_mgr.list_models():
         log.info(

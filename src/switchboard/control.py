@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -46,6 +47,29 @@ class SignalFreshness(Enum):
     FRESH = "fresh"
     DEGRADED = "degraded"
     UNKNOWN = "unknown"
+
+
+class RoutingStrategy(Enum):
+    """How to order immediate candidates (Plan 020 Wave 4, D5).
+
+    * ``ORDERED`` — table order (default, current behavior). The primary fronts
+      unless an affinity pin or opportunistic burn overrides it.
+    * ``HEADROOM`` — order by ``usage_headroom`` descending (Plan 015). Data-
+      bearing candidates precede ones without headroom data; ties break on
+      table order. Same as ``headroom_ranking = True``.
+    * ``PACE`` — order by quota surplus descending (Plan 020 D5). A provider
+      that will not plausibly spend its remaining quota before reset is
+      use-it-or-lose-it and should be burned first. Only providers with a FRESH
+      weekly-window signal are scored; unscored providers rank after scored
+      ones in table order (they are never starved). ``pace_flap_margin`` is a
+      deadband, not hysteresis with memory: it compares the top two candidates
+      rather than the currently-serving one, which is enough to stop
+      per-request alternation between near-equal providers.
+    """
+
+    ORDERED = "ordered"
+    HEADROOM = "headroom"
+    PACE = "pace"
 
 
 @dataclass(frozen=True)
@@ -109,6 +133,14 @@ class ProviderState:
     usage_24h_utilization: float | None = None
     # tokens_24h / cap_tokens (Plan 013). 0.0 = none used; 1.0 = at cap.
     # None = no 24h budget configured or no data (no filtering).
+    weekly_remaining_fraction: float | None = None
+    # Remaining fraction of the WEEKLY quota window (Plan 020 D6). 1.0 = full,
+    # 0.0 = exhausted. None = no weekly signal. The pace strategy scores on
+    # this; the session-window ``usage_headroom`` stays a separate signal.
+    weekly_reset_in: float | None = None
+    # Seconds until the weekly quota window resets (Plan 020 D6). None =
+    # unknown. The pace surplus formula uses this to compute the expected
+    # burn-down against a nominal ``burn_rate_per_day``.
 
 
 @dataclass(frozen=True)
@@ -218,6 +250,161 @@ class RoutingConfig:
     # Bounded LRU affinity table size.  API-key-hash mode (default) needs ~1k;
     # conversation pinning (many concurrent conversations) benefits from 8k+.
     # An eviction counter is surfaced so operators can detect pin loss.
+    strategy: RoutingStrategy = RoutingStrategy.ORDERED
+    # How to order immediate candidates (Plan 020 Wave 4 D5). Default
+    # ``ORDERED`` preserves today's behavior. ``PACE`` ranks by quota surplus
+    # (use-it-or-lose-it); ``HEADROOM`` is equivalent to ``headroom_ranking``.
+    pace_burn_rate_per_day: float = 0.14
+    # Nominal daily burn-down of the weekly quota (Plan 020 D5). Paul's number:
+    # ~a weekly quota consumed evenly, 100%/7d ≈ 14.3%. The surplus formula is
+    # ``remaining_fraction - burn_rate_per_day * days_until_reset``.
+    pace_flap_margin: float = 0.05
+    # Minimum surplus advantage the leader must hold over the runner-up to
+    # re-rank (Plan 020 D5 deadband). Prevents two near-equal providers from
+    # alternating per-request. Default 0.05 = 5 percentage points.
+
+
+@dataclass(frozen=True)
+class FieldBound:
+    """An inclusive/exclusive numeric range for one routing config field."""
+
+    minimum: float | None = None
+    minimum_inclusive: bool = True
+    maximum: float | None = None
+    maximum_inclusive: bool = True
+    integer: bool = False
+
+    def describe(self) -> str:
+        """Render the range in interval notation, e.g. ``[0.0, 1.0)``."""
+        if self.minimum is None and self.maximum is None:
+            return "any number"
+        if self.maximum is None:
+            op = ">=" if self.minimum_inclusive else ">"
+            return f"{op} {self.minimum}"
+        if self.minimum is None:
+            op = "<=" if self.maximum_inclusive else "<"
+            return f"{op} {self.maximum}"
+        left = "[" if self.minimum_inclusive else "("
+        right = "]" if self.maximum_inclusive else ")"
+        return f"in {left}{self.minimum}, {self.maximum}{right}"
+
+
+# The single source of truth for routing-field ranges.  Both config surfaces
+# read it: TOML validation (``switchboard config validate`` / boot) and the
+# admin API (``PUT /admin/config/routing``).  They used to carry independent
+# copies of these bounds and had silently drifted apart — the API rejected
+# ``headroom_threshold = 0.0`` (the documented "disabled" value) and
+# ``pace_burn_rate_per_day = 1.0``, both of which TOML accepted.  Keep this
+# table as the only place a bound is written down; ``test_config_surfaces``
+# asserts the two surfaces agree.
+ROUTING_FIELD_BOUNDS: dict[str, FieldBound] = {
+    "failover_threshold_seconds": FieldBound(minimum=0, integer=True),
+    "failover_margin": FieldBound(minimum=0, integer=True),
+    "dwell_interval": FieldBound(minimum=0.0),
+    "failback_delay": FieldBound(minimum=0.0),
+    "affinity_max_entries": FieldBound(minimum=1, integer=True),
+    "headroom_threshold": FieldBound(minimum=0.0, maximum=1.0),
+    "token_budget_threshold": FieldBound(minimum=0.0, maximum=1.0),
+    "usage_24h_threshold": FieldBound(minimum=0.0, maximum=1.0),
+    "opportunistic_min_headroom": FieldBound(
+        minimum=0.0, minimum_inclusive=False, maximum=1.0,
+    ),
+    "opportunistic_reset_window": FieldBound(
+        minimum=0.0, minimum_inclusive=False,
+    ),
+    "opportunistic_margin": FieldBound(
+        minimum=0.0, maximum=1.0, maximum_inclusive=False,
+    ),
+    "pace_burn_rate_per_day": FieldBound(minimum=0.0, maximum=1.0),
+    "pace_flap_margin": FieldBound(
+        minimum=0.0, maximum=1.0, maximum_inclusive=False,
+    ),
+}
+
+# Routing fields that are booleans rather than numbers.
+ROUTING_BOOL_FIELDS: frozenset[str] = frozenset(
+    {"headroom_ranking", "opportunistic_enabled", "pin_conversations"}
+)
+
+# Valid ``[routing] strategy`` values, derived from the enum so a new
+# strategy cannot be added without both surfaces accepting it.
+ROUTING_STRATEGIES: tuple[str, ...] = tuple(s.value for s in RoutingStrategy)
+
+
+# Routing fields ``PUT /admin/config/routing`` will apply, in the order errors
+# are reported.  Everything else in RoutingConfig is rejected at runtime:
+# ``affinity_max_entries`` (resizing the live table would evict active pins),
+# ``pin_conversations`` (it decides whether the proxy buffers request bodies,
+# which is a startup decision), and ``failover_threshold_seconds`` /
+# ``failover_margin`` (retained for display only).
+MUTABLE_ROUTING_FIELDS: tuple[str, ...] = (
+    "strategy",
+    "pace_burn_rate_per_day",
+    "pace_flap_margin",
+    "dwell_interval",
+    "failback_delay",
+    "headroom_threshold",
+    "headroom_ranking",
+    "token_budget_threshold",
+    "usage_24h_threshold",
+    "opportunistic_enabled",
+    "opportunistic_min_headroom",
+    "opportunistic_reset_window",
+    "opportunistic_margin",
+)
+
+
+def validate_routing_field(field: str, value: object) -> str | None:
+    """Validate one routing field's value against :data:`ROUTING_FIELD_BOUNDS`.
+
+    Returns an error message *without* a surface-specific prefix (the caller
+    adds ``routing.`` for TOML), or ``None`` when the value is acceptable.
+    Fields with no entry in the table are not range-checked here and return
+    ``None`` — the caller is responsible for anything structural.
+    """
+    if field == "strategy":
+        if not isinstance(value, str) or value not in ROUTING_STRATEGIES:
+            joined = ", ".join(ROUTING_STRATEGIES)
+            return f"{field} must be one of: {joined}"
+        return None
+
+    if field in ROUTING_BOOL_FIELDS:
+        if not isinstance(value, bool):
+            return f"{field} must be a boolean"
+        return None
+
+    bound = ROUTING_FIELD_BOUNDS.get(field)
+    if bound is None:
+        return None
+
+    # bool is a subclass of int; a boolean is never a valid number here.
+    if isinstance(value, bool):
+        return f"{field} must be {'an integer' if bound.integer else 'a number'}"
+    if bound.integer:
+        if not isinstance(value, int):
+            return f"{field} must be an integer"
+    elif not isinstance(value, (int, float)):
+        return f"{field} must be a number"
+
+    numeric = float(value)
+    # JSON accepts NaN/Infinity as literals; both poison the routing math
+    # (every NaN comparison is False, so a NaN threshold silently disables
+    # the signal it was meant to enforce).
+    if not math.isfinite(numeric):
+        return f"{field} must be a finite number"
+    if bound.minimum is not None:
+        if bound.minimum_inclusive:
+            if numeric < bound.minimum:
+                return f"{field} must be {bound.describe()}"
+        elif numeric <= bound.minimum:
+            return f"{field} must be {bound.describe()}"
+    if bound.maximum is not None:
+        if bound.maximum_inclusive:
+            if numeric > bound.maximum:
+                return f"{field} must be {bound.describe()}"
+        elif numeric >= bound.maximum:
+            return f"{field} must be {bound.describe()}"
+    return None
 
 
 @dataclass(frozen=True)
@@ -376,6 +563,97 @@ def _satisfies_capabilities(
     return required <= caps.surfaces
 
 
+def pace_surplus(state: ProviderState, burn_rate_per_day: float) -> float | None:
+    """Quota surplus for one provider (Plan 020 D5).
+
+    ``surplus = remaining_fraction - expected_burn``
+    where ``expected_burn = burn_rate_per_day * days_until_reset``.
+
+    Returns ``None`` when the provider has no FRESH weekly signal (stale or
+    unscored providers rank after scored ones in table order and are never
+    starved — fail safe).
+
+    A positive surplus means the provider has more quota than it will plausibly
+    spend before reset → use-it-or-lose-it → should be burned first (ranked
+    highest). A negative surplus means the provider is burning faster than
+    nominal and should be conserved.
+
+    Pure and deterministic: no I/O, no clock — the weekly reset countdown is
+    already a ``seconds_until_reset`` value in the frozen ``ProviderState``.
+    """
+    if state.weekly_remaining_fraction is None or state.weekly_reset_in is None:
+        return None
+    if state.signal_freshness != SignalFreshness.FRESH:
+        return None
+    days_until_reset = state.weekly_reset_in / 86400.0
+    expected_burn = burn_rate_per_day * days_until_reset
+    return state.weekly_remaining_fraction - expected_burn
+
+
+def pace_rank(
+    immediate: list[str],
+    states: dict[str, ProviderState],
+    candidates: tuple[str, ...],
+    config: RoutingConfig,
+) -> bool:
+    """Reorder ``immediate`` by pace surplus descending (Plan 020 D5, WI-13).
+
+    Scored providers rank first (highest surplus), unscored providers follow
+    in table order. The ranking is stable within each group. Deadband: when
+    the leader's surplus advantage over the runner-up is less than
+    ``pace_flap_margin``, table order is preserved to avoid flapping between
+    near-equal providers.
+
+    Mutates ``immediate`` in place — the caller already separated immediate
+    candidates; this only reorders them. Returns ``True`` when the ranking
+    changed the order (i.e. a non-table-order result), ``False`` when the
+    deadband guard or all-unscored path left it unchanged.
+    """
+    scored: list[tuple[str, float]] = []
+    unscored: list[str] = []
+    for name in immediate:
+        st = states.get(name)
+        if st is None:
+            unscored.append(name)
+            continue
+        s = pace_surplus(st, config.pace_burn_rate_per_day)
+        if s is None:
+            unscored.append(name)
+        else:
+            scored.append((name, s))
+
+    if not scored:
+        return False  # nothing to rank; leave table order
+
+    order = {name: idx for idx, name in enumerate(candidates)}
+
+    def _sort_key(item: tuple[str, float]) -> tuple[float, int]:
+        return (-item[1], order[item[0]])
+
+    scored.sort(key=_sort_key)
+
+    # Deadband: if the leader's advantage < pace_flap_margin, keep table
+    # order to avoid per-request flapping between near-equal providers.  But
+    # still enforce the scored-first invariant (unscored providers never
+    # outrank scored ones) — the plan's guardrail holds even under the deadband.
+    if len(scored) >= 2:
+        best_surplus = scored[0][1]
+        runner_up_surplus = scored[1][1]
+        if best_surplus - runner_up_surplus < config.pace_flap_margin:
+            # Too close to re-rank: keep scored (table order via the sort
+            # ties) before unscored, but do not re-order by surplus.
+            scored.sort(key=lambda item: order[item[0]])
+            new_order = [name for name, _ in scored] + unscored
+            changed = new_order != immediate
+            immediate[:] = new_order
+            return changed
+
+    new_order = [name for name, _ in scored] + unscored
+    changed = new_order != immediate
+    immediate[:] = new_order
+    return changed
+
+
 def _opportunistic_target(
     immediate: list[str],
     primary: str,
@@ -454,9 +732,13 @@ def route_decision(
        budget, trailing-24h usage; Plan 013 allows the last to demote the
        primary).
     6. Place candidates with immediate permits (AVAILABLE) first.
-    7. Order immediate candidates by ``usage_headroom`` descending when
-       ``headroom_ranking`` is enabled (Plan 015); data-bearing candidates
-       precede ones without headroom data; ties break on table order.
+    7. Order immediate candidates by the configured strategy: ``ORDERED``
+       (default, table order), ``HEADROOM`` (``usage_headroom`` descending,
+       Plan 015; ``headroom_ranking = True`` is equivalent), or ``PACE``
+       (weekly quota surplus descending, Plan 020 D5). Data-bearing candidates
+       precede ones without data; ties break on table order. Pace applies
+       a ``pace_flap_margin`` deadband so near-equal providers don't
+       alternate per-request.
     8. Apply affinity stickiness / dwell / failback logic (Plan 008 §5).
        After ``dwell_interval``, if the primary is in immediate and
        ``failback_delay`` is configured, failback requires the primary to have
@@ -620,8 +902,17 @@ def route_decision(
                 queue_eligible.append(name)
         # UNKNOWN: excluded from failover preference (fresh-only-for-failover)
 
-    # --- Headroom-ordered fallback ranking (Plan 015) ---
-    if config.headroom_ranking and len(immediate) > 1:
+    # --- Immediate-candidate ordering (Plan 015 / Plan 020 D5) ---
+    # The strategy determines how immediate candidates are ordered before
+    # affinity/primary fronting. ORDERED (default) leaves table order intact.
+    # HEADROOM orders by usage_headroom descending (Plan 015). PACE orders by
+    # weekly quota surplus descending (Plan 020 D5). ``headroom_ranking = True``
+    # is treated as ``strategy = HEADROOM`` for backward compat.
+    pace_changed = False
+    use_headroom = (
+        config.strategy == RoutingStrategy.HEADROOM or config.headroom_ranking
+    )
+    if use_headroom and len(immediate) > 1:
         order = {name: i for i, name in enumerate(candidates)}
 
         def _rank_key(name: str) -> tuple[int, float, int]:
@@ -631,6 +922,8 @@ def route_decision(
             return (0 if h is not None else 1, -(h or 0.0), order[name])
 
         immediate.sort(key=_rank_key)
+    elif config.strategy == RoutingStrategy.PACE and len(immediate) > 1:
+        pace_changed = pace_rank(immediate, states, candidates, config)
 
     # --- Affinity stickiness / dwell / failback (Plan 008 §5) ---
     affinity_reason = ""
@@ -691,8 +984,24 @@ def route_decision(
             immediate.remove(affinity.provider)
             immediate.insert(0, affinity.provider)
             affinity_reason = "affinity_pinned"
-        else:
-            target = _opportunistic_target(immediate, primary, states, config)
+        elif config.strategy != RoutingStrategy.PACE:
+            # ORDERED / HEADROOM only: consider an opportunistic burn, and
+            # otherwise front the primary.
+            #
+            # PACE deliberately skips BOTH. pace_rank (step 7) has already
+            # ordered `immediate` by weekly quota surplus, which is Plan 016's
+            # use-it-or-lose-it philosophy promoted from an opportunistic
+            # exception to the primary ordering (Plan 020 D5). Re-fronting the
+            # primary here would undo exactly the ordering the operator asked
+            # for, and running opportunism on top would let a session-window
+            # signal override a weekly-window decision. So under PACE the
+            # primary can lose the front — it is NOT demoted (it stays
+            # immediate-eligible, queue backstop, and terminal fallback), but
+            # it is not privileged either. An affinity pin still outranks the
+            # ranking; that is handled above.
+            target = _opportunistic_target(
+                immediate, primary, states, config
+            )
             if target is not None:
                 immediate.remove(target)
                 immediate.insert(0, target)
@@ -721,6 +1030,8 @@ def route_decision(
             reason = affinity_reason
         elif immediate[0] == primary:
             reason = "primary_available"
+        elif config.strategy == RoutingStrategy.PACE and pace_changed and primary in immediate:
+            reason = "pace_failover"
         else:
             reason = "failover"
     else:

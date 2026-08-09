@@ -66,9 +66,12 @@ The decision proceeds in this order (Plans 006, 008, 014, 015, 016):
    pressured non-primary candidates to queue-eligible (headroom, token budget,
    trailing-24h usage; Plan 013 allows the last to demote the primary).
 6. **Place** candidates with immediate permits (AVAILABLE) first.
-7. **Order** immediate candidates by `usage_headroom` descending when
-   `[routing] headroom_ranking` is enabled (Plan 015); data-bearing candidates
-   precede ones without headroom data; ties break on table order.
+7. **Order** immediate candidates by the configured strategy: `ORDERED`
+   (default, table order), `HEADROOM` (`usage_headroom` descending, Plan 015;
+   `headroom_ranking = True` is equivalent), or `PACE` (weekly quota surplus
+   descending, Plan 020 D5). Data-bearing candidates precede ones without
+   data; ties break on table order. Pace applies a `pace_flap_margin`
+   deadband so near-equal providers don't alternate per-request.
 8. **Apply** affinity stickiness / dwell / failback logic (Plan 008 §5). After
    `dwell_interval`, if the primary is in immediate and `failback_delay` is
    configured, failback requires the primary to have been continuously
@@ -104,6 +107,7 @@ class AdmissionPlan:
 | `affinity_hysteresis` | Affinity pin held past dwell while primary reproves itself (Plan 014) |
 | `affinity_pinned` | Conversation pinning (Plan 019) holds the pin past dwell — no failback to primary while the pinned provider stays FRESH + AVAILABLE |
 | `opportunistic` | No affinity pin; a quota-bearing fallback with expiring headroom took front preference (Plan 016) |
+| `pace_failover` | Pace strategy ranked a non-primary provider highest by weekly quota surplus (Plan 020 D5) |
 | `queue_only` | No immediate candidates; queue on a candidate |
 | `no_eligible_candidates` | All candidates are closed or unknown |
 | `model_unservable` | No configured provider serves the requested model |
@@ -126,6 +130,19 @@ Properties this guarantees:
   and a near-term quota reset may front `immediate`, but the primary remains
   immediate-eligible, queue backstop, and terminal fallback. Stale or
   unmeasured quota data never promotes.
+- **Pace routing (Plan 020 D5).** Opt-in via `[routing] strategy = "pace"`.
+  Ranks immediate candidates by weekly quota surplus (`remaining_fraction −
+  burn_rate × days_until_reset`) descending — a provider that will not
+  plausibly spend its remaining quota before reset is use-it-or-lose-it and
+  should be burned first. Only providers with a FRESH weekly signal are
+  scored; unscored providers rank after scored ones in table order (never
+  starved). `pace_flap_margin` is a deadband on the ranking: when the
+  leader's advantage over the runner-up is smaller than the margin, table
+  order is kept. It compares the top two candidates rather than remembering
+  the currently-serving one, so it suppresses per-request alternation without
+  being hysteresis in the with-memory sense. The primary is never demoted —
+  it may lose the front but stays immediate-eligible, queue backstop, and
+  terminal fallback.
 - **Pure.** `now`, `healthy_since`, and all provider states are
   arguments. No I/O, no clock.
 - **Deterministic.** Same inputs → same plan. Testable without a network.

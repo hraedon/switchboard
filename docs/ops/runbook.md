@@ -346,3 +346,77 @@ to `0`. A stuck non-zero value is a **leaked permit** — a bug, usually a
 request whose upstream or client disconnected without releasing the gate.
 Note the provider and the `recent_decisions`, and report it.
 
+
+## 10. Routing strategies
+
+`[routing] strategy` controls how switchboard orders the **immediate**
+(capacity-available) candidates before applying affinity and primary
+preference. The default preserves the behaviour switchboard has always had.
+
+| Strategy | Behaviour |
+|---|---|
+| `ordered` (default) | Table order. The primary fronts unless an affinity pin or an opportunistic burn overrides it. |
+| `headroom` | Order by `usage_headroom` descending (Plan 015) — the provider with the most remaining **session** headroom goes first. Equivalent to the older `headroom_ranking = true`; setting both is rejected. |
+| `pace` | Order by **weekly quota surplus** descending (Plan 020 D5). A provider that will not plausibly spend its remaining weekly quota before it resets has a positive surplus and is burned first — use it or lose it. |
+
+**What pace actually computes.**
+
+```
+surplus = weekly_remaining_fraction - pace_burn_rate_per_day * days_until_reset
+```
+
+`pace_burn_rate_per_day` (default `0.14`) is the nominal daily fraction of the
+weekly quota you expect to consume — a week's quota spent evenly is 100%/7 ≈
+14.3%. A positive surplus means "ahead of schedule, spend it"; a negative one
+means "burning too fast, conserve".
+
+Three properties matter when you are deciding whether to trust it:
+
+- **Only fresh signals are scored.** A provider whose weekly reading is stale,
+  missing, or whose truth source is down is *unscored*. Unscored providers rank
+  after scored ones in table order — never starved, never scored on stale data.
+- **The primary is never demoted.** Under pace it can lose the *front*, but it
+  stays immediate-eligible, the queue backstop, and the terminal fallback.
+- **An affinity pin still wins.** Pace reorders candidates; it does not break
+  conversation pinning or dwell.
+
+`pace_flap_margin` (default `0.05`) is a deadband: when the leader's surplus
+advantage over the runner-up is smaller than the margin, table order is kept
+instead of re-ranking. It stops two near-equal providers alternating on every
+request. Note it compares the top two *candidates*, not the currently-serving
+provider — it is a deadband, not true hysteresis with memory.
+
+**Changing it.** Either surface works, and they validate identically:
+
+```toml
+[routing]
+strategy = "pace"
+pace_burn_rate_per_day = 0.14
+pace_flap_margin = 0.05
+```
+
+or at runtime, without a restart:
+
+```
+PUT /admin/config/routing
+Authorization: Bearer <admin-token>
+Content-Type: application/json
+
+{"strategy": "pace"}
+```
+
+The dashboard's **Routing Config → Edit Strategy** does the same thing. A
+runtime change takes effect on the next routing decision **and is persisted to
+the config store**, so it survives a restart and outranks the TOML value
+(Plan 020 D1: the store wins). Only the fields you actually change are stored —
+everything else keeps following the config file. The response includes
+`"persisted": true`; if it says `false`, no store is configured
+(`route_table_store` unset) and your change will be lost on restart.
+
+To hand a knob back to the config file, reset the stored config
+(§5) — there is no "unset one field" verb.
+
+**When pace does nothing.** If no provider reports a weekly window, every
+candidate is unscored and pace is identical to `ordered`. Check
+`providers.<name>.weekly_remaining_fraction` in `/status.json`: `null` means no
+weekly signal is reaching switchboard, and the strategy has nothing to rank on.

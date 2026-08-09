@@ -33,6 +33,7 @@ from switchboard.config_reset import (
     reset_sections,
 )
 from switchboard.config_store import ConfigStoreManager
+from switchboard.control import MUTABLE_ROUTING_FIELDS as _MUTABLE_ROUTING_FIELDS
 from switchboard.session import (
     SESSION_COOKIE,
     LoginThrottle,
@@ -152,6 +153,13 @@ def _provider_status(
         "usage_age": round(r.last_age_seconds, 1),
         "stale": not r.last_fetch_ok,
         "phantom_estimate": r.phantom_estimate_value,
+        # Weekly-window quota (Plan 020 D6) — the pace strategy's signal.
+        "weekly_remaining_fraction": (
+            reading.weekly_remaining_fraction if reading else None
+        ),
+        "weekly_reset_epoch": (
+            reading.weekly_reset_epoch if reading else None
+        ),
         # Request-window budget
         "requests_in_window": (
             reading.requests_in_window if reading else None
@@ -259,6 +267,7 @@ def _build_status_payload(
     usage_history_tracker: Any | None = None,
     model_map_mgr: ModelMapManager | None = None,
     speed_sampler: Any | None = None,
+    routing_config: Any | None = None,
 ) -> dict[str, Any]:
     """Build the full status payload for /status.json."""
     provider_states: dict[str, Any] = {}
@@ -295,6 +304,16 @@ def _build_status_payload(
         "version": __version__,
         "build": build_sha,
     }
+
+    if routing_config is not None:
+        payload["routing_config"] = {
+            "strategy": routing_config.strategy.value,
+            "dwell_interval": routing_config.dwell_interval,
+            "failback_delay": routing_config.failback_delay,
+            "pace_burn_rate_per_day": routing_config.pace_burn_rate_per_day,
+            "pace_flap_margin": routing_config.pace_flap_margin,
+            "headroom_ranking": routing_config.headroom_ranking,
+        }
 
     if estimator is not None:
         est = estimator.state().estimate
@@ -340,6 +359,7 @@ async def send_status_json(
     usage_history_tracker: Any | None = None,
     model_map_mgr: ModelMapManager | None = None,
     speed_sampler: Any | None = None,
+    routing_config: Any | None = None,
 ) -> None:
     """GET /status.json — per-provider state + route table + routing metrics."""
     payload = _build_status_payload(
@@ -350,6 +370,7 @@ async def send_status_json(
         usage_history_tracker=usage_history_tracker,
         model_map_mgr=model_map_mgr,
         speed_sampler=speed_sampler,
+        routing_config=routing_config,
     )
     await send_json(
         send, 200, payload,
@@ -1268,11 +1289,201 @@ async def handle_config_get(
         "dwell_interval": routing_config.dwell_interval,
         "headroom_threshold": routing_config.headroom_threshold,
         "token_budget_threshold": routing_config.token_budget_threshold,
+        "strategy": routing_config.strategy.value,
+        "pace_burn_rate_per_day": routing_config.pace_burn_rate_per_day,
+        "pace_flap_margin": routing_config.pace_flap_margin,
     }
     await send_json(
         send, 200, body,
         extra_headers=cors_extra_headers(cors_allow_origin, None),
     )
+
+
+async def handle_routing_config_update(
+    send: Send,
+    receive: Receive,
+    proxy_app: Any,
+    admin_token: str | None,
+    scope: Scope,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """PUT /admin/config/routing — swap routing config at runtime (Plan 020 WI-14).
+
+    Accepts a JSON body with any of the mutable routing fields and applies them
+    as an overlay on the current config. Fields not present in the body are
+    preserved unchanged. The change takes effect on the next routing decision.
+
+    Mutable fields: ``strategy``, ``pace_burn_rate_per_day``, ``pace_flap_margin``,
+    ``dwell_interval``, ``failback_delay``, ``headroom_threshold``,
+    ``headroom_ranking``, ``token_budget_threshold``, ``usage_24h_threshold``,
+    ``opportunistic_enabled``, ``opportunistic_min_headroom``,
+    ``opportunistic_reset_window``, ``opportunistic_margin``.
+
+    NOT mutable: ``affinity_max_entries`` (resizing the live table would evict
+    active pins), ``pin_conversations`` (requires a body-buffering restart to
+    take effect safely), ``failover_threshold_seconds``/``failover_margin``
+    (retained for display only).
+    """
+    from switchboard.control import (
+        ROUTING_BOOL_FIELDS,
+        RoutingConfig,
+        RoutingStrategy,
+        validate_routing_field,
+    )
+
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(
+            send, 405,
+            {"error": "mutations disabled — set --admin-token to enable"},
+            extra_headers=cors,
+        )
+        return
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    ct = next(
+        (
+            v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+            if k == b"content-type"
+        ),
+        "",
+    )
+    if not ct.lower().startswith("application/json"):
+        await send_json(
+            send, 400, {"error": "content-type must be application/json"},
+            extra_headers=cors,
+        )
+        return
+
+    body: bytes = b""
+    try:
+        body = await read_body(receive)
+    except ValueError:
+        await send_json(
+            send, 413, {"error": "request body too large"}, extra_headers=cors,
+        )
+        return
+    except ConnectionError:
+        return
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        await send_json(send, 400, {"error": "invalid JSON body"}, extra_headers=cors)
+        return
+    if not isinstance(payload, dict):
+        await send_json(
+            send, 400, {"error": "body must be a JSON object"}, extra_headers=cors,
+        )
+        return
+
+    current = proxy_app.routing_config
+    # Build the new config from the current one, applying the overlay.
+    # We use the dataclass fields to construct kwargs, preserving all
+    # untouched fields.
+    import dataclasses
+
+    kwargs: dict[str, Any] = {}
+    for f in dataclasses.fields(current):
+        kwargs[f.name] = getattr(current, f.name)
+
+    errors: list[str] = []
+
+    # Every field is validated against control.ROUTING_FIELD_BOUNDS — the same
+    # table the TOML validator uses.  The two surfaces previously carried
+    # independent copies of these bounds and drifted; `test_config_surfaces`
+    # now asserts they agree, and this loop is why they can.
+    for field_name in _MUTABLE_ROUTING_FIELDS:
+        if field_name not in payload:
+            continue
+        value = payload[field_name]
+        message = validate_routing_field(field_name, value)
+        if message is not None:
+            errors.append(message)
+            continue
+        if field_name == "strategy":
+            kwargs["strategy"] = RoutingStrategy(value)
+        elif field_name in ROUTING_BOOL_FIELDS:
+            kwargs[field_name] = value
+        else:
+            kwargs[field_name] = float(value)
+
+    # Reject strategy + headroom_ranking conflict
+    final_strategy = kwargs.get("strategy")
+    final_hr = kwargs.get("headroom_ranking")
+    if (
+        final_strategy is not None
+        and final_strategy is not RoutingStrategy.ORDERED
+        and final_hr is True
+    ):
+        errors.append(
+            f"strategy={final_strategy.value} and headroom_ranking=true "
+            "are mutually exclusive — use strategy alone"
+        )
+
+    # Reject immutable / display-only fields and unknown keys
+    for key in payload:
+        if key not in _MUTABLE_ROUTING_FIELDS:
+            errors.append(
+                f"{key} is not mutable at runtime — restart to change"
+            )
+
+    if errors:
+        await send_json(
+            send, 400, {"error": "; ".join(errors)}, extra_headers=cors,
+        )
+        return
+
+    new_config = RoutingConfig(**kwargs)
+    proxy_app.update_routing_config(new_config)
+
+    # Persist the overlay so the change survives a restart, the same rule the
+    # default route follows (Plan 020 WI-8a / D1: store wins over TOML). Only
+    # the fields this request set are merged in — a knob the operator never
+    # touched keeps following TOML instead of being frozen at today's default.
+    # Without a store the swap is live but not durable, and `persisted` in the
+    # response says so rather than letting the GUI imply otherwise.
+    persisted = False
+    config_store = getattr(proxy_app, "config_store", None)
+    if config_store is not None:
+        overlay = dict(config_store.get_routing_overlay())
+        for key, value in payload.items():
+            overlay[key] = value
+        try:
+            config_store.set_routing_overlay(overlay)
+            persisted = config_store.db is not None
+        except Exception:
+            log.warning(
+                "could not persist the routing overlay; the change is live "
+                "but will not survive a restart",
+                exc_info=True,
+            )
+
+    body_out = {
+        "persisted": persisted,
+        "strategy": new_config.strategy.value,
+        "dwell_interval": new_config.dwell_interval,
+        "failback_delay": new_config.failback_delay,
+        "pace_burn_rate_per_day": new_config.pace_burn_rate_per_day,
+        "pace_flap_margin": new_config.pace_flap_margin,
+        "headroom_ranking": new_config.headroom_ranking,
+        "headroom_threshold": new_config.headroom_threshold,
+        "token_budget_threshold": new_config.token_budget_threshold,
+        "usage_24h_threshold": new_config.usage_24h_threshold,
+        "opportunistic_enabled": new_config.opportunistic_enabled,
+        "opportunistic_min_headroom": new_config.opportunistic_min_headroom,
+        "opportunistic_reset_window": new_config.opportunistic_reset_window,
+        "opportunistic_margin": new_config.opportunistic_margin,
+    }
+    await send_json(send, 200, body_out, extra_headers=cors)
 
 
 async def handle_provider_override(
