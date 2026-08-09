@@ -1,0 +1,126 @@
+# switchboard — standalone usage routing (no usage-dashboard required)
+#
+# This config demonstrates direct usage solicitation: switchboard fetches
+# usage data directly from each provider's own endpoint, populates the
+# weekly-window fields for pace routing, and shows the surplus ranking —
+# all without a separate usage-dashboard deployment.
+#
+# Copy, fill in the api_key values (or use env indirection), and run:
+#
+#   switchboard --config examples/standalone-usage.toml
+#
+# Required env vars (set before starting):
+#   SWITCHBOARD_OPENCODE_GO_KEY   — opencode-go API key
+#   SWITCHBOARD_ZAI_KEY           — z.ai API key
+#   SWITCHBOARD_OPENCODE_WORKSPACE — opencode-go workspace ID (wrk_…)
+#   SWITCHBOARD_OPENCODE_COOKIE   — opencode-go auth cookie
+#   SWITCHBOARD_OLLAMA_COOKIE     — ollama.com session cookie
+#
+# Keys belong in a file that is NOT committed. samples/ is gitignored.
+#
+# READ THIS BEFORE ENABLING IT (see plans/022-direct-usage-solicitation.md):
+#
+#   * Two of the three fetchers parse vendor HTML that nobody has promised to
+#     keep stable. They WILL break, without warning, on the vendor's schedule.
+#     Watch `providers.<name>.direct_usage.parse_failures` in /status.json —
+#     a rising count means the page changed and this provider has no weekly
+#     signal any more. Routing degrades safely (the provider ranks in table
+#     order); nothing 503s. But nothing else tells you either.
+#
+#   * A session cookie is a bearer credential for your whole account, wider
+#     than the API key next to it, and it expires on its own schedule. It is
+#     read from an environment variable only, never from this file — setting
+#     `direct_usage_cookie` here is rejected at startup.
+#
+#   * Enabling direct_usage changes which truth source a provider uses, which
+#     also changes how its concurrency gate is sized (Plan 022 WI-5, open).
+#     Do not enable it on a provider whose concurrency behaviour you depend on
+#     without re-checking `capacity` in /status.json.
+
+listen = "127.0.0.1:8900"
+admin_token = "change-me"
+
+# ── providers ────────────────────────────────────────────────────────────
+#
+# `direct_usage = true` tells switchboard to fetch usage directly from the
+# provider's own endpoint. The fetcher is selected by provider `type`:
+#
+#   zai-coding-plan → z.ai JSON quota API (uses api_key)
+#   opencode-go     → opencode.ai workspace page scrape (uses workspace_id + cookie)
+#   ollama-cloud    → ollama.com settings page scrape (uses cookie)
+#
+# Providers without a direct fetcher (generic, deepseek, etc.) silently fall
+# through to the default truth source — direct_usage is opt-in per provider.
+
+[provider.opencode-go]
+upstream = "https://opencode.ai/zen/go/v1"
+type = "opencode-go"
+target = 4
+api_key_env = "SWITCHBOARD_OPENCODE_GO_KEY"
+direct_usage = true
+direct_usage_workspace_id_env = "SWITCHBOARD_OPENCODE_WORKSPACE"
+direct_usage_cookie_env = "SWITCHBOARD_OPENCODE_COOKIE"
+direct_usage_poll_interval = 120.0   # 2 min — the page is slow to change
+
+[provider.ollama-cloud]
+upstream = "https://ollama.com/v1"
+type = "ollama-cloud"
+target = 4
+api_key_env = "SWITCHBOARD_OLLAMA_CLOUD_KEY"
+direct_usage = true
+direct_usage_cookie_env = "SWITCHBOARD_OLLAMA_COOKIE"
+direct_usage_poll_interval = 120.0
+
+[provider.zai-coding-plan]
+upstream = "https://api.z.ai/api/coding/paas/v4"
+type = "zai-coding-plan"
+target = 2
+api_key_env = "SWITCHBOARD_ZAI_KEY"
+direct_usage = true
+direct_usage_poll_interval = 60.0
+
+# ── routing ──────────────────────────────────────────────────────────────
+#
+# strategy = "pace" ranks providers by weekly quota surplus — a provider
+# that won't plausibly spend its remaining quota before reset is use-it-or-
+# lose-it and should be burned first. With direct_usage, each provider's
+# weekly_remaining_fraction and weekly_reset_epoch are populated from the
+# provider's own data, so pace routing works without usage-dashboard.
+#
+# Pace itself has not been validated against a live provider (Plan 020 WI-15).
+# If every provider is unscored — check weekly_remaining_fraction in
+# /status.json — pace behaves exactly like "ordered".
+
+[route.default]
+providers = ["opencode-go", "ollama-cloud", "zai-coding-plan"]
+
+[routing]
+strategy = "pace"
+pace_burn_rate_per_day = 0.14    # nominal 14%/day (~100%/7d)
+pace_flap_margin = 0.05          # 5% advantage needed to re-rank
+dwell_interval = 30.0            # stay on fallback for 30s minimum
+
+# ── usage-error reroute ──────────────────────────────────────────────────
+#
+# The reactive backstop: on 429/402/503/529, retry once on the next eligible
+# provider before the client sees a byte. Works whether or not direct_usage
+# is enabled — it reads the upstream response, not the usage data.
+
+[reroute]
+enabled = true
+max_attempts = 1
+
+# ── model bridge ─────────────────────────────────────────────────────────
+
+[model."deepseek-v4-flash"]
+opencode-go = "deepseek-v4-flash"
+ollama-cloud = "deepseek-v4-flash"
+
+[model."kimi-k3"]
+opencode-go = "kimi-k3"
+ollama-cloud = "kimi-k3"
+
+[model."glm-5.2"]
+opencode-go = "glm-5.2"
+ollama-cloud = "glm-5.2"
+zai-coding-plan = "glm-5.2"

@@ -420,3 +420,44 @@ To hand a knob back to the config file, reset the stored config
 candidate is unscored and pace is identical to `ordered`. Check
 `providers.<name>.weekly_remaining_fraction` in `/status.json`: `null` means no
 weekly signal is reaching switchboard, and the strategy has nothing to rank on.
+
+## 11. Direct usage solicitation
+
+Some providers can have their quota read from the vendor's own surface instead
+of from a usage-dashboard deployment (`direct_usage = true` per provider; see
+`examples/standalone-usage.toml` and `plans/022-direct-usage-solicitation.md`).
+It is off unless configured.
+
+**It is scraping, for two of the three providers.** z.ai has a real JSON quota
+API. opencode-go and ollama-cloud are parsed out of their web pages, using a
+session cookie. Those parsers break when the vendor rebuilds a page, and you
+will not be told.
+
+**How to tell it has broken.** `GET /status.json` →
+`providers.<name>.direct_usage`:
+
+```json
+"direct_usage": { "parse_failures": 41, "transport_failures": 0 }
+```
+
+| Reading | Meaning |
+|---|---|
+| key absent | this provider is not using direct usage |
+| both counters 0 | working |
+| `parse_failures` rising | **the vendor page changed** — the parser needs fixing; no amount of waiting helps |
+| `transport_failures` rising | network, timeout, or an expired cookie — check the log line, retry may be enough |
+
+The first parse failure logs one `WARNING` naming the provider and the surface;
+it is not repeated until the parser recovers, so a permanent break does not
+drown the log.
+
+**What breakage costs you.** Nothing that pages you. The provider's weekly
+signal goes stale, the pace strategy stops scoring it, and it ranks in table
+order — which is what `ordered` would have done anyway. Traffic keeps flowing.
+This is why the counter exists: the failure is invisible from routing
+behaviour.
+
+**Rotating the cookie.** Cookies come from the environment
+(`direct_usage_cookie_env`) and are read at startup, so rotation is: update
+the Secret, roll the deployment. A cookie in the config file is rejected at
+startup — it is a whole-account credential and must not be committed.

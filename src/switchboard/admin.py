@@ -102,6 +102,25 @@ async def handle_readyz(
         await send_json(send, 503, {"status": "not ready"})
 
 
+def _direct_usage_health(ctx: ProviderContext) -> dict[str, Any]:
+    """Parse/transport failure counts for a direct-usage provider, else {}.
+
+    Kept out of the main status dict for providers that do not use direct
+    usage, so the absence of the keys means "not scraping" rather than
+    "scraping fine" (Plan 022 WI-3).
+    """
+    source = ctx.truth_source
+    parse_failures = getattr(source, "parse_failures", None)
+    if parse_failures is None:
+        return {}
+    return {
+        "direct_usage": {
+            "parse_failures": parse_failures,
+            "transport_failures": getattr(source, "transport_failures", 0),
+        }
+    }
+
+
 def _provider_status(
     ctx: ProviderContext,
     overload_tracker: Any | None = None,
@@ -160,6 +179,11 @@ def _provider_status(
         "weekly_reset_epoch": (
             reading.weekly_reset_epoch if reading else None
         ),
+        # Direct usage solicitation health (Plan 022 WI-3). Absent for
+        # providers not using it. `parse_failures` rising means the vendor
+        # surface changed shape and this provider's weekly signal is gone —
+        # routing degrades safely to table order, so nothing else surfaces it.
+        **_direct_usage_health(ctx),
         # Request-window budget
         "requests_in_window": (
             reading.requests_in_window if reading else None
