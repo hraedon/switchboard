@@ -249,16 +249,26 @@ Content-Type: application/json
 {
   "name": "ollama-cloud",
   "upstream": "https://ollama.com/v1",
-  "type": "generic",
+  "provider_type": "generic",
   "target": 4,
+  "key_mode": "env",
   "api_key_env": "SWITCHBOARD_OLLAMA_CLOUD_KEY"
 }
 ```
 
-The full set of accepted fields is: `name`, `upstream`, `type`, `target`,
-`key_mode`, `api_key_env`, `api_key_stored`, `auth_header`, `auth_prefix`,
-`dashboard_url`, `dashboard_token_env`, `usage_key_env`, `enabled`. Unknown
-keys are ignored.
+**Required:** `name`, `upstream`, `provider_type`, `target`, `key_mode`. The
+field is `provider_type`, not `type`, and `key_mode` is not optional — omitting
+either gets a 400 naming the field. `key_mode` is one of `env` (the key comes
+from the environment variable named by `api_key_env` — the production case),
+`stored` (the key is supplied as `api_key_stored` and kept in the config store),
+or `passthrough` (no credential of our own; the client's headers are forwarded
+untouched).
+
+The full set of accepted fields is: `account`, `upstream`, `provider_type`,
+`target`, `key_mode`, `api_key_env`, `api_key_stored`, `auth_header`,
+`auth_prefix`, `dashboard_url`, `dashboard_token_env`, `usage_key_env`,
+`enabled` — plus `name`, which is read separately. Unknown keys are ignored,
+so a misspelled field does not error; it silently does nothing.
 
 **Credential indirection (`api_key_env`).** In production the credential
 almost always comes from the environment, not the request body: set
