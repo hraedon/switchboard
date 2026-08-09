@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -262,6 +263,10 @@ class RoutingConfig:
     # Minimum surplus advantage the leader must hold over the runner-up to
     # re-rank (Plan 020 D5 deadband). Prevents two near-equal providers from
     # alternating per-request. Default 0.05 = 5 percentage points.
+    quarantine_threshold: int = 5
+    # Consecutive PROVIDER-attributable failures before a (provider, model)
+    # pair is quarantined until a human releases it (Plan 023). 0 disables
+    # quarantining; counting continues so the counters stay visible.
 
 
 @dataclass(frozen=True)
@@ -319,6 +324,7 @@ ROUTING_FIELD_BOUNDS: dict[str, FieldBound] = {
     "pace_flap_margin": FieldBound(
         minimum=0.0, maximum=1.0, maximum_inclusive=False,
     ),
+    "quarantine_threshold": FieldBound(minimum=0, integer=True),
 }
 
 # Routing fields that are booleans rather than numbers.
@@ -351,6 +357,7 @@ MUTABLE_ROUTING_FIELDS: tuple[str, ...] = (
     "opportunistic_min_headroom",
     "opportunistic_reset_window",
     "opportunistic_margin",
+    "quarantine_threshold",
 )
 
 
@@ -1056,6 +1063,129 @@ def route_decision(
 #: signal, and rerouting it would silently spray a broken request across every
 #: provider in turn.
 DEFAULT_REROUTE_STATUSES: frozenset[int] = frozenset({402, 429, 503, 529})
+
+
+class FailureAttribution(Enum):
+    """Who is at fault for a failed attempt (Plan 023 WI-1).
+
+    Only ``PROVIDER`` counts toward quarantine. The distinction is the whole
+    point of the feature: a failure caused by the request itself reproduces on
+    every provider, so counting it converts one misbehaving client into an
+    estate-wide outage.
+    """
+
+    NONE = "none"          # success, or not a fault signal — resets the counter
+    PROVIDER = "provider"  # the provider or our credential for it is broken
+    CALLER = "caller"      # the request is at fault; retrying elsewhere fails too
+
+
+# Response headers that mean an edge/CDN answered rather than the origin.
+# Mirrors the set `proxy._CDN_HEADERS` uses to classify 429s.
+_EDGE_HEADERS: frozenset[str] = frozenset(
+    {
+        "cf-ray",
+        "x-amz-cf-id",
+        "x-served-by",
+        "x-fastly-request-id",
+        "x-vercel-id",
+        "fly-request-id",
+    }
+)
+_EDGE_SERVERS: frozenset[str] = frozenset({"cloudflare"})
+
+# 4xx that can legitimately mean "our credential is bad", which IS the
+# provider's pair being broken from switchboard's point of view.
+_CREDENTIAL_STATUSES: frozenset[int] = frozenset({401, 403})
+
+
+def _looks_like_edge_block(
+    headers: Mapping[str, str], body_prefix: str
+) -> bool:
+    """Did an edge answer, rather than the vendor's API?
+
+    Two independent signals, either sufficient: an edge-identifying header, or
+    a body that is not JSON. A vendor API returns JSON errors; a Cloudflare
+    block page is HTML. Observed live on 2026-08-09 — opencode.ai returned
+    Cloudflare error 1010 banning the *client's* User-Agent, which switchboard
+    forwards verbatim, so the identical request failed on any provider whose
+    edge ran the same rule.
+    """
+    for name in _EDGE_HEADERS:
+        if headers.get(name) is not None:
+            return True
+    server = (headers.get("server") or "").lower()
+    for edge in _EDGE_SERVERS:
+        if edge in server:
+            return True
+    content_type = (headers.get("content-type") or "").lower()
+    if "html" in content_type:
+        return True
+    stripped = body_prefix.lstrip()
+    if not stripped:
+        # No body to judge. Not positive evidence of an edge — the caller
+        # decides what an absence means.
+        return False
+    return not stripped.startswith(("{", "["))
+
+
+def _looks_like_api_json(
+    headers: Mapping[str, str], body_prefix: str
+) -> bool:
+    """Positive evidence the vendor's own API answered.
+
+    ``content-type`` is checked first and is usually the only thing available:
+    the response body streams straight through to the client, so buffering it
+    purely to classify a failure would mean surgery on the streaming core for
+    a signal the header already carries.
+    """
+    if "json" in (headers.get("content-type") or "").lower():
+        return True
+    return body_prefix.lstrip().startswith(("{", "["))
+
+
+def classify_failure(
+    status: int | None,
+    headers: Mapping[str, str] | None = None,
+    body_prefix: str = "",
+) -> FailureAttribution:
+    """Attribute one attempt's outcome (Plan 023 WI-1). Pure.
+
+    ``status`` is ``None`` for a transport failure — connect, TLS, timeout —
+    which is unambiguously the provider's side of the wire.
+
+    ``body_prefix`` need only be the first few hundred bytes; the only question
+    asked of it is whether it opens like JSON.
+
+    Ambiguity resolves to ``CALLER`` on purpose. A missed quarantine costs some
+    failed requests. A false quarantine costs a working provider, and then its
+    fallback, and then the model.
+    """
+    if status is None:
+        return FailureAttribution.PROVIDER
+    if 200 <= status < 400:
+        return FailureAttribution.NONE
+    # Quota is normal operation, not fault. The breaker, the usage-error
+    # reroute and quota-aware routing already own 429; a busy provider must
+    # never become a quarantined one.
+    if status == 429:
+        return FailureAttribution.NONE
+    if status >= 500:
+        return FailureAttribution.PROVIDER
+    if status in _CREDENTIAL_STATUSES:
+        # Blaming the provider for a 401/403 requires positive evidence that
+        # the vendor's API answered — a JSON body, with no edge fingerprint.
+        # Absence of evidence is not evidence: an empty or unreadable body is
+        # unattributable, and unattributable resolves to CALLER.
+        if _looks_like_edge_block(headers or {}, body_prefix):
+            return FailureAttribution.CALLER
+        if _looks_like_api_json(headers or {}, body_prefix):
+            # The credential switchboard presented was refused. That is this
+            # pair being broken, and is exactly what should quarantine.
+            return FailureAttribution.PROVIDER
+        return FailureAttribution.CALLER
+    # 400, 404, 422, and the rest: the request is wrong and will be wrong
+    # everywhere.
+    return FailureAttribution.CALLER
 
 
 def should_reroute(

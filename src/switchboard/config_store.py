@@ -84,6 +84,18 @@ CREATE TABLE IF NOT EXISTS routing_config (
 )
 """
 
+# Quarantined (provider, model) pairs (Plan 023). One JSON row; the set is
+# small and always read whole. Persisted so a pod restart cannot silently
+# un-quarantine something no human has looked at yet — that would turn a
+# standing alarm into a five-minute one.
+_QUARANTINE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS quarantine (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    entries TEXT NOT NULL,
+    updated_at REAL NOT NULL
+)
+"""
+
 _COLUMNS = (
     "name",
     "account",
@@ -170,6 +182,7 @@ class ConfigStoreManager:
             try:
                 self._db.execute(_SCHEMA)
                 self._db.execute(_ROUTING_SCHEMA)
+                self._db.execute(_QUARANTINE_SCHEMA)
                 self._db.commit()
             except sqlite3.Error:
                 # Boot must not crash on a bad store file; later writes will
@@ -509,6 +522,52 @@ class ConfigStoreManager:
             "INSERT OR REPLACE INTO routing_config (id, overlay, updated_at) "
             "VALUES (1, ?, ?)",
             (json.dumps(overlay), self._clock()),
+        )
+        db.commit()
+
+    # -- quarantine (Plan 023) -----------------------------------------------
+
+    def get_quarantine(self) -> list[dict[str, object]]:
+        """Quarantined pairs from the last run, or ``[]``.
+
+        An unreadable row yields ``[]`` with a warning rather than failing the
+        boot: losing a quarantine costs some failed requests, while refusing to
+        start costs the whole estate.
+        """
+        db = self._db
+        if db is None:
+            return []
+        try:
+            row = db.execute(
+                "SELECT entries FROM quarantine WHERE id = 1"
+            ).fetchone()
+        except sqlite3.Error:
+            log.warning(
+                "config store: could not read the quarantine table; "
+                "starting with nothing quarantined",
+                exc_info=True,
+            )
+            return []
+        if row is None:
+            return []
+        try:
+            loaded = json.loads(row[0])
+        except (TypeError, ValueError):
+            log.warning("config store: quarantine is not valid JSON; ignoring")
+            return []
+        if not isinstance(loaded, list):
+            return []
+        return [e for e in loaded if isinstance(e, dict)]
+
+    def set_quarantine(self, entries: list[dict[str, object]]) -> None:
+        """Replace the quarantine set wholesale."""
+        db = self._db
+        if db is None:
+            return
+        db.execute(
+            "INSERT OR REPLACE INTO quarantine (id, entries, updated_at) "
+            "VALUES (1, ?, ?)",
+            (json.dumps(entries), self._clock()),
         )
         db.commit()
 

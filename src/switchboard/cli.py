@@ -678,6 +678,10 @@ def _build_serve_app(
     from switchboard.overload import OverloadConfig
     from switchboard.providers import build_provider_contexts_from_config
     from switchboard.proxy import ProxyApp
+    from switchboard.quarantine import (
+        QuarantineTracker,
+        config_store_quarantine_store,
+    )
     from switchboard.route_table import RouteTableManager
     from switchboard.speed import SpeedSampler
     from switchboard.token_budget import TokenBudgetTracker
@@ -934,6 +938,9 @@ def _build_serve_app(
         pace_flap = routing_section.get("pace_flap_margin")
         if isinstance(pace_flap, (int, float)) and not isinstance(pace_flap, bool):
             rc_kwargs["pace_flap_margin"] = float(pace_flap)
+        q_threshold = routing_section.get("quarantine_threshold")
+        if isinstance(q_threshold, int) and not isinstance(q_threshold, bool):
+            rc_kwargs["quarantine_threshold"] = q_threshold
         if rc_kwargs:
             routing_config = RoutingConfig(**rc_kwargs)
 
@@ -968,6 +975,13 @@ def _build_serve_app(
                 "  routing overlay:   %s (from the config store)",
                 ", ".join(sorted(applied)),
             )
+
+    # Quarantine (Plan 023). Persisted through the config store so a restart
+    # cannot silently un-quarantine a pair no human has looked at.
+    quarantine = QuarantineTracker(
+        threshold=routing_config.quarantine_threshold,
+        store=config_store_quarantine_store(config_store),
+    )
 
     # valid_providers guards SQLite-loaded aliases against providers that
     # were since removed from the config — without it a stale row makes its
@@ -1212,6 +1226,7 @@ def _build_serve_app(
         budget_tracker=budget_tracker,
         usage_history_tracker=usage_history_tracker,
         speed_sampler=speed_sampler,
+        quarantine=quarantine,
         config_store=config_store,
         toml_provider_names=frozenset(toml_provider_sections),
         toml_provider_sections=toml_provider_sections,
@@ -1259,6 +1274,12 @@ def _build_serve_app(
             routing_config.opportunistic_min_headroom,
             routing_config.opportunistic_reset_window,
             routing_config.opportunistic_margin,
+        )
+    if quarantine.entries():
+        log.warning(
+            "  quarantine:        %d pair(s) still quarantined from a "
+            "previous run — they take no traffic until released",
+            len(quarantine.entries()),
         )
     if routing_config.strategy != RoutingStrategy.ORDERED:
         log.info(
