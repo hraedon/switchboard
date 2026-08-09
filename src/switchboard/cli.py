@@ -164,6 +164,87 @@ def _validate_provider_config(
     return errors
 
 
+# Every key switchboard reads at the top level of a config file. A key that is
+# not here is not "extra config" — it is config the operator wrote and
+# switchboard will never look at (WI-003).
+_KNOWN_TOP_LEVEL_SCALARS: frozenset[str] = frozenset({
+    "listen",
+    "log_level",
+    "admin_token",
+    "queue_timeout",
+    "drain_timeout",
+    "max_request_body_bytes",
+})
+
+_KNOWN_TOP_LEVEL_TABLES: frozenset[str] = frozenset({
+    "provider",
+    "route",
+    "route_table",
+    "routing",
+    "model",
+    "overload",
+    "reroute",
+    "threshold",
+    "token_budget",
+    "usage_24h_budget",
+})
+
+# Mistakes worth naming the fix for, rather than only saying "unknown key".
+# `route_table_store` is the one that has actually bitten (WI-003): it is the
+# spelling of both the CLI flag and the env var, and it sits in `_DEFAULTS`
+# beside genuine top-level keys, so writing it at the top level of a TOML file
+# is the obvious guess — and it was silently ignored, leaving an operator with
+# a store that looked configured and persisted nothing.
+_MISPLACED_TOP_LEVEL_KEYS: dict[str, str] = {
+    "route_table_store": '[route_table]\nstore = "..."',
+    "store": '[route_table]\nstore = "..."',
+    "strategy": '[routing]\nstrategy = "..."',
+    "dwell_interval": "[routing]\ndwell_interval = ...",
+    "failback_delay": "[routing]\nfailback_delay = ...",
+    "headroom_ranking": "[routing]\nheadroom_ranking = ...",
+    "pace_burn_rate_per_day": "[routing]\npace_burn_rate_per_day = ...",
+    "pace_flap_margin": "[routing]\npace_flap_margin = ...",
+    "providers": '[route.default]\nproviders = ["..."]',
+    "upstream": '[provider.<name>]\nupstream = "..."',
+    "target": "[provider.<name>]\ntarget = ...",
+}
+
+
+def _validate_unknown_top_level(config_data: dict[str, Any]) -> list[str]:
+    """Reject top-level keys switchboard will never read (WI-003).
+
+    A misplaced key is worse than a rejected one: switchboard starts, reports
+    healthy, and quietly does not do the thing the operator configured. The
+    reported instance was `route_table_store` written at the top level — the
+    spelling of the flag and the env var — which left the route table
+    in-memory while the config file said otherwise, so every runtime edit
+    vanished at the next restart with nothing to explain it.
+    """
+    errors: list[str] = []
+    known = _KNOWN_TOP_LEVEL_SCALARS | _KNOWN_TOP_LEVEL_TABLES
+    for key, value in config_data.items():
+        if key in known:
+            continue
+        correction = _MISPLACED_TOP_LEVEL_KEYS.get(key)
+        if correction is not None:
+            errors.append(
+                f"'{key}' is not a top-level key and would be ignored. "
+                f"Write it as:\n    {correction.replace(chr(10), chr(10) + '    ')}"
+            )
+        elif isinstance(value, dict):
+            errors.append(
+                f"unknown config section '[{key}]' — switchboard does not read "
+                "it. Known sections: "
+                + ", ".join(f"[{s}]" for s in sorted(_KNOWN_TOP_LEVEL_TABLES))
+            )
+        else:
+            errors.append(
+                f"unknown top-level key '{key}' — switchboard does not read "
+                "it. Known keys: " + ", ".join(sorted(_KNOWN_TOP_LEVEL_SCALARS))
+            )
+    return errors
+
+
 def _validate_serve_keys(config_data: dict[str, Any]) -> list[str]:
     """Validate top-level serve keys present in the TOML config (WI-3b).
 
@@ -171,7 +252,25 @@ def _validate_serve_keys(config_data: dict[str, Any]) -> list[str]:
     config typo fails startup with a switchboard error instead of surfacing
     later as a uvicorn error or a silently substituted default.
     """
-    errors: list[str] = []
+    errors: list[str] = _validate_unknown_top_level(config_data)
+
+    rt_section = config_data.get("route_table")
+    if rt_section is not None:
+        if not isinstance(rt_section, dict):
+            errors.append("[route_table] must be a table")
+        else:
+            store = rt_section.get("store")
+            if store is not None and not isinstance(store, str):
+                # Silently ignoring a non-string here is the same failure in a
+                # different costume: the store looks configured and isn't.
+                errors.append(
+                    f"route_table.store must be a string path, got {store!r}"
+                )
+            for extra in set(rt_section) - {"store"}:
+                errors.append(
+                    f"unknown key 'route_table.{extra}' — the only key in "
+                    "[route_table] is 'store'"
+                )
 
     log_level = config_data.get("log_level")
     if log_level is not None:
