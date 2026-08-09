@@ -3,10 +3,10 @@
 Status: **substantially implemented.** Wave 0 (reroute review) and Wave 1
 (Dockerfile, listen-precedence fix, strict config validation,
 exhausted-estate observability, k8s manifests, image CI, model-map admin API
-+ dashboard + WI-12b follow-ups) have landed on main. Still open: WI-9
-(alerting), WI-10 (soak/chaos harness), WI-11 (operator runbook), and the
-operational WIs (WI-7 deploy proof, WI-8 opencode migration) that live
-outside this repo. Originally authored 2026-08-06.
++ dashboard + WI-12b follow-ups) have landed on main. WI-10 (soak/chaos
+harness) and WI-11 (operator runbook) have landed. Still open: WI-9
+(alerting) and the operational WIs (WI-7 deploy proof, WI-8 opencode
+migration) that live outside this repo. Originally authored 2026-08-06.
 
 Depends on: nothing new. Every routing capability this plan deploys is
 already implemented and tested.
@@ -418,7 +418,7 @@ rejected at load with the provider named.
 
 ### WI-11 — Operator runbook
 
-`docs/runbook.md`: how to read `/status.json`, what each throttle state means,
+`docs/ops/runbook.md`: how to read `/status.json`, what each throttle state means,
 what to do when the estate is exhausted, how to add or remove a provider, how
 to rotate a provider credential, and how to roll back the opencode migration.
 Write it for someone who did not build this.
