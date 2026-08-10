@@ -216,6 +216,7 @@ def _boot(tmp_path, toml_body: str, overlay: dict[str, Any] | None):
         listen=None,
         config=str(cfg),
         admin_token=None,
+        no_admin_token=True,
         log_level=None,
         queue_timeout=None,
         drain_timeout=None,

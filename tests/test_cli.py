@@ -203,6 +203,7 @@ def _serve_args(**overrides: object) -> argparse.Namespace:
         "listen": None,
         "config": None,
         "admin_token": None,
+        "no_admin_token": True,
         "log_level": None,
         "queue_timeout": None,
         "drain_timeout": None,
@@ -380,6 +381,47 @@ class TestServeKeyValidation:
     def test_non_string_admin_token_rejected(self) -> None:
         with pytest.raises(_ConfigError, match="admin_token"):
             _validate_config_pre_build({"admin_token": 42})
+
+
+class TestServeAdminTokenFailClosed:
+    """WI-008: check_admin_auth fails OPEN when no token is configured.
+
+    The fix mirrors the api_key_env precedent: refuse to start without an
+    explicit --no-admin-token opt-out. A fresh `kubectl apply -f k8s/`
+    must not come up with an open admin surface.
+    """
+
+    def test_refuses_to_start_without_token_or_opt_out(self, tmp_path) -> None:
+        cfg = _write_serve_config(tmp_path, _SERVE_PROVIDER)
+        with pytest.raises(_ConfigError, match="admin_token is not set"):
+            _build_serve_app(_serve_args(config=cfg, no_admin_token=False))
+
+    def test_starts_with_explicit_opt_out(self, tmp_path) -> None:
+        cfg = _write_serve_config(tmp_path, _SERVE_PROVIDER)
+        app, _, _, _, _ = _build_serve_app(
+            _serve_args(config=cfg, no_admin_token=True)
+        )
+        assert app._admin_token is None
+
+    def test_starts_with_token_set(self, tmp_path) -> None:
+        cfg = _write_serve_config(
+            tmp_path, 'admin_token = "s3cret"\n' + _SERVE_PROVIDER
+        )
+        app, _, _, _, _ = _build_serve_app(
+            _serve_args(config=cfg, no_admin_token=False)
+        )
+        assert app._admin_token == "s3cret"
+
+    def test_starts_with_token_from_env(self, tmp_path) -> None:
+        cfg = _write_serve_config(tmp_path, _SERVE_PROVIDER)
+        os.environ["SWITCHBOARD_ADMIN_TOKEN"] = "env-secret"
+        try:
+            app, _, _, _, _ = _build_serve_app(
+                _serve_args(config=cfg, no_admin_token=False)
+            )
+            assert app._admin_token == "env-secret"
+        finally:
+            del os.environ["SWITCHBOARD_ADMIN_TOKEN"]
 
 
 class TestServeKeyStartup:

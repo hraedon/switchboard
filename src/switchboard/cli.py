@@ -606,6 +606,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--admin-token", default=None, help="token gating admin routes"
     )
     serve.add_argument(
+        "--no-admin-token",
+        action="store_true",
+        default=False,
+        help=(
+            "explicitly disable the admin token (the admin surface becomes "
+            "readable by anything that can reach the pod). Without this flag "
+            "or an explicit --admin-token / SWITCHBOARD_ADMIN_TOKEN, "
+            "switchboard refuses to start — an unset token is not 'secure by "
+            "default', it is readable by all and writable by none"
+        ),
+    )
+    serve.add_argument(
         "--log-level",
         default=None,
         choices=_LOG_LEVEL_CHOICES,
@@ -1051,6 +1063,22 @@ def _build_serve_app(
             reroute_statuses = frozenset(parsed)
 
     admin_token = _resolve("admin_token", args, config_data)
+    # WI-008: check_admin_auth fails OPEN when the token is absent — every
+    # admin route becomes readable, and mutating endpoints return 405. An
+    # unset token is not "secure by default"; it is readable by all and
+    # writable by none. Mirror the api_key_env precedent: refuse to start
+    # unless the operator explicitly opts out with --no-admin-token.
+    no_admin_token = getattr(args, "no_admin_token", False)
+    if not admin_token and not no_admin_token:
+        raise _ConfigError(
+            "admin_token is not set — the admin surface would be readable "
+            "by anything on the network. Set --admin-token (or the "
+            "SWITCHBOARD_ADMIN_TOKEN env var), or pass --no-admin-token to "
+            "explicitly accept the open surface. An unset token is not "
+            "'secure by default'; it is readable by all and writable by none."
+        )
+    if isinstance(admin_token, str):
+        admin_token = admin_token if admin_token else None
 
     queue_timeout = _resolve_float("queue_timeout", args, config_data)
     drain_timeout = _resolve_float("drain_timeout", args, config_data)
@@ -1255,8 +1283,13 @@ def _build_serve_app(
         log.info("  config:            %s", config_path)
     if admin_token:
         log.info("  admin_token:       set")
+    elif no_admin_token:
+        log.warning(
+            "  admin_token:       DISABLED (--no-admin-token) — admin "
+            "surface is readable by anything on the network"
+        )
     else:
-        log.info("  admin_token:       disabled")
+        log.warning("  admin_token:       disabled")
     if routing_config.failback_delay > 0:
         log.info(
             "  failback_delay:    %.1fs",
