@@ -387,3 +387,36 @@ async def test_release_requires_auth() -> None:
     start = next(m for m in sent if m["type"] == "http.response.start")
     assert start["status"] == 403
     assert tracker.is_quarantined("alpha", "shared-model") is True
+
+
+# ----------------------------------------------------------- WI-007 evidence
+# A quarantine entry from a transport failure must carry evidence — the
+# error type as detail — not null status and empty string. The original
+# code's `detail = "forward failed"` branch was dead for the entire
+# httpx.RequestError class because _forward caught it without re-raising.
+
+
+def _connect_error(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("connection refused")
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_carries_evidence() -> None:
+    """WI-007: a transport failure (ConnectError) produces a quarantine entry
+    with a non-empty detail naming the error type, not null/empty."""
+    app, tracker = await _build(_connect_error)
+    for _ in range(5):
+        await _post(app)
+    assert tracker.is_quarantined("alpha", "shared-model") is True
+    entries = tracker.entries()
+    alpha_entry = next(
+        e for e in entries if e.provider == "alpha"
+        and e.model == "shared-model"
+    )
+    # The evidence: detail must name the transport error, not be empty.
+    assert alpha_entry.last_detail, (
+        f"transport failure has empty detail: {alpha_entry!r}"
+    )
+    assert "ConnectError" in alpha_entry.last_detail, (
+        f"detail does not name the error type: {alpha_entry.last_detail!r}"
+    )
