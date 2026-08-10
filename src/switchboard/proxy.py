@@ -282,6 +282,13 @@ class _RerouteProbe:
     #: vendor refused our credential" from "an edge blocked the caller".
     headers: dict[str, str] = field(default_factory=dict)
     body_prefix: str = ""
+    #: Transport-level error type name (e.g. "ConnectError", "TimeoutException"),
+    #: set when _forward catches httpx.RequestError. The quarantine bookkeeping
+    #: (WI-007) uses this to attribute a transport failure to the PROVIDER with
+    #: real evidence instead of a null status and empty detail — the first row
+    #: of Plan 023's attribution table, which was dead because _forward caught
+    #: RequestError without re-raising.
+    transport_error: str = ""
 
 
 @dataclass
@@ -1453,11 +1460,31 @@ class ProxyApp:
             # to the PROVIDER count; a caller-caused failure would reproduce
             # on every provider, so counting it would walk the estate into
             # quarantine one provider at a time.
+            #
+            # WI-007: _forward catches httpx.RequestError without re-raising
+            # (it sends the 502 itself), so forward_failed stays False for
+            # the entire transport class. The dead `detail = "forward
+            # failed"` branch was the first row of Plan 023's attribution
+            # table. Now _forward stamps probe.transport_error, and this
+            # branch attributes it with the error type as evidence.
+            #
+            # Note: quarantine records nothing when no model map is
+            # configured (request_model is only extracted when
+            # has_model_map). This is intended — quarantine keys on
+            # (provider, model) pairs, and without a model map there is no
+            # model to key on. A transport failure on an unmapped request
+            # is still observable in the proxy logs and /metrics; it just
+            # does not count toward quarantine because there is no model
+            # to quarantine.
             if self._quarantine is not None and request_model is not None:
                 if forward_failed:
                     attribution = classify_failure(None)
                     status_for_q: int | None = None
                     detail = "forward failed"
+                elif probe.transport_error:
+                    attribution = classify_failure(None)
+                    status_for_q = None
+                    detail = f"transport: {probe.transport_error}"
                 else:
                     status_for_q = probe.status
                     attribution = classify_failure(
@@ -2189,6 +2216,13 @@ class ProxyApp:
                     await stream_cm.__aexit__(None, None, None)
 
         except httpx.RequestError as exc:
+            # WI-007: stamp the probe so the quarantine bookkeeping can
+            # attribute this transport failure to the PROVIDER with real
+            # evidence. Without this, forward_failed stays False (this
+            # except never re-raises), and the quarantine branch sees
+            # probe.status=None → null status, empty detail.
+            if probe is not None:
+                probe.transport_error = type(exc).__name__
             if not disconnect.is_set() and not response_started:
                 log.warning(
                     "upstream error: %s: %s",
