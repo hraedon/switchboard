@@ -58,6 +58,7 @@ from switchboard.admin import (
     handle_provider_create,
     handle_provider_delete,
     handle_provider_discover,
+    handle_provider_models,
     handle_provider_registry,
     handle_provider_test,
     handle_provider_update,
@@ -945,6 +946,17 @@ class ProxyApp:
             if len(parts) == 5 and parts[4] == "test":
                 if method == "POST":
                     await handle_provider_test(
+                        send, self._providers, self._admin_token,
+                        scope, unquote(parts[3]), self._cors_allow_origin,
+                    )
+                    return
+                await send_text(send, 405, "Method not allowed")
+                return
+            if len(parts) == 5 and parts[4] == "models":
+                # GET /admin/providers/<name>/models (Plan 024 WI-1). Auth +
+                # CSRF gated inside the handler, same as the test endpoint.
+                if method == "GET":
+                    await handle_provider_models(
                         send, self._providers, self._admin_token,
                         scope, unquote(parts[3]), self._cors_allow_origin,
                     )
