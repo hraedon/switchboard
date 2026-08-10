@@ -850,6 +850,27 @@ async function deleteModel(model) {
   } catch (e) { alert(String(e)); }
 }
 
+// Plan 023 WI-4 — release a quarantined provider/model pair from the
+// dashboard. DELETE /admin/quarantine/<provider>/<model> is the only way
+// out by design: a timer would recreate the flapping the quarantine
+// exists to stop.
+async function releaseQuarantine(provider, model) {
+  if (!confirm('Release the quarantine on ' + provider + '/' + model + '?\n'
+             + 'It will resume taking traffic for this model immediately.')) return;
+  try {
+    const resp = await fetch(
+      '/admin/quarantine/' + encodeURIComponent(provider) + '/' + encodeURIComponent(model),
+      { method: 'DELETE', credentials: 'same-origin' },
+    );
+    if (!resp.ok) {
+      const b = await resp.json().catch(() => ({}));
+      alert(b.error || ('HTTP ' + resp.status));
+      return;
+    }
+    load();
+  } catch (e) { alert(String(e)); }
+}
+
 // Configuration provenance (Plan 021 WI-7). Which tier owns each provider,
 // and which fields an env var has taken over. Fields shown as env-locked are
 // owned by a Deployment variable: the edit-provider form (Plan 020 WI-6)
@@ -1298,6 +1319,38 @@ async function load() {
 
   html += renderConfig(cfg);
 
+  // Quarantine (Plan 023 WI-4 dashboard panel). Shows quarantined pairs with
+  // their evidence and a Release button. The status.json payload already
+  // carries quarantine.entries; this just renders them. Releasing is an
+  // explicit operator action — DELETE /admin/quarantine/<provider>/<model>.
+  const q = data.quarantine;
+  if (q && q.entries && q.entries.length) {
+    html += '<h2>Quarantine</h2>';
+    html += `<p style="margin:0 0 0.6rem;color:var(--muted);font-size:0.85rem">`
+         +  `Pairs taken out of service after ${q.threshold} consecutive`
+         +  ` provider-attributed failures. Release is a human decision.</p>`;
+    html += '<table><thead><tr><th>Provider</th><th>Model</th>'
+         +  '<th>Failures</th><th>Last status</th><th>Detail</th><th></th>'
+         +  '</tr></thead><tbody>';
+    q.entries.forEach((entry, qi) => {
+      const statusTxt = entry.last_status != null
+        ? String(entry.last_status)
+        : '<span style="color:var(--muted)">&mdash;</span>';
+      const detailTxt = entry.last_detail
+        ? esc(entry.last_detail)
+        : '<span style="color:var(--muted)">&mdash;</span>';
+      html += `<tr>`
+           +  `<td>${esc(entry.provider)}</td>`
+           +  `<td><code>${esc(entry.model)}</code></td>`
+           +  `<td>${entry.failures}</td>`
+           +  `<td>${statusTxt}</td>`
+           +  `<td style="font-size:0.8rem">${detailTxt}</td>`
+           +  `<td><button id="rel-q-${qi}" class="mini-btn">Release</button></td>`
+           +  `</tr>`;
+    });
+    html += '</tbody></table>';
+  }
+
   const m = data.routing_metrics || {};
   html += '<h2>Routing Metrics</h2><div class="grid">';
   html += `<div class="card"><h3>Decisions</h3>
@@ -1328,6 +1381,13 @@ async function load() {
     const btn = document.getElementById('del-model-' + mi);
     if (btn) btn.onclick = () => deleteModel(model);
   });
+  // Wire quarantine Release buttons (Plan 023 WI-4).
+  if (q && q.entries) {
+    q.entries.forEach((entry, qi) => {
+      const btn = document.getElementById('rel-q-' + qi);
+      if (btn) btn.onclick = () => releaseQuarantine(entry.provider, entry.model);
+    });
+  }
 }
 load();
 setInterval(load, 5000);
