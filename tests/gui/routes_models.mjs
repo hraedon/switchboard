@@ -109,11 +109,11 @@ check('opening model form sets editingModel', getEditingModel() === true);
 const mform = $('model-add').innerHTML;
 check('model form has a model-name field', mform.includes('id="mf-model"'));
 check('model form renders an alias input per provider',
-      mform.includes('id="mf-alias-umans"') && mform.includes('id="mf-alias-ollama-cloud"'));
+      mform.includes('id="mf-umans-alias"') && mform.includes('id="mf-ollama-cloud-alias"'));
 
 // --- 6. saving a model POSTs aliases, blank aliases dropped ---------------
 $('mf-model').value = 'kimi-k2.7';
-$('mf-alias-umans').value = 'umans-kimi';
+$('mf-umans-alias').value = 'umans-kimi';
 // ollama-cloud left blank → dropped.
 fetchCalls = [];
 nextResponse = { ok: true, status: 200, json: async () => ({}) };
@@ -130,7 +130,7 @@ check('model save clears editingModel on success', getEditingModel() === false);
 vm.runInContext('editingModel = true', sandbox);
 sandbox.renderModelAddForm(['umans']);
 $('mf-model').value = 'x';
-$('mf-alias-umans').value = '';  // no aliases
+$('mf-umans-alias').value = '';  // no aliases
 fetchCalls = [];
 await $('mf-save').onclick();
 check('model save with no aliases does not POST',

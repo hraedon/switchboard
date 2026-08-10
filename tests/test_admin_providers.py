@@ -18,11 +18,13 @@ import pytest
 
 from switchboard.admin import (
     _discover_candidates,
+    _parse_openai_models,
     handle_config_effective,
     handle_preview_path,
     handle_provider_create,
     handle_provider_delete,
     handle_provider_discover,
+    handle_provider_models,
     handle_provider_registry,
     handle_provider_test,
     handle_provider_update,
@@ -917,6 +919,39 @@ async def test_dispatch_probe_routes_to_test_handler() -> None:
     assert data["status"] is None
 
 
+@pytest.mark.asyncio
+async def test_dispatch_models_routes_to_handler() -> None:
+    """GET /admin/providers/<name>/models reaches the enumeration handler.
+
+    Uses an unreachable upstream so the handler reports ok=False without
+    needing a mock transport — proves the dispatch branch lands on the right
+    handler (the test endpoint answers POST only and would 405 here).
+    """
+    ctx = _make_ctx("test", upstream="http://127.0.0.1:1")
+    app = _make_app({"test": ctx}, ConfigStoreManager())
+    status, body = await _dispatch(
+        app, "GET", "/admin/providers/test/models",
+        headers=_admin_headers(),
+    )
+    assert status == 200
+    data = json.loads(body)
+    assert data["ok"] is False
+    assert data["models"] == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_models_rejects_post() -> None:
+    app = _make_app({"test": _make_ctx("test")}, ConfigStoreManager())
+    try:
+        status, _ = await _dispatch(
+            app, "POST", "/admin/providers/test/models",
+            headers=_admin_headers(),
+        )
+        assert status == 405
+    finally:
+        await app.provider_manager.shutdown()
+
+
 # ----------------------------------------------- Plan 021 Wave 2: registry
 
 
@@ -1180,3 +1215,242 @@ async def test_create_rejects_reserved_provider_name() -> None:
         assert "discover" not in app._providers
     finally:
         await app.provider_manager.shutdown()
+
+
+# --------------------------------------------------- provider models endpoint
+# Plan 024 WI-1 — GET /admin/providers/<name>/models generalises the test
+# endpoint to parse and return the upstream's model IDs.
+
+
+def test_parse_openai_models_canonical_shape() -> None:
+    assert _parse_openai_models(
+        {"data": [{"id": "glm-5.2"}, {"id": "kimi-k3"}, {"id": "deepseek-v4"}]}
+    ) == ["glm-5.2", "kimi-k3", "deepseek-v4"]
+
+
+def test_parse_openai_models_bare_list() -> None:
+    assert _parse_openai_models(["a", "b", "a"]) == ["a", "b"]
+
+
+def test_parse_openai_models_models_key() -> None:
+    # Some providers nest under ``models`` instead of ``data``.
+    assert _parse_openai_models(
+        {"models": [{"id": "x"}, {"id": "y"}]}
+    ) == ["x", "y"]
+
+
+def test_parse_openai_models_drops_non_string_ids() -> None:
+    # A malformed item must not abort the parse — the rest still come back.
+    payload = {"data": [{"id": "ok"}, {"id": 7}, {"no": "id"}, {"id": "ok2"}]}
+    assert _parse_openai_models(payload) == ["ok", "ok2"]
+
+
+def test_parse_openai_models_empty_and_garbage() -> None:
+    assert _parse_openai_models({}) == []
+    assert _parse_openai_models({"data": "not-a-list"}) == []
+    assert _parse_openai_models(None) == []
+    assert _parse_openai_models("") == []
+
+
+@pytest.mark.asyncio
+async def test_provider_models_ok_shape_and_no_credential_leak() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers.get("authorization")
+        captured["url"] = str(request.url)
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "glm-5.2"}, {"id": "kimi-k3"}]},
+        )
+
+    ctx = _make_ctx("alpha", api_key="sk-cred-SENTINEL-leak-9999")
+    providers = {"alpha": ctx}
+    scope = _make_scope("GET", headers=_admin_headers())
+    messages, send = _make_send()
+    await handle_provider_models(
+        send, providers, ADMIN_TOKEN, scope, "alpha",
+        client_factory=_mock_factory(handler),
+    )
+    status, body = _parse_response(messages)
+    assert status == 200
+    text = body.decode()
+    assert "sk-cred-SENTINEL" not in text
+    assert "SENTINEL-leak" not in text
+    data = json.loads(body)
+    assert data["ok"] is True
+    assert data["status"] == 200
+    assert isinstance(data["latency_ms"], (int, float))
+    assert data["latency_ms"] >= 0
+    assert data["models"] == ["glm-5.2", "kimi-k3"]
+    assert data["detail"] == ""
+    # The credential went to the UPSTREAM request, and only there.
+    assert captured["auth"] == "Bearer sk-cred-SENTINEL-leak-9999"
+    assert captured["url"].endswith("/models")
+
+
+@pytest.mark.asyncio
+async def test_provider_models_404_for_unknown_provider() -> None:
+    scope = _make_scope("GET", headers=_admin_headers())
+    messages, send = _make_send()
+    await handle_provider_models(
+        send, {}, ADMIN_TOKEN, scope, "ghost",
+    )
+    status, body = _parse_response(messages)
+    assert status == 404
+    assert "unknown" in json.loads(body)["error"]
+
+
+@pytest.mark.asyncio
+async def test_provider_models_non_2xx_reports_ok_false() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "bad key"})
+
+    ctx = _make_ctx("alpha")
+    scope = _make_scope("GET", headers=_admin_headers())
+    messages, send = _make_send()
+    await handle_provider_models(
+        send, {"alpha": ctx}, ADMIN_TOKEN, scope, "alpha",
+        client_factory=_mock_factory(handler),
+    )
+    status, body = _parse_response(messages)
+    assert status == 200  # the endpoint itself answers 200 with ok=False
+    data = json.loads(body)
+    assert data["ok"] is False
+    assert data["status"] == 401
+    assert data["models"] == []
+
+
+@pytest.mark.asyncio
+async def test_provider_models_empty_data_reports_detail() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": []})
+
+    ctx = _make_ctx("alpha")
+    scope = _make_scope("GET", headers=_admin_headers())
+    messages, send = _make_send()
+    await handle_provider_models(
+        send, {"alpha": ctx}, ADMIN_TOKEN, scope, "alpha",
+        client_factory=_mock_factory(handler),
+    )
+    _, body = _parse_response(messages)
+    data = json.loads(body)
+    assert data["ok"] is False
+    assert data["models"] == []
+    assert data["detail"] == "no models in response"
+
+
+@pytest.mark.asyncio
+async def test_provider_models_non_json_reports_detail() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"<html>not json</html>")
+
+    ctx = _make_ctx("alpha")
+    scope = _make_scope("GET", headers=_admin_headers())
+    messages, send = _make_send()
+    await handle_provider_models(
+        send, {"alpha": ctx}, ADMIN_TOKEN, scope, "alpha",
+        client_factory=_mock_factory(handler),
+    )
+    _, body = _parse_response(messages)
+    data = json.loads(body)
+    assert data["ok"] is False
+    assert data["models"] == []
+    assert data["detail"] == "non-JSON response"
+
+
+@pytest.mark.asyncio
+async def test_provider_models_connection_error_reports_detail() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom")
+
+    ctx = _make_ctx("alpha")
+    scope = _make_scope("GET", headers=_admin_headers())
+    messages, send = _make_send()
+    await handle_provider_models(
+        send, {"alpha": ctx}, ADMIN_TOKEN, scope, "alpha",
+        client_factory=_mock_factory(handler),
+    )
+    _, body = _parse_response(messages)
+    data = json.loads(body)
+    assert data["ok"] is False
+    assert data["status"] is None
+    assert data["detail"] == "ConnectError"
+
+
+@pytest.mark.asyncio
+async def test_provider_models_requires_admin_token() -> None:
+    ctx = _make_ctx("alpha")
+    scope = _make_scope("GET", headers=_admin_headers())
+    messages, send = _make_send()
+    await handle_provider_models(
+        send, {"alpha": ctx}, None, scope, "alpha",
+    )
+    status, body = _parse_response(messages)
+    assert status == 405
+    assert "disabled" in json.loads(body)["error"]
+
+
+# ---------------------------------------------------------- Plan 024 finding #3
+# Non-2xx from the upstream must surface a failure reason in detail, not
+# an empty string. Plan 024 §3 promises "the operator sees the failure
+# reason in detail". The original code skipped the parse block on non-2xx,
+# leaving detail="".
+
+
+@pytest.mark.asyncio
+async def test_provider_models_401_surfaces_detail() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "invalid api key"})
+
+    ctx = _make_ctx("alpha")
+    scope = _make_scope("GET", headers=_admin_headers())
+    messages, send = _make_send()
+    await handle_provider_models(
+        send, {"alpha": ctx}, ADMIN_TOKEN, scope, "alpha",
+        client_factory=_mock_factory(handler),
+    )
+    _, body = _parse_response(messages)
+    data = json.loads(body)
+    assert data["ok"] is False
+    assert data["status"] == 401
+    assert data["models"] == []
+    assert data["detail"] == "invalid api key"
+
+
+@pytest.mark.asyncio
+async def test_provider_models_404_surfaces_detail() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "not found"})
+
+    ctx = _make_ctx("alpha")
+    scope = _make_scope("GET", headers=_admin_headers())
+    messages, send = _make_send()
+    await handle_provider_models(
+        send, {"alpha": ctx}, ADMIN_TOKEN, scope, "alpha",
+        client_factory=_mock_factory(handler),
+    )
+    _, body = _parse_response(messages)
+    data = json.loads(body)
+    assert data["ok"] is False
+    assert data["status"] == 404
+    assert data["detail"] == "not found"
+
+
+@pytest.mark.asyncio
+async def test_provider_models_500_surfaces_text_detail() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=b"Internal Server Error\n")
+
+    ctx = _make_ctx("alpha")
+    scope = _make_scope("GET", headers=_admin_headers())
+    messages, send = _make_send()
+    await handle_provider_models(
+        send, {"alpha": ctx}, ADMIN_TOKEN, scope, "alpha",
+        client_factory=_mock_factory(handler),
+    )
+    _, body = _parse_response(messages)
+    data = json.loads(body)
+    assert data["ok"] is False
+    assert data["status"] == 500
+    assert data["detail"] == "Internal Server Error"

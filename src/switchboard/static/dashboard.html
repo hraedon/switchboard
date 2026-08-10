@@ -772,6 +772,8 @@ let editingModel = false;
 function renderModelAdd(data) {
   if (editingModel) return;
   const known = Object.keys((data && data.providers) || {}).sort();
+  const mm = (data && data.model_map) || {};
+  const definedModels = Object.keys(mm);
   const el = document.getElementById('model-add');
   el.innerHTML = `
     <h2>Model Map</h2>
@@ -781,25 +783,80 @@ function renderModelAdd(data) {
         can serve the model; the alias is what gets sent upstream.
       </p>
       <button id="add-model-btn">Add model mapping</button>
+      <button id="scan-match-btn" style="margin-left:0.4rem">Scan for exact-match models</button>
+      <span id="scan-match-status" style="margin-left:0.6rem;font-size:0.85rem;color:var(--muted)"></span>
+      <div id="scan-match-results" style="margin-top:0.6rem"></div>
     </div>`;
   const btn = document.getElementById('add-model-btn');
   if (btn) btn.onclick = () => { editingModel = true; renderModelAddForm(known); };
+  const scanBtn = document.getElementById('scan-match-btn');
+  if (scanBtn) scanBtn.onclick = () => runAutoMatchScan(known, definedModels, mm);
+}
+
+// Plan 024 — fetch a provider's enumerated models for the datalist. Cached
+// per form-open so a provider is probed once per session, not per keystroke.
+let modelEnums = {};   // { providerName: Promise<{ok,models,detail}> }
+
+async function _fetchProviderModels(provider) {
+  // Finding #1 fix: store the in-flight PROMISE, not null, so a concurrent
+  // caller (double-click on "show models") awaits the same promise rather
+  // than getting null back and throwing on `res.models`. The guard is
+  // `!== undefined`; a stored promise is defined, so the second caller
+  // awaits it and gets the resolved result.
+  if (modelEnums[provider] !== undefined) return modelEnums[provider];
+  const promise = (async () => {
+    try {
+      const resp = await fetch(
+        '/admin/providers/' + encodeURIComponent(provider) + '/models',
+        { credentials: 'same-origin' },
+      );
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        return { ok: false, models: [], detail: data.error || ('HTTP ' + resp.status) };
+      }
+      return {
+        ok: !!data.ok,
+        models: Array.isArray(data.models) ? data.models : [],
+        detail: data.detail || (data.ok ? '' : 'no models'),
+      };
+    } catch (e) {
+      return { ok: false, models: [], detail: String(e) };
+    }
+  })();
+  modelEnums[provider] = promise;
+  return promise;
 }
 
 function renderModelAddForm(knownProviders) {
   const el = document.getElementById('model-add');
   const provs = (knownProviders || []).slice().sort();
-  const aliasRows = provs.map(p => `
+  // Finding #4 fix: provider names have no character validation (only
+  // _RESERVED_PROVIDER_NAMES is checked), so a name containing &<>"' would
+  // render an id attribute that getElementById — which expects the raw
+  // string, not the escaped one — cannot find. _domId sanitises the name
+  // for id use; the same function is used in both the attribute and the
+  // lookup so they always agree.
+  const _domId = (p) => 'mf-' + p.replace(/[^A-Za-z0-9_-]/g, '_');
+  const aliasRows = provs.map(p => {
+    const idp = _domId(p);
+    return `
     <div class="form-row">
-      <label for="mf-alias-${esc(p)}">${esc(p)} alias</label>
-      <input id="mf-alias-${esc(p)}" autocomplete="off" placeholder="leave blank if ${esc(p)} does not serve it">
-    </div>`).join('');
+      <label for="${idp}-alias">${esc(p)} alias</label>
+      <input id="${idp}-alias" list="${idp}-models"
+             autocomplete="off" placeholder="leave blank if ${esc(p)} does not serve it">
+      <datalist id="${idp}-models"></datalist>
+      <button type="button" id="${idp}-show" class="mini-btn"
+              style="margin-left:0.4rem">show models</button>
+      <span id="${idp}-status" style="margin-left:0.4rem;font-size:0.8rem;color:var(--muted)"></span>
+    </div>`;
+  }).join('');
   el.innerHTML = `
     <h2>Add Model Mapping</h2>
     <div class="card">
       <div class="form-row">
         <label for="mf-model">Model name (as the client sends it)</label>
-        <input id="mf-model" autocomplete="off" placeholder="e.g. glm-5.2">
+        <input id="mf-model" list="mf-model-known" autocomplete="off" placeholder="e.g. glm-5.2">
+        <datalist id="mf-model-known"></datalist>
       </div>
       ${aliasRows || '<p style="color:var(--muted)">No providers configured.</p>'}
       <div id="mf-error" style="color:var(--red);font-size:0.85rem;margin-bottom:0.5rem"></div>
@@ -807,6 +864,30 @@ function renderModelAddForm(knownProviders) {
       <button id="mf-cancel" style="background:transparent;border:1px solid var(--border)">Cancel</button>
     </div>`;
   document.getElementById('mf-cancel').onclick = () => { editingModel = false; load(); };
+  // Fresh form open → fresh probe cache. A prior form open's enumerated
+  // models may be stale (provider changed, or a provider was just added);
+  // clearing on open keeps "one probe per provider per form open" honest.
+  modelEnums = {};
+  // Per-provider "show models" → populate the alias input's datalist. One
+  // upstream call per provider per form-open (cached in modelEnums).
+  provs.forEach(p => {
+    const idp = _domId(p);
+    const btn = document.getElementById(idp + '-show');
+    if (btn) btn.onclick = async () => {
+      const statusEl = document.getElementById(idp + '-status');
+      if (statusEl) statusEl.textContent = 'probing\u2026';
+      const res = await _fetchProviderModels(p);
+      const dl = document.getElementById(idp + '-models');
+      if (dl) dl.innerHTML = (res.models || []).map(m => `<option value="${esc(m)}">`).join('');
+      if (statusEl) {
+        if (res.ok && (res.models || []).length) {
+          statusEl.textContent = `${res.models.length} model${res.models.length === 1 ? '' : 's'}`;
+        } else {
+          statusEl.textContent = res.detail || 'no models';
+        }
+      }
+    };
+  });
   document.getElementById('mf-save').onclick = async () => {
     const model = (document.getElementById('mf-model') || {}).value.trim();
     const errEl = document.getElementById('mf-error');
@@ -814,7 +895,7 @@ function renderModelAddForm(knownProviders) {
     if (!model) { errEl.textContent = 'model name is required'; return; }
     const aliases = {};
     for (const p of provs) {
-      const v = (document.getElementById('mf-alias-' + p) || {}).value.trim();
+      const v = (document.getElementById(_domId(p) + '-alias') || {}).value.trim();
       if (v) aliases[p] = v;
     }
     if (!Object.keys(aliases).length) {
@@ -833,6 +914,98 @@ function renderModelAddForm(knownProviders) {
       editingModel = false; load();
     } catch (e) { errEl.textContent = String(e); }
   };
+}
+
+// Plan 024 WI-3 — auto-match scan. For each configured provider, fetch its
+// enumerated models, then for every defined model name check whether the
+// provider offers an exact string match that the model map does not already
+// wire. Matches become one-click "Add" offers; no write happens without the
+// click. A provider that fails to answer is listed, not aborting the scan.
+async function runAutoMatchScan(providers, definedModels, currentMap) {
+  const statusEl = document.getElementById('scan-match-status');
+  const outEl = document.getElementById('scan-match-results');
+  if (!outEl) return;
+  if (!definedModels.length) {
+    outEl.innerHTML = '<p style="color:var(--muted)">No models defined yet — add a model mapping first.</p>';
+    return;
+  }
+  outEl.innerHTML = '';
+  if (statusEl) statusEl.textContent = 'scanning\u2026';
+  const offers = [];   // {model, provider, alias}
+  const failed = [];   // {provider, detail}
+  for (const p of providers) {
+    const res = await _fetchProviderModels(p);
+    if (!res || !res.ok || !(res.models || []).length) {
+      failed.push({ provider: p, detail: res ? (res.detail || 'no models') : 'no response' });
+      continue;
+    }
+    for (const model of definedModels) {
+      // Already wired for this provider? Skip — no duplicate offer.
+      const existing = (currentMap[model] || {})[p];
+      if (existing !== undefined) continue;
+      if (res.models.indexOf(model) !== -1) {
+        offers.push({ model, provider: p, alias: model });
+      }
+    }
+  }
+  if (statusEl) {
+    const parts = [`${offers.length} match${offers.length === 1 ? '' : 'es'}`];
+    if (failed.length) parts.push(`${failed.length} provider${failed.length === 1 ? '' : 's'} unavailable`);
+    statusEl.textContent = parts.join(', ');
+  }
+  let html = '';
+  for (const f of failed) {
+    html += `<div style="color:var(--muted);font-size:0.85rem">${esc(f.provider)}: ${esc(f.detail)}</div>`;
+  }
+  if (!offers.length) {
+    html += '<p style="color:var(--muted)">No exact-match offers.</p>';
+  } else {
+    for (let i = 0; i < offers.length; i++) {
+      const o = offers[i];
+      html += `<div style="margin:0.2rem 0">
+        <button id="mf-am-${i}" class="mini-btn">Add</button>
+        <code>${esc(o.model)}</code> &rarr; ${esc(o.provider)}: <code>${esc(o.alias)}</code>
+      </div>`;
+    }
+  }
+  outEl.innerHTML = html;
+  offers.forEach((o, i) => {
+    const b = document.getElementById('mf-am-' + i);
+    if (b) b.onclick = () => applyAutoMatch(o, currentMap);
+  });
+}
+
+async function applyAutoMatch(offer, currentMap) {
+  // Finding #2 fix: re-read the CURRENT model-map state before merging, so an
+  // alias added between the last load() and this click is not silently dropped.
+  // The model-map POST replaces the whole alias set, so a stale snapshot would
+  // overwrite a concurrent add. currentMap is kept only as a fallback if the
+  // re-read fails (better to apply with slightly-stale data than to refuse).
+  let existing = Object.assign({}, currentMap[offer.model] || {});
+  try {
+    const resp = await fetch('/admin/model-map', { credentials: 'same-origin' });
+    if (resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      const entry = (data.models || []).find(
+        m => m.model === offer.model,
+      );
+      if (entry && entry.aliases) {
+        existing = Object.assign({}, entry.aliases);
+      }
+    }
+  } catch (e) { /* fall back to currentMap snapshot */ }
+  existing[offer.provider] = offer.alias;
+  try {
+    const resp = await fetch('/admin/model-map', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ model: offer.model, aliases: existing }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) { alert(data.error || ('HTTP ' + resp.status)); return; }
+    load();
+  } catch (e) { alert(String(e)); }
 }
 
 async function deleteModel(model) {

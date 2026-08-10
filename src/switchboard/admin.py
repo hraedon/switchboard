@@ -2512,6 +2512,8 @@ async def handle_provider_test(
         async with factory() as client:
             response = await client.get(url, headers=headers)
             status_code = response.status_code
+            if status_code is not None and not (200 <= status_code < 300):
+                detail = _extract_upstream_detail(response)
     except httpx.TimeoutException:
         detail = "timeout"
     except httpx.HTTPError as exc:
@@ -2532,6 +2534,181 @@ async def handle_provider_test(
         },
         extra_headers=cors,
     )
+
+
+async def handle_provider_models(
+    send: Send,
+    providers: dict[str, ProviderContext],
+    admin_token: str | None,
+    scope: Scope,
+    prov_name: str,
+    cors_allow_origin: str | None = None,
+    client_factory: Callable[[], httpx.AsyncClient] | None = None,
+) -> None:
+    """GET /admin/providers/<name>/models — enumerate the upstream's models.
+
+    Generalises :func:`handle_provider_test` (Plan 020 WI-3): same upstream
+    ``/models`` GET, same credential resolution, same no-echo discipline, but
+    parses the response body's ``data`` array (the OpenAI-compatible shape
+    every provider in the registry speaks) and returns the model IDs so the
+    GUI can populate a datalist on the model-map alias input and offer exact
+    matches (Plan 024).
+
+    Auth + CSRF gated like the test endpoint because each call spends a
+    request against a real upstream. Read-only: no alias is written here; the
+    operator applies any match with an explicit POST to ``/admin/model-map``.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(
+            send, 405,
+            {"error": "mutations disabled — set --admin-token to enable"},
+            extra_headers=cors,
+        )
+        return
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    ctx = providers.get(prov_name)
+    if ctx is None:
+        await send_json(
+            send, 404, {"error": "unknown provider"}, extra_headers=cors,
+        )
+        return
+
+    url = ctx.upstream_url.rstrip("/") + "/models"
+    headers: dict[str, str] = {}
+    if ctx.api_key:
+        headers[ctx.auth_header] = f"{ctx.auth_prefix}{ctx.api_key}"
+    factory = client_factory or (
+        lambda: httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+    )
+
+    status_code: int | None = None
+    detail = ""
+    models: list[str] = []
+    start = time.monotonic()
+    try:
+        async with factory() as client:
+            response = await client.get(url, headers=headers)
+            status_code = response.status_code
+            if 200 <= status_code < 300:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    detail = "non-JSON response"
+                else:
+                    models = _parse_openai_models(payload)
+                    if not models:
+                        # A 200 with an empty or unrecognised shape is not a
+                        # transport failure, but the operator needs to know
+                        # the parse found nothing rather than a silent empty.
+                        data_arr = (
+                            payload.get("data")
+                            if isinstance(payload, dict) else None
+                        )
+                        if not isinstance(data_arr, list) or not data_arr:
+                            detail = "no models in response"
+            else:
+                # Non-2xx: surface the upstream's reason so the operator sees
+                # WHY the enumeration failed, not just that it did. Plan 024
+                # §3 promises "the operator sees the failure reason in detail".
+                detail = _extract_upstream_detail(response)
+    except httpx.TimeoutException:
+        detail = "timeout"
+    except httpx.HTTPError as exc:
+        detail = type(exc).__name__
+    latency_ms = round((time.monotonic() - start) * 1000.0, 1)
+
+    ok = status_code is not None and 200 <= status_code < 300 and bool(models)
+    log.info(
+        "provider models: %s -> status=%s ok=%s count=%d",
+        prov_name, status_code, ok, len(models),
+    )
+    await send_json(
+        send, 200,
+        {
+            "ok": ok,
+            "status": status_code,
+            "latency_ms": latency_ms,
+            "models": models,
+            "detail": detail,
+        },
+        extra_headers=cors,
+    )
+
+
+def _parse_openai_models(payload: Any) -> list[str]:
+    """Extract model IDs from an OpenAI-compatible ``/models`` response.
+
+    The canonical shape is ``{"data": [{"id": "glm-5.2", ...}, ...]}``. Some
+    providers return a bare list; a few nest under ``models`` instead of
+    ``data``. All three are accepted, de-duplicated in stable order. A
+    non-dict ``id`` is skipped rather than crashing the parse.
+    """
+    items: list[Any]
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        data_arr = payload.get("data")
+        if isinstance(data_arr, list):
+            items = data_arr
+        else:
+            models_arr = payload.get("models")
+            items = models_arr if isinstance(models_arr, list) else []
+    else:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            mid = item.get("id")
+        elif isinstance(item, str):
+            mid = item
+        else:
+            mid = None
+        if isinstance(mid, str) and mid and mid not in seen:
+            seen.add(mid)
+            out.append(mid)
+    return out
+
+
+def _extract_upstream_detail(response: httpx.Response) -> str:
+    """Extract a short failure reason from a non-2xx upstream response.
+
+    Plan 024 §3 promises the operator sees the failure reason in ``detail``.
+    A non-2xx response (401/403/404/5xx) skipped the parse block, so without
+    this the detail stayed empty — the operator saw ``ok: false`` with a
+    status but no reason. Try the JSON ``error`` field (OpenAI-shaped), then
+    a ``message`` field, then the first line of a plain-text body, capped
+    at 200 chars so a verbose upstream error page does not bloat the JSON.
+    Never raises: a body that fails to decode yields ``HTTP <status>``.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        text = response.text
+        if text:
+            first = text.strip().splitlines()[0][:200]
+            return first or f"HTTP {response.status_code}"
+        return f"HTTP {response.status_code}"
+    if isinstance(payload, dict):
+        for key in ("error", "message", "detail"):
+            val = payload.get(key)
+            if isinstance(val, str) and val:
+                return val[:200]
+            if isinstance(val, dict):
+                msg = val.get("message") or val.get("reason")
+                if isinstance(msg, str) and msg:
+                    return msg[:200]
+    return f"HTTP {response.status_code}"
 
 
 # ── Plan 021 Wave 2: registry, path preview, discovery probe ────────────────
