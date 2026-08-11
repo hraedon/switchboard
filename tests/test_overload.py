@@ -90,3 +90,18 @@ def test_invalid_config_rejected() -> None:
         OverloadConfig(threshold=0)
     with pytest.raises(ValueError):
         OverloadConfig(cooldown_min=10.0, cooldown_default=5.0, cooldown_max=300.0)
+
+
+def test_nan_cooldown_rejected() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        OverloadConfig(cooldown_default=float("nan"))
+
+
+def test_inf_cooldown_rejected() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        OverloadConfig(cooldown_max=float("inf"))
+
+
+def test_negative_cooldown_rejected() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        OverloadConfig(cooldown_min=-1.0, cooldown_default=-1.0, cooldown_max=-1.0)

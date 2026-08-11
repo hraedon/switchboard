@@ -721,10 +721,18 @@ def _opportunistic_target(
         if state is None:
             continue
         headroom = state.usage_headroom
-        if headroom is None or headroom < config.opportunistic_min_headroom:
+        if (
+            headroom is None
+            or not math.isfinite(headroom)
+            or headroom < config.opportunistic_min_headroom
+        ):
             continue
         resets_in = state.quota_resets_in
-        if resets_in is None or not (0.0 < resets_in <= config.opportunistic_reset_window):
+        if (
+            resets_in is None
+            or not math.isfinite(resets_in)
+            or not (0.0 < resets_in <= config.opportunistic_reset_window)
+        ):
             continue
         qualifiers.append((name, headroom))
 

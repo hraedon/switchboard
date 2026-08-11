@@ -43,6 +43,12 @@ class OverloadConfig:
     def __post_init__(self) -> None:
         if self.threshold < 1:
             raise ValueError(f"threshold must be >= 1, got {self.threshold}")
+        for name in ("cooldown_min", "cooldown_default", "cooldown_max"):
+            val = getattr(self, name)
+            if not math.isfinite(val) or val < 0:
+                raise ValueError(
+                    f"{name} must be finite and >= 0, got {val}"
+                )
         if not (self.cooldown_min <= self.cooldown_default <= self.cooldown_max):
             raise ValueError(
                 "require cooldown_min <= cooldown_default <= cooldown_max, got "

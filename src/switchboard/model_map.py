@@ -84,6 +84,16 @@ class ModelMapManager:
                     model,
                 )
                 continue
+            # Drop empty-string aliases: a persisted null/empty value makes
+            # providers_for() include a provider while alias_for() returns
+            # an empty string, silently rewriting the upstream model to "".
+            aliases = {k: v for k, v in aliases.items() if isinstance(v, str) and v}
+            if not aliases:
+                log.warning(
+                    "model-map row %r has no non-empty aliases, skipping",
+                    model,
+                )
+                continue
             if self._valid_providers is not None:
                 unknown = sorted(
                     k for k in aliases if k not in self._valid_providers
@@ -135,7 +145,9 @@ class ModelMapManager:
         corrupt store), memory is untouched and the exception propagates so
         the caller never reports a save that a restart would revert.
         """
-        stored = {str(k): str(v) for k, v in aliases.items()}
+        stored = {str(k): str(v) for k, v in aliases.items() if str(v)}
+        if not stored:
+            raise ValueError("model map requires at least one non-empty alias")
         if self._db is not None:
             self._db.execute(
                 "INSERT OR REPLACE INTO model_map (model, aliases) "
@@ -194,7 +206,7 @@ class ModelMapManager:
                 continue
             entry: dict[str, str] = {}
             for pn, alias in provider_map.items():
-                if isinstance(alias, str):
+                if isinstance(alias, str) and alias:
                     entry[str(pn)] = alias
             if not entry:
                 continue
