@@ -198,16 +198,16 @@ routing configuration (`routing_config` reports every runtime-settable knob,
 not a summary). No credential values — those are masked everywhere — but
 enough to map the estate.
 
-> ⚠️ **A fresh cluster comes up open.** `k8s/secret.yaml` carries no `data:`
-> entry for `SWITCHBOARD_ADMIN_TOKEN` — only instructions. A bring-up via
-> `kubectl apply -f k8s/` therefore starts with **no token and an open admin
-> surface**, and nothing fails or warns: the pod is healthy, `/readyz` is 200,
-> and the only signal is one INFO line reading `admin_token: disabled`. The
-> patch below is a **mandatory bring-up step, not an optional hardening one**.
-> The same hazard reaches a running cluster through a renamed or misspelled
-> Secret key: the `secretKeyRef` resolves to nothing and the surface reopens
-> silently. Tracked as WI-008 — the durable fix is to fail closed rather than
-> to remember.
+> ⚠️ **The app fails closed at startup.** `check_admin_auth` still returns
+> `True` when no token is configured (reads open, writes disabled), but the CLI
+> refuses to start without a token unless `--no-admin-token` is passed
+> explicitly (WI-008). `k8s/secret.yaml` carries `SWITCHBOARD_ADMIN_TOKEN` as a
+> `data:` key and `k8s/deployment.yaml` references it via a non-optional
+> `secretKeyRef`, so a fresh `kubectl apply -f k8s/` CrashLoops loudly on the
+> empty value rather than coming up open. Populate the Secret (below) before
+> the first rollout. A renamed or misspelled Secret key causes
+> `CreateContainerConfigError` — the pod never starts, which is the correct
+> failure mode.
 
 **Where it comes from.** `--admin-token` flag → `SWITCHBOARD_ADMIN_TOKEN` env →
 `admin_token` in TOML → unset. In k8s only the env var is viable; the TOML is a

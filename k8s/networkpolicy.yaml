@@ -16,7 +16,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: switchboard
+      app: switchboard
   policyTypes:
     - Ingress
   ingress:
