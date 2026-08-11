@@ -158,6 +158,47 @@ def test_reset_without_a_store_reports_empty(tmp_path) -> None:
     assert reset_sections(None, ["providers"]) == {"providers": []}
 
 
+def test_reset_all_on_completely_fresh_database(tmp_path) -> None:
+    """A database with NO tables at all (never opened by any manager) must
+    not raise — _row_labels guards every table, including route_default."""
+    path = _store(tmp_path)
+    db = sqlite3.connect(path)
+    try:
+        deleted = reset_sections(db, sorted(SECTIONS))
+    finally:
+        db.close()
+    for section in SECTIONS:
+        assert deleted[section] == []
+
+
+def test_reset_routing_config_clears_runtime_overlay(tmp_path) -> None:
+    """routing-config section must be in SECTIONS and clear the overlay."""
+    path = _store(tmp_path)
+    RouteTableManager(sqlite_path=path).close()
+    conn = sqlite3.connect(path)
+    from switchboard.config_store import ConfigStoreManager
+
+    cs = ConfigStoreManager(sqlite_path=path)
+    cs.set_routing_overlay({"strategy": "pace"})
+    cs.close()
+
+    db = sqlite3.connect(path)
+    try:
+        deleted = reset_sections(db, ["routing-config"])
+    finally:
+        db.close()
+    assert len(deleted["routing-config"]) == 1
+
+    db = sqlite3.connect(path)
+    try:
+        row = db.execute(
+            "SELECT overlay FROM routing_config WHERE id = 1"
+        ).fetchone()
+    finally:
+        db.close()
+    assert row is None
+
+
 def test_reset_is_scoped_to_the_named_sections(tmp_path) -> None:
     """Resetting one section must not take the others with it — the operator
     is reclaiming one surface, not wiping the deployment."""

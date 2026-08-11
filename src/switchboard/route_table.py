@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -38,6 +39,16 @@ class RouteTableManager:
                 sqlite_path,
                 check_same_thread=False,
             )
+            # The file is shared with ConfigStoreManager and may hold
+            # credentials (provider api_key in stored mode). Tighten perms
+            # before any row is written; some volumes (k8s) forbid chmod,
+            # so degrade quietly rather than fail boot.
+            try:
+                os.chmod(sqlite_path, 0o600)
+            except OSError:
+                log.debug(
+                    "route table: could not chmod %s to 0600", sqlite_path
+                )
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS routes "
                 "(key TEXT PRIMARY KEY, providers TEXT, created_at REAL)"
@@ -60,7 +71,22 @@ class RouteTableManager:
             return
         cursor = db.execute("SELECT key, providers FROM routes")
         for key, providers_json in cursor:
-            providers_list: list[str] = json.loads(providers_json)
+            try:
+                providers_list = json.loads(providers_json)
+            except (TypeError, json.JSONDecodeError):
+                log.warning(
+                    "route table: keyed row %s is not valid JSON; "
+                    "ignoring it", key,
+                )
+                continue
+            if not isinstance(providers_list, list) or not all(
+                isinstance(p, str) for p in providers_list
+            ):
+                log.warning(
+                    "route table: keyed row %s is not a list of strings; "
+                    "ignoring it", key,
+                )
+                continue
             self._entries[key] = RouteEntry(
                 key=key,
                 providers=tuple(providers_list),
@@ -127,12 +153,13 @@ class RouteTableManager:
         hashed_key: str,
         providers: list[str] | tuple[str, ...],
     ) -> None:
-        """Add or update a route entry. Persists to SQLite if configured."""
+        """Add or update a route entry. Persists to SQLite if configured.
+
+        DB-first: the write commits before memory is touched, so a store
+        failure leaves the live route table unchanged (the caller surfaces
+        the error) rather than diverged from disk.
+        """
         provider_tuple = tuple(providers)
-        self._entries[hashed_key] = RouteEntry(
-            key=hashed_key,
-            providers=provider_tuple,
-        )
         if self._db is not None:
             self._db.execute(
                 "INSERT OR REPLACE INTO routes (key, providers, created_at) "
@@ -140,18 +167,24 @@ class RouteTableManager:
                 (hashed_key, json.dumps(list(provider_tuple)), time.time()),
             )
             self._db.commit()
+        self._entries[hashed_key] = RouteEntry(
+            key=hashed_key,
+            providers=provider_tuple,
+        )
 
     def remove_entry(self, hashed_key: str) -> bool:
-        """Remove a route entry. Returns True if found and removed."""
+        """Remove a route entry. Returns True if found and removed.
+
+        DB-first: the delete commits before memory is touched."""
         found = hashed_key in self._entries
         if found:
-            del self._entries[hashed_key]
             if self._db is not None:
                 self._db.execute(
                     "DELETE FROM routes WHERE key = ?",
                     (hashed_key,),
                 )
                 self._db.commit()
+            del self._entries[hashed_key]
         return found
 
     def list_entries(self) -> list[RouteEntry]:
@@ -206,7 +239,6 @@ class RouteTableManager:
             # describes is exactly the kind of thing a later caller trusts.
             self._default_from_store = False
             return
-        self._default_from_store = True
         if self._db is not None:
             self._db.execute(
                 "INSERT OR REPLACE INTO route_default "
@@ -214,6 +246,7 @@ class RouteTableManager:
                 (json.dumps(list(providers)), time.time()),
             )
             self._db.commit()
+        self._default_from_store = True
 
     def get_route_table(self) -> RouteTable:
         """Return a frozen RouteTable snapshot for the pure routing function."""

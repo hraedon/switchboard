@@ -1057,6 +1057,13 @@ def route_decision(
         queue_candidate = primary
     elif queue_eligible:
         queue_candidate = queue_eligible[0]
+    elif primary in immediate:
+        # No provider is BUSY or demoted, so queue_eligible is empty. But
+        # if all immediate acquisitions lose their snapshot race the request
+        # should still wait on the primary (the documented queue backstop)
+        # rather than failing at once — docs/routing-model.md §4 step 4:
+        # "then queue on configured primary for at most queue_timeout".
+        queue_candidate = primary
 
     if not immediate and queue_candidate is None:
         return AdmissionPlan(

@@ -227,6 +227,19 @@ def test_both_busy_queue_on_primary() -> None:
     assert plan.reason == "queue_only"
 
 
+def test_two_available_queue_candidate_is_primary_backstop() -> None:
+    """When both providers are AVAILABLE, queue_eligible is empty — but the
+    primary should still be the queue backstop so a snapshot-race failure
+    waits rather than returning 503 immediately (docs/routing-model.md §4)."""
+    states = {
+        "umans": _state("umans"),
+        "ollama": _state("ollama"),
+    }
+    plan = route_decision(states, TABLE, "any_key", CONFIG, now=0.0)
+    assert plan.immediate_candidates == ("umans", "ollama")
+    assert plan.queue_candidate == "umans"
+
+
 def test_hash_route_key_deterministic() -> None:
     assert hash_route_key("sk-test-123") == hash_route_key("sk-test-123")
 

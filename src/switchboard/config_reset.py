@@ -42,6 +42,7 @@ SECTIONS: dict[str, tuple[str, str]] = {
     "model-map": ("model_map", "model alias rows"),
     "routes": ("routes", "keyed route entries"),
     "route-default": ("route_default", "the persisted default route"),
+    "routing-config": ("routing_config", "runtime routing overlay"),
 }
 
 ALL = "all"
@@ -83,13 +84,16 @@ def parse_sections(raw: str) -> list[str]:
 
 def _row_labels(db: sqlite3.Connection, table: str) -> list[str]:
     """Best-effort human labels for the rows about to be deleted."""
-    if table == "route_default":
-        row = db.execute("SELECT providers FROM route_default").fetchone()
-        return [str(row[0])] if row else []
-    key = "key" if table == "routes" else (
-        "model" if table == "model_map" else "name"
-    )
     try:
+        if table == "route_default":
+            row = db.execute("SELECT providers FROM route_default").fetchone()
+            return [str(row[0])] if row else []
+        if table == "routing_config":
+            row = db.execute("SELECT overlay FROM routing_config").fetchone()
+            return [str(row[0])] if row else []
+        key = "key" if table == "routes" else (
+            "model" if table == "model_map" else "name"
+        )
         return [str(r[0]) for r in db.execute(f"SELECT {key} FROM {table}")]
     except sqlite3.OperationalError:
         return []
