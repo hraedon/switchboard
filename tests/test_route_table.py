@@ -161,3 +161,85 @@ def test_sqlite_persistence_remove_entry_gone_in_new_manager() -> None:
         mgr2.close()
     finally:
         os.unlink(path)
+
+
+def test_sqlite_corrupt_keyed_row_does_not_brick_boot() -> None:
+    """A corrupt JSON row in the keyed routes table must be skipped, not
+    fatal — one bad row must not prevent startup."""
+    import json as _json
+    import sqlite3
+
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        mgr1 = RouteTableManager(
+            default_providers=("umans",),
+            sqlite_path=path,
+        )
+        mgr1.add_entry("good_key", ["umans"])
+        mgr1.close()
+
+        # Corrupt one row directly in the DB.
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "INSERT OR REPLACE INTO routes (key, providers, created_at) "
+            "VALUES (?, ?, ?)",
+            ("bad_key", "NOT-VALID-JSON{", 0),
+        )
+        conn.commit()
+        conn.close()
+
+        mgr2 = RouteTableManager(
+            default_providers=("umans",),
+            sqlite_path=path,
+        )
+        assert mgr2.lookup("good_key") == ("umans",)
+        assert mgr2.lookup("bad_key") == ("umans",)  # falls to default
+        mgr2.close()
+    finally:
+        os.unlink(path)
+
+
+def test_add_entry_db_failure_leaves_memory_unchanged() -> None:
+    """DB-first: if the store write fails, the live route table must not
+    diverge from disk (memory stays unchanged)."""
+    import sqlite3
+
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        mgr = RouteTableManager(
+            default_providers=("umans",),
+            sqlite_path=path,
+        )
+        mgr.add_entry("good_key", ["umans"])
+        mgr._db.close()  # subsequent writes raise
+
+        try:
+            mgr.add_entry("fail_key", ["ollama"])
+            assert False, "should have raised"
+        except sqlite3.ProgrammingError:
+            pass
+        # Memory was NOT updated — the failed write left no trace.
+        assert mgr.get_entry("fail_key") is None
+        assert mgr.get_entry("good_key") == ("umans",)
+    finally:
+        os.unlink(path)
+
+
+def test_sqlite_file_mode_is_0600() -> None:
+    """The credential-bearing store file must be 0600, not the default 0644."""
+    import stat
+
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        mgr = RouteTableManager(
+            default_providers=("umans",),
+            sqlite_path=path,
+        )
+        mgr.close()
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600, f"expected 0600, got {oct(mode)}"
+    finally:
+        os.unlink(path)
