@@ -419,7 +419,8 @@ async def test_handle_model_map_set_persists_and_responds() -> None:
     receive = _make_receive(body)
     messages, send = _make_send()
     await handle_model_map_set(
-        send, receive, mgr, "admin-secret", scope, None, providers
+        send, receive, mgr, "admin-secret", scope, None, providers,
+        max_request_body_bytes=1048576,
     )
     status, resp_body = _parse_response(messages)
     assert status == 200
@@ -467,7 +468,8 @@ async def test_handle_model_map_set_rejects_unknown_provider() -> None:
     receive = _make_receive(body)
     messages, send = _make_send()
     await handle_model_map_set(
-        send, receive, mgr, "admin-secret", scope, None, providers
+        send, receive, mgr, "admin-secret", scope, None, providers,
+        max_request_body_bytes=1048576,
     )
     status, resp_body = _parse_response(messages)
     assert status == 400
@@ -483,7 +485,7 @@ async def test_handle_model_map_set_invalid_json_returns_400() -> None:
     scope = _authed_scope()
     receive = _make_receive(b"not json")
     messages, send = _make_send()
-    await handle_model_map_set(send, receive, mgr, "admin-secret", scope)
+    await handle_model_map_set(send, receive, mgr, "admin-secret", scope, max_request_body_bytes=1048576)
     status, _ = _parse_response(messages)
     assert status == 400
 
@@ -495,7 +497,7 @@ async def test_handle_model_map_set_missing_model_returns_400() -> None:
     body = json.dumps({"aliases": {"umans": "u"}}).encode()
     receive = _make_receive(body)
     messages, send = _make_send()
-    await handle_model_map_set(send, receive, mgr, "admin-secret", scope)
+    await handle_model_map_set(send, receive, mgr, "admin-secret", scope, max_request_body_bytes=1048576)
     status, _ = _parse_response(messages)
     assert status == 400
 
@@ -507,7 +509,7 @@ async def test_handle_model_map_set_missing_aliases_returns_400() -> None:
     body = json.dumps({"model": "kimi"}).encode()
     receive = _make_receive(body)
     messages, send = _make_send()
-    await handle_model_map_set(send, receive, mgr, "admin-secret", scope)
+    await handle_model_map_set(send, receive, mgr, "admin-secret", scope, max_request_body_bytes=1048576)
     status, _ = _parse_response(messages)
     assert status == 400
 
@@ -525,7 +527,7 @@ async def test_handle_model_map_set_wrong_content_type_returns_415() -> None:
     )
     receive = _make_receive(b"{}")
     messages, send = _make_send()
-    await handle_model_map_set(send, receive, mgr, "admin-secret", scope)
+    await handle_model_map_set(send, receive, mgr, "admin-secret", scope, max_request_body_bytes=1048576)
     status, _ = _parse_response(messages)
     assert status == 415
 
@@ -546,13 +548,35 @@ async def test_handle_model_map_set_store_failure_returns_500_json() -> None:
     receive = _make_receive(body)
     messages, send = _make_send()
     await handle_model_map_set(
-        send, receive, mgr, "admin-secret", scope, None, providers
+        send, receive, mgr, "admin-secret", scope, None, providers,
+        max_request_body_bytes=1048576,
     )
     status, resp_body = _parse_response(messages)
     assert status == 500
     data = json.loads(resp_body)
     assert "error" in data
     # Memory was not mutated: the handler's failure report is honest.
+    assert "kimi" not in mgr.get_model_map()
+
+
+@pytest.mark.asyncio
+async def test_handle_model_map_set_no_body_limit_returns_409() -> None:
+    """Without max_request_body_bytes, a model map would force unbounded
+    buffering — reject the addition at the API."""
+    mgr = ModelMapManager()
+    providers = {"umans": _make_provider_context("umans")}
+    scope = _authed_scope()
+    body = json.dumps(
+        {"model": "kimi", "aliases": {"umans": "umans-kimi"}}
+    ).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_model_map_set(
+        send, receive, mgr, "admin-secret", scope, None, providers,
+        max_request_body_bytes=None,
+    )
+    status, _ = _parse_response(messages)
+    assert status == 409
     assert "kimi" not in mgr.get_model_map()
 
 

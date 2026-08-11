@@ -1151,6 +1151,7 @@ async def handle_model_map_set(
     scope: Scope,
     cors_allow_origin: str | None = None,
     providers: dict[str, ProviderContext] | None = None,
+    max_request_body_bytes: int | None = None,
 ) -> None:
     """POST /admin/model-map — add or update a model's per-provider aliases.
 
@@ -1175,6 +1176,21 @@ async def handle_model_map_set(
     if not check_csrf(scope, admin_token):
         await send_json(
             send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    # A model map forces request-body buffering on every request — without a
+    # finite max_request_body_bytes the buffer is unbounded (memory risk).
+    if max_request_body_bytes is None:
+        await send_json(
+            send, 409,
+            {
+                "error": (
+                    "model map requires max_request_body_bytes to be set; "
+                    "restart with --max-request-body-bytes to enable"
+                )
+            },
             extra_headers=cors,
         )
         return
