@@ -953,6 +953,22 @@ def test_token_budget_none_not_filtered() -> None:
     assert "ollama-cloud" in plan.immediate_candidates
 
 
+def test_nan_token_utilization_does_not_bypass_demotion() -> None:
+    """NaN >= threshold is always False, so without an isfinite guard a
+    corrupt utilization reading would keep a provider immediate."""
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama-cloud")
+    )
+    states = {
+        "umans": _state("umans"),
+        "ollama-cloud": _state(
+            "ollama-cloud", token_utilization=float("nan")
+        ),
+    }
+    plan = route_decision(states, table, "k", _BUDGET_CONFIG, now=0.0)
+    assert "ollama-cloud" in plan.immediate_candidates
+
+
 def test_token_budget_primary_never_demoted() -> None:
     table = RouteTable(
         entries={}, default_providers=("umans", "ollama-cloud")

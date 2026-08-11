@@ -265,11 +265,9 @@ class QuarantineTracker:
     def release(self, provider: str, model: str) -> bool:
         """Clear one pair. Returns False if it was not quarantined.
 
-        .. warning::
-            A ``True`` return means the pair was removed from the in-memory
-            set. If the store write failed, the pair will reappear after a
-            restart. Callers that need to surface this should check
-            :meth:`persistence_ok` after a batch of operations.
+        The in-memory entry is always removed on True. If the store write
+        fails (logged at ERROR), the pair will reappear after a restart —
+        the operator should check logs after releasing.
         """
         key = (provider, model)
         if key not in self._entries:

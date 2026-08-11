@@ -915,6 +915,7 @@ def route_decision(
                 not is_primary
                 and config.headroom_threshold > 0
                 and state.usage_headroom is not None
+                and math.isfinite(state.usage_headroom)
                 and state.usage_headroom < config.headroom_threshold
             )
             # Per-provider soft_threshold (Plan 012 §4) overrides the global
@@ -932,6 +933,7 @@ def route_decision(
                 not is_primary
                 and budget_threshold > 0
                 and state.token_utilization is not None
+                and math.isfinite(state.token_utilization)
                 and state.token_utilization
                 >= budget_threshold
             )
@@ -941,6 +943,7 @@ def route_decision(
             over_24h = (
                 config.usage_24h_threshold > 0
                 and state.usage_24h_utilization is not None
+                and math.isfinite(state.usage_24h_utilization)
                 and state.usage_24h_utilization >= config.usage_24h_threshold
             )
             if low_headroom or over_budget or over_24h:

@@ -229,14 +229,8 @@ class RouteTableManager:
         through the admin API is intent, and must survive a restart. It then
         takes precedence over the TOML default, per D1's store-wins rule.
         """
-        self._default_providers = providers
         if not persist:
-            # The flag tracks the provenance of the CURRENT value, so an
-            # in-memory replacement clears it: what is live is now a derived
-            # value, not the row on disk. Only `load_from_config` reads it and
-            # only before this point in the boot merge, so this is hygiene
-            # rather than a fix — but a flag that outlives the value it
-            # describes is exactly the kind of thing a later caller trusts.
+            self._default_providers = providers
             self._default_from_store = False
             return
         if self._db is not None:
@@ -246,6 +240,7 @@ class RouteTableManager:
                 (json.dumps(list(providers)), time.time()),
             )
             self._db.commit()
+        self._default_providers = providers
         self._default_from_store = True
 
     def get_route_table(self) -> RouteTable:
