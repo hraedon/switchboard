@@ -175,7 +175,6 @@ def test_reset_routing_config_clears_runtime_overlay(tmp_path) -> None:
     """routing-config section must be in SECTIONS and clear the overlay."""
     path = _store(tmp_path)
     RouteTableManager(sqlite_path=path).close()
-    conn = sqlite3.connect(path)
     from switchboard.config_store import ConfigStoreManager
 
     cs = ConfigStoreManager(sqlite_path=path)

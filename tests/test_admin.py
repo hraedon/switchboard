@@ -505,7 +505,10 @@ async def test_handle_model_map_set_invalid_json_returns_400() -> None:
     scope = _authed_scope()
     receive = _make_receive(b"not json")
     messages, send = _make_send()
-    await handle_model_map_set(send, receive, mgr, "admin-secret", scope, max_request_body_bytes=1048576)
+    await handle_model_map_set(
+        send, receive, mgr, "admin-secret", scope,
+        max_request_body_bytes=1048576,
+    )
     status, _ = _parse_response(messages)
     assert status == 400
 
@@ -517,7 +520,10 @@ async def test_handle_model_map_set_missing_model_returns_400() -> None:
     body = json.dumps({"aliases": {"umans": "u"}}).encode()
     receive = _make_receive(body)
     messages, send = _make_send()
-    await handle_model_map_set(send, receive, mgr, "admin-secret", scope, max_request_body_bytes=1048576)
+    await handle_model_map_set(
+        send, receive, mgr, "admin-secret", scope,
+        max_request_body_bytes=1048576,
+    )
     status, _ = _parse_response(messages)
     assert status == 400
 
@@ -529,7 +535,10 @@ async def test_handle_model_map_set_missing_aliases_returns_400() -> None:
     body = json.dumps({"model": "kimi"}).encode()
     receive = _make_receive(body)
     messages, send = _make_send()
-    await handle_model_map_set(send, receive, mgr, "admin-secret", scope, max_request_body_bytes=1048576)
+    await handle_model_map_set(
+        send, receive, mgr, "admin-secret", scope,
+        max_request_body_bytes=1048576,
+    )
     status, _ = _parse_response(messages)
     assert status == 400
 
@@ -547,7 +556,10 @@ async def test_handle_model_map_set_wrong_content_type_returns_415() -> None:
     )
     receive = _make_receive(b"{}")
     messages, send = _make_send()
-    await handle_model_map_set(send, receive, mgr, "admin-secret", scope, max_request_body_bytes=1048576)
+    await handle_model_map_set(
+        send, receive, mgr, "admin-secret", scope,
+        max_request_body_bytes=1048576,
+    )
     status, _ = _parse_response(messages)
     assert status == 415
 

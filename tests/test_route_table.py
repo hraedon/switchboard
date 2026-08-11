@@ -166,7 +166,6 @@ def test_sqlite_persistence_remove_entry_gone_in_new_manager() -> None:
 def test_sqlite_corrupt_keyed_row_does_not_brick_boot() -> None:
     """A corrupt JSON row in the keyed routes table must be skipped, not
     fatal — one bad row must not prevent startup."""
-    import json as _json
     import sqlite3
 
     fd, path = tempfile.mkstemp(suffix=".db")
@@ -217,7 +216,7 @@ def test_add_entry_db_failure_leaves_memory_unchanged() -> None:
 
         try:
             mgr.add_entry("fail_key", ["ollama"])
-            assert False, "should have raised"
+            raise AssertionError("should have raised")
         except sqlite3.ProgrammingError:
             pass
         # Memory was NOT updated — the failed write left no trace.

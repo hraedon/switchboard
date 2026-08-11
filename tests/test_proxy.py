@@ -872,5 +872,5 @@ async def test_chunked_body_over_limit_returns_413_pre_upstream() -> None:
     receive = _MockReceive(body=b'{"model": "very-long-name"}')
     messages, send = _make_send()
     await app(scope, receive, send)
-    status, body, _ = _parse_response(messages)
+    status, _body, _ = _parse_response(messages)
     assert status == 413
