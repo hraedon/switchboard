@@ -473,6 +473,37 @@ class TestServeKeyStartup:
         )
         assert app._routing_config.pin_conversations is True
 
+    def test_reroute_without_body_limit_fails(self, tmp_path) -> None:
+        """Reroute buffers the body for replay — same memory risk as pin."""
+        cfg = _write_serve_config(
+            tmp_path,
+            "[reroute]\nenabled = true\nmax_attempts = 1\n"
+            + _SERVE_PROVIDER,
+        )
+        with pytest.raises(_ConfigError, match="max_request_body_bytes"):
+            _build_serve_app(_serve_args(config=cfg))
+
+    def test_model_map_without_body_limit_fails(self, tmp_path) -> None:
+        """A model map buffers the body to read/rewrite the model field."""
+        cfg = _write_serve_config(
+            tmp_path,
+            '[model."kimi"]\numans = "kimi-alias"\n'
+            + _SERVE_PROVIDER,
+        )
+        with pytest.raises(_ConfigError, match="max_request_body_bytes"):
+            _build_serve_app(_serve_args(config=cfg))
+
+    def test_reroute_with_body_limit_starts(self, tmp_path) -> None:
+        cfg = _write_serve_config(
+            tmp_path,
+            "[reroute]\nenabled = true\nmax_attempts = 1\n"
+            + _SERVE_PROVIDER,
+        )
+        app, _, _, _, _ = _build_serve_app(
+            _serve_args(config=cfg, max_request_body_bytes=1048576)
+        )
+        assert app._reroute_max_attempts == 1
+
     def test_route_key_secret_env_threads_to_app(self, tmp_path, monkeypatch) -> None:
         """SWITCHBOARD_ROUTE_KEY_SECRET (and _PREV) reach the ProxyApp as the
         ordered secrets tuple (Plan 008 §3). Env-only by design — a credential

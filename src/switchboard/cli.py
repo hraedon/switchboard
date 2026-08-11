@@ -1183,13 +1183,23 @@ def _build_serve_app(
     # the dashboard. It never influences a routing decision (Wave 4 would).
     speed_sampler = SpeedSampler()
 
-    # Conversation pinning (Plan 019 §6) buffers the request body to extract a
-    # fingerprint — an unbounded buffer is a memory-exhaustion vector, so a
-    # finite max_request_body_bytes is required when the feature is opt-in.
-    if routing_config.pin_conversations and max_request_body_bytes is None:
+    # Body-buffering features (model map, usage-error reroute, conversation
+    # pinning) buffer the full request body in memory — an unbounded buffer
+    # is a memory-exhaustion vector (a large chunked request can exhaust the
+    # pod's memory limit), so a finite max_request_body_bytes is required
+    # when ANY of them is active.
+    has_model_map_entries = bool(model_map_mgr.get_model_map().routes)
+    _buffering_features: list[str] = []
+    if has_model_map_entries:
+        _buffering_features.append("model map")
+    if reroute_max_attempts > 0:
+        _buffering_features.append("reroute")
+    if routing_config.pin_conversations:
+        _buffering_features.append("pin_conversations")
+    if _buffering_features and max_request_body_bytes is None:
         raise _ConfigError(
-            "pin_conversations requires max_request_body_bytes to be set "
-            "to a finite limit (unbounded buffering is a memory risk)"
+            f"{'/'.join(_buffering_features)} requires max_request_body_bytes "
+            "to be set to a finite limit (unbounded buffering is a memory risk)"
         )
 
     # Route-key HMAC secret (Plan 008 §3). Env-only by design — a credential

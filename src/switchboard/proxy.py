@@ -750,6 +750,7 @@ class ProxyApp:
                     send, receive, self._model_map_mgr,
                     self._admin_token, scope, self._cors_allow_origin,
                     self._providers,
+                    max_request_body_bytes=self._max_request_body_bytes,
                 )
                 return
             await send_text(send, 405, "Method not allowed")
@@ -1150,11 +1151,44 @@ class ProxyApp:
         model_map = self._model_map_mgr.get_model_map()
         has_model_map = bool(model_map.routes)
 
-        # Buffer the body when any feature needs it: model rewriting reads it,
-        # usage-error reroute must replay it, and conversation pinning reads
-        # the first user message for a fingerprint (Plan 019 §6).
+        # Pre-flight body-size check (phantom prevention): when a limit is
+        # set and Content-Length declares an oversized body, reject BEFORE
+        # connecting upstream.  In the streaming path a mid-stream overflow
+        # forwards earlier chunks before the excess is detected, creating a
+        # phantom upstream request with a truncated body.
+        body_limit = self._max_request_body_bytes
+        content_length: int | None = None
+        for hk, hv in scope.get("headers", []):
+            if hk == b"content-length":
+                try:
+                    content_length = int(hv)
+                except ValueError:
+                    content_length = None
+                break
+        if (
+            body_limit is not None
+            and content_length is not None
+            and content_length > body_limit
+        ):
+            await send_json(
+                send, 413, {"error": "request body too large"}
+            )
+            return
+
+        # Buffer the body when any feature needs it: model rewriting reads
+        # it, usage-error reroute must replay it, and conversation pinning
+        # reads the first user message for a fingerprint (Plan 019 §6).
+        # Also buffer when a body-size limit is set but the size is unknown
+        # (chunked, no Content-Length): buffering is the only way to enforce
+        # a byte limit without creating phantom upstream requests.
         pin_conversations = self._routing_config.pin_conversations
-        if has_model_map or self._reroute_max_attempts > 0 or pin_conversations:
+        must_buffer = (
+            has_model_map
+            or self._reroute_max_attempts > 0
+            or pin_conversations
+            or (body_limit is not None and content_length is None)
+        )
+        if must_buffer:
             buffered_body, overflow = await self._buffer_request_body(receive)
             if overflow:
                 await send_json(

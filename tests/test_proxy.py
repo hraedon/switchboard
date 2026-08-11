@@ -833,3 +833,44 @@ async def test_buffer_request_body_detects_disconnect() -> None:
     body, overflow = await app._buffer_request_body(DisconnectReceive())
     assert overflow is False
     assert body is None
+
+
+@pytest.mark.asyncio
+async def test_content_length_over_limit_returns_413_pre_upstream() -> None:
+    """Phantom prevention: a Content-Length declaring an oversized body is
+    rejected BEFORE connecting upstream — no truncated body reaches the
+    provider."""
+    app = _make_app()
+    app._max_request_body_bytes = 10
+    scope = _make_scope(
+        method="POST",
+        path="/v1/chat/completions",
+        headers=[
+            (b"content-type", b"application/json"),
+            (b"content-length", b"99999"),
+        ],
+    )
+    receive = _MockReceive(body=b'{"model": "test"}')
+    messages, send = _make_send()
+    await app(scope, receive, send)
+    status, body, _ = _parse_response(messages)
+    assert status == 413
+    assert b"request body too large" in body
+
+
+@pytest.mark.asyncio
+async def test_chunked_body_over_limit_returns_413_pre_upstream() -> None:
+    """No Content-Length + limit: the body is buffered to enforce the limit,
+    and overflow returns 413 before connecting upstream (no phantom)."""
+    app = _make_app()
+    app._max_request_body_bytes = 5
+    scope = _make_scope(
+        method="POST",
+        path="/v1/chat/completions",
+        headers=[(b"content-type", b"application/json")],
+    )
+    receive = _MockReceive(body=b'{"model": "very-long-name"}')
+    messages, send = _make_send()
+    await app(scope, receive, send)
+    status, body, _ = _parse_response(messages)
+    assert status == 413
