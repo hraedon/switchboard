@@ -442,7 +442,8 @@ async def test_handle_model_map_set_rejects_empty_alias() -> None:
     receive = _make_receive(body)
     messages, send = _make_send()
     await handle_model_map_set(
-        send, receive, mgr, "admin-secret", scope, None, providers
+        send, receive, mgr, "admin-secret", scope, None, providers,
+        max_request_body_bytes=1048576,
     )
     status, resp_body = _parse_response(messages)
     assert status == 400
