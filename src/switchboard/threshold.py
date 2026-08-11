@@ -101,10 +101,16 @@ class DimensionEstimate:
 
         Returns ``upper`` alone when only an upper bound is known (windows that
         started with an OFF observation are needed for a lower bound).
+
+        For adjacent integer bounds (upper == lower + 1) returns ``upper`` —
+        the proven-trigger value — rather than floor division, which would
+        return the proven-non-trigger ``lower``.
         """
         if self.contradicted:
             return None
         if self.lower is not None and self.upper is not None:
+            if self.upper == self.lower + 1:
+                return self.upper
             return (self.lower + self.upper) // 2
         if self.upper is not None:
             return self.upper
