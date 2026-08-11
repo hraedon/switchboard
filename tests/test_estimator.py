@@ -566,3 +566,16 @@ def test_status_payload_includes_events() -> None:
 
     _close_ctxs(ctx_off, ctx_on, no_reading_ctx)
     db.close()
+
+
+def test_dimension_estimate_adjacent_bounds_return_trigger_value() -> None:
+    """Adjacent integer bounds (lower=4, upper=5) must return upper — the
+    proven-trigger value — not floor division which returns the proven-
+    non-trigger lower bound."""
+    from switchboard.threshold import DimensionEstimate
+
+    adj = DimensionEstimate(lower=4, upper=5, edges=2)
+    assert adj.best_guess == 5
+
+    wide = DimensionEstimate(lower=100, upper=120, edges=2)
+    assert wide.best_guess == 110

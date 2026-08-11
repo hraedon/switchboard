@@ -118,7 +118,7 @@ def cors_extra_headers(
         (b"access-control-allow-origin", cors_allow_origin.encode("latin-1"))
     )
     headers.append(
-        (b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS")
+        (b"access-control-allow-methods", b"GET, POST, PUT, DELETE, OPTIONS")
     )
     headers.append(
         (b"access-control-allow-headers", b"Authorization, Content-Type, Cookie")

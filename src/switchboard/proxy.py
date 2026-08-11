@@ -601,6 +601,9 @@ class ProxyApp:
                 or (
                     path.startswith("/admin/model-map/")
                 )
+                or (
+                    path.startswith("/admin/quarantine")
+                )
             )
         ):
             await send_text(
@@ -2116,6 +2119,17 @@ class ProxyApp:
                     if not is_sse:
                         non_sse_buf = bytearray()
 
+                # Quarantine evidence (Plan 023): capture the first 256 bytes
+                # of a non-2xx response body so classify_failure can tell an
+                # API JSON error from an edge/proxy block. Bytes forwarded to
+                # the client are unchanged.
+                probe_buf: bytearray | None = None
+                if (
+                    probe is not None
+                    and response.status_code >= 400
+                ):
+                    probe_buf = bytearray()
+
                 try:
                     while True:
                         if disconnect.is_set():
@@ -2154,6 +2168,8 @@ class ProxyApp:
                             and len(non_sse_buf) < 1_048_576
                         ):
                             non_sse_buf.extend(chunk)
+                        if probe_buf is not None and len(probe_buf) < 256:
+                            probe_buf.extend(chunk)
                         try:
                             await send(
                                 {
@@ -2167,6 +2183,11 @@ class ProxyApp:
                             break
                 finally:
                     await _cancel_task(disc_wait)
+
+                if probe_buf is not None and probe is not None:
+                    probe.body_prefix = bytes(probe_buf[:256]).decode(
+                        "utf-8", errors="replace"
+                    )
 
                 if not disconnect.is_set():
                     await send(

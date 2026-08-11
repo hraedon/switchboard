@@ -122,17 +122,19 @@ class QuarantineTracker:
                 ", ".join(f"{p}/{m}" for p, m in sorted(self._entries)),
             )
 
-    def _persist(self) -> None:
+    def _persist(self) -> bool:
         if self._store is None:
-            return
+            return True
         try:
             self._store.save([e.to_dict() for e in self._entries.values()])
+            return True
         except Exception:
-            log.warning(
+            log.error(
                 "could not persist quarantine; it is in force now but will "
                 "not survive a restart",
                 exc_info=True,
             )
+            return False
 
     # -- recording -----------------------------------------------------------
 
@@ -261,7 +263,14 @@ class QuarantineTracker:
     # -- releasing -----------------------------------------------------------
 
     def release(self, provider: str, model: str) -> bool:
-        """Clear one pair. Returns False if it was not quarantined."""
+        """Clear one pair. Returns False if it was not quarantined.
+
+        .. warning::
+            A ``True`` return means the pair was removed from the in-memory
+            set. If the store write failed, the pair will reappear after a
+            restart. Callers that need to surface this should check
+            :meth:`persistence_ok` after a batch of operations.
+        """
         key = (provider, model)
         if key not in self._entries:
             return False
