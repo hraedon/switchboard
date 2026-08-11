@@ -1305,7 +1305,7 @@ async function load() {
     const reason = p.gate_closed_reason || 'open';
     const badgeCls = reason === 'open' ? 'open' : reason;
     html += `<div class="card">
-      <h3>${name} <span class="badge ${badgeCls}">${reason}</span></h3>
+      <h3>${esc(name)} <span class="badge ${badgeCls}">${reason}</span></h3>
       <div style="margin:-0.3rem 0 0.6rem">
         <button id="edit-prov-${provIdx}" class="mini-btn">Edit</button>
       </div>
@@ -1533,7 +1533,7 @@ async function load() {
   const fpp = m.forwarded_per_provider || {};
   html += `<div class="card"><h3>Forwarded per Provider</h3>`;
   for (const [name, count] of Object.entries(fpp)) {
-    html += `<div class="stat"><span class="k">${name}</span><span class="v">${count}</span></div>`;
+    html += `<div class="stat"><span class="k">${esc(name)}</span><span class="v">${count}</span></div>`;
   }
   html += '</div></div>';
 

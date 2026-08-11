@@ -1633,6 +1633,23 @@ def test_opportunistic_headroom_none_returns_none() -> None:
     assert plan.reason == "primary_available"
 
 
+def test_opportunistic_nan_headroom_does_not_qualify() -> None:
+    """NaN headroom defeats the < comparison (NaN < x is always False), so
+    without a math.isfinite guard it would qualify for promotion."""
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state(
+            "zai",
+            usage_headroom=float("nan"),
+            quota_resets_in=10800.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+
 def test_opportunistic_margin_suppresses_close_qualifiers() -> None:
     """Best and runner-up within margin → keep primary."""
     table = RouteTable(

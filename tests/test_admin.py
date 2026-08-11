@@ -431,6 +431,25 @@ async def test_handle_model_map_set_persists_and_responds() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_model_map_set_rejects_empty_alias() -> None:
+    """An empty alias string would rewrite the upstream model to ''."""
+    mgr = ModelMapManager()
+    providers = {"umans": _make_provider_context("umans")}
+    scope = _authed_scope()
+    body = json.dumps(
+        {"model": "kimi", "aliases": {"umans": ""}}
+    ).encode()
+    receive = _make_receive(body)
+    messages, send = _make_send()
+    await handle_model_map_set(
+        send, receive, mgr, "admin-secret", scope, None, providers
+    )
+    status, resp_body = _parse_response(messages)
+    assert status == 400
+    assert b"non-empty" in resp_body
+
+
+@pytest.mark.asyncio
 async def test_handle_model_map_set_requires_auth() -> None:
     mgr = ModelMapManager()
     scope = _make_scope(

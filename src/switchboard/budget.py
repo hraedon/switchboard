@@ -33,6 +33,7 @@ Key design decisions:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -57,13 +58,13 @@ class TokenBudgetConfig:
             raise ValueError(
                 f"cap_tokens must be > 0, got {self.cap_tokens}"
             )
-        if self.window_seconds <= 0:
+        if not math.isfinite(self.window_seconds) or self.window_seconds <= 0:
             raise ValueError(
-                f"window_seconds must be > 0, got {self.window_seconds}"
+                f"window_seconds must be finite and > 0, got {self.window_seconds}"
             )
-        if not (0.0 < self.soft_threshold <= 1.0):
+        if not math.isfinite(self.soft_threshold) or not (0.0 < self.soft_threshold <= 1.0):
             raise ValueError(
-                f"soft_threshold must be in (0.0, 1.0], got {self.soft_threshold}"
+                f"soft_threshold must be finite and in (0.0, 1.0], got {self.soft_threshold}"
             )
 
 

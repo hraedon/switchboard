@@ -1254,12 +1254,12 @@ async def handle_model_map_set(
         )
         return
     if not all(
-        isinstance(k, str) and isinstance(v, str)
+        isinstance(k, str) and isinstance(v, str) and v
         for k, v in aliases_raw.items()
     ):
         await send_json(
             send, 400,
-            {"error": "aliases must be an object of provider → string"},
+            {"error": "aliases must be a non-empty object of provider → non-empty string"},
             extra_headers=cors,
         )
         return

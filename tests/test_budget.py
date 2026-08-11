@@ -38,6 +38,18 @@ class TestTokenBudgetConfig:
         with pytest.raises(ValueError, match="soft_threshold"):
             TokenBudgetConfig(cap_tokens=100, soft_threshold=1.5)
 
+    def test_nan_window_rejected(self) -> None:
+        with pytest.raises(ValueError, match="window_seconds"):
+            TokenBudgetConfig(cap_tokens=100, window_seconds=float("nan"))
+
+    def test_inf_window_rejected(self) -> None:
+        with pytest.raises(ValueError, match="window_seconds"):
+            TokenBudgetConfig(cap_tokens=100, window_seconds=float("inf"))
+
+    def test_nan_soft_threshold_rejected(self) -> None:
+        with pytest.raises(ValueError, match="soft_threshold"):
+            TokenBudgetConfig(cap_tokens=100, soft_threshold=float("nan"))
+
 
 class TestComputeUtilization:
     def test_own_only(self) -> None:
