@@ -1055,6 +1055,17 @@ function renderModelAddForm(knownProviders, editModelName, editAliases) {
       errEl.textContent = 'fill in at least one provider alias';
       return;
     }
+    // Editing: clearing an alias removes that provider from the model
+    // (the POST replaces the whole set) — destructive with no undo, so it
+    // gets the same confirm() as the sibling delete actions.
+    if (editing && editAliases) {
+      const removed = Object.keys(editAliases).filter(p => !(p in aliases));
+      if (removed.length && !confirm(
+            'Remove ' + removed.join(', ') + ' from ' + editModelName + '? '
+            + 'Cleared aliases are deleted from the mapping.')) {
+        return;
+      }
+    }
     try {
       const resp = await fetch('/admin/model-map', {
         method: 'POST',
