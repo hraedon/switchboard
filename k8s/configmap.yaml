@@ -74,7 +74,7 @@ data:
     type = "generic"
     target = 4
     api_key_env = "SWITCHBOARD_OPENCODE_GO_KEY"
-    dashboard_url = "https://usage.k8s.hraedon.com"
+    dashboard_url = "http://usage-dashboard-server.usage-dashboard.svc.cluster.local:8080"
     dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"
     dashboard_provider = "opencode"
     dashboard_stale_ttl = 2700
@@ -84,7 +84,7 @@ data:
     type = "generic"
     target = 4
     api_key_env = "SWITCHBOARD_OLLAMA_CLOUD_KEY"
-    dashboard_url = "https://usage.k8s.hraedon.com"
+    dashboard_url = "http://usage-dashboard-server.usage-dashboard.svc.cluster.local:8080"
     dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"
     dashboard_provider = "ollama"
     dashboard_stale_ttl = 2700
@@ -94,7 +94,7 @@ data:
     type = "generic"
     target = 2
     api_key_env = "SWITCHBOARD_ZAI_KEY"
-    dashboard_url = "https://usage.k8s.hraedon.com"
+    dashboard_url = "http://usage-dashboard-server.usage-dashboard.svc.cluster.local:8080"
     dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"
     dashboard_provider = "zai"
     dashboard_stale_ttl = 2700

@@ -698,11 +698,19 @@ per logged decision.
 Per provider, all three keys (plus the Secret entry):
 
 ```toml
-dashboard_url = "https://usage.k8s.hraedon.com"
+dashboard_url = "https://usage.k8s.hraedon.com"   # from OUTSIDE the cluster
 dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"
 dashboard_provider = "zai"        # the DASHBOARD's id, not the route key
 dashboard_stale_ttl = 2700        # dashboard refetch cadence stretches ~30 min
 ```
+
+**In-cluster pods must use the Service URL instead** —
+`http://usage-dashboard-server.usage-dashboard.svc.cluster.local:8080` — the
+ingress hostname hairpins onto traefik's default self-signed certificate from
+inside the cluster, every fetch fails TLS verification, and (since the
+advisory boot-fail-closed rule) a provider whose ONLY truth source never
+succeeds sits unready with a closed gate. Observed live on the 026 rollout:
+the pod ran but /readyz held at 503 until the URL was switched.
 
 `dashboard_provider` maps the route key to the dashboard's own provider id
 (`zai` / `ollama` / `opencode` / `codex` / `claude`); without it the lookup
