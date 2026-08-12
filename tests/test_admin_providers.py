@@ -330,6 +330,65 @@ async def test_create_stored_key_masked_in_response() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_with_peak_windows_and_dashboard_provider() -> None:
+    """Plan 025: the new fields flow body → store → live context. The built
+    context carries PARSED windows (routing demotion is armed immediately,
+    not only after a restart), and the masked response echoes both fields."""
+    mgr = ProviderManager({})
+    store = ConfigStoreManager()
+    scope = _make_scope("POST", headers=_admin_headers())
+    body_in = json.dumps({
+        "name": "zai-like",
+        "upstream": "https://z.example.com/v4",
+        "provider_type": "generic",
+        "target": 2,
+        "key_mode": "stored",
+        "api_key_stored": SENTINEL_STORE,
+        "dashboard_provider": "zai",
+        "peak_windows": ["mon-fri 14:00-18:00 +08:00"],
+    }).encode()
+    status, body = await _invoke(
+        "create", admin_token=ADMIN_TOKEN, scope=scope,
+        mgr=mgr, store=store, body=body_in,
+    )
+    try:
+        assert status == 200
+        data = json.loads(body)
+        assert data["dashboard_provider"] == "zai"
+        assert data["peak_windows"] == ["mon-fri 14:00-18:00 +08:00"]
+        (w,) = mgr.providers["zai-like"].peak_windows
+        assert w.utc_offset_minutes == 480
+    finally:
+        await mgr.remove("zai-like")
+        await mgr.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_create_bad_peak_window_400_and_store_untouched() -> None:
+    """A bad window spec is refused at create time, naming the spec."""
+    mgr = ProviderManager({})
+    store = ConfigStoreManager()
+    scope = _make_scope("POST", headers=_admin_headers())
+    body_in = json.dumps({
+        "name": "badwin",
+        "upstream": "https://b.example.com",
+        "provider_type": "generic",
+        "target": 1,
+        "key_mode": "passthrough",
+        "peak_windows": ["whenever it is cheap"],
+    }).encode()
+    status, body = await _invoke(
+        "create", admin_token=ADMIN_TOKEN, scope=scope,
+        mgr=mgr, store=store, body=body_in,
+    )
+    assert status == 400
+    assert b"peak window" in body
+    assert store.get("badwin") is None
+    assert "badwin" not in mgr.providers
+    await mgr.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_create_unset_api_key_env_400_and_store_untouched(
     monkeypatch,
 ) -> None:

@@ -143,6 +143,11 @@ class ProviderState:
     # Seconds until the weekly quota window resets (Plan 020 D6). None =
     # unknown. The pace surplus formula uses this to compute the expected
     # burn-down against a nominal ``burn_rate_per_day``.
+    in_peak: bool = False
+    # True when the provider is inside a configured peak-pricing window
+    # (Plan 025). Computed by the shell (switchboard.peak evaluated against
+    # the wall clock in snapshot_provider_state) — the pure core never reads
+    # a clock. Demotes like the trailing-24h signal: expensive, not broken.
 
 
 @dataclass(frozen=True)
@@ -943,7 +948,7 @@ def route_decision(
                 and state.token_utilization
                 >= budget_threshold
             )
-            # Plan 013: trailing-24h usage — the ONE proactive signal that
+            # Plan 013: trailing-24h usage — a proactive signal that
             # may demote the primary (no `not is_primary` guard).  Demotion
             # de-prefers only: the primary stays queue-eligible backstop.
             over_24h = (
@@ -952,7 +957,13 @@ def route_decision(
                 and math.isfinite(state.usage_24h_utilization)
                 and state.usage_24h_utilization >= config.usage_24h_threshold
             )
-            if low_headroom or over_budget or over_24h:
+            # Plan 025: peak-pricing window. Like over_24h it may demote the
+            # primary — expensive is expensive regardless of table position —
+            # and like every demotion it de-prefers only: the provider stays
+            # a queue backstop and the terminal fallback. Demotion happens
+            # before strategy ordering, so an in-peak provider never enters
+            # the pace surplus race.
+            if low_headroom or over_budget or over_24h or state.in_peak:
                 queue_eligible.append(name)
             elif state.availability == Availability.AVAILABLE:
                 immediate.append(name)

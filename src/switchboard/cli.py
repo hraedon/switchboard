@@ -153,6 +153,23 @@ def _validate_provider_config(
             f"provider '{name}': dashboard_provider must be a non-empty string"
         )
 
+    peak_windows = cfg.get("peak_windows")
+    if peak_windows is not None:
+        if not isinstance(peak_windows, list) or not all(
+            isinstance(w, str) for w in peak_windows
+        ):
+            errors.append(
+                f"provider '{name}': peak_windows must be a list of window "
+                'strings, e.g. ["mon-fri 14:00-18:00 +08:00"]'
+            )
+        else:
+            from switchboard.peak import parse_peak_windows
+
+            try:
+                parse_peak_windows(peak_windows)
+            except ValueError as exc:
+                errors.append(f"provider '{name}': {exc}")
+
     for key in ("direct_usage_stale_ttl", "direct_usage_poll_interval"):
         val = cfg.get(key)
         if val is not None and (
