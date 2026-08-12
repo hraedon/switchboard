@@ -37,6 +37,7 @@ def _state(
     usage_24h_utilization: float | None = None,
     weekly_remaining_fraction: float | None = None,
     weekly_reset_in: float | None = None,
+    in_peak: bool = False,
 ) -> ProviderState:
     return ProviderState(
         name=name,
@@ -53,6 +54,7 @@ def _state(
         usage_24h_utilization=usage_24h_utilization,
         weekly_remaining_fraction=weekly_remaining_fraction,
         weekly_reset_in=weekly_reset_in,
+        in_peak=in_peak,
     )
 
 
@@ -2130,6 +2132,79 @@ def test_pace_post_dwell_conversation_pin_still_holds() -> None:
     )
     assert plan.immediate_candidates[0] == "ollama"
     assert plan.reason == "affinity_pinned"
+
+
+def test_in_peak_demotes_non_primary() -> None:
+    """Plan 025: an in-peak provider is demoted from immediate to the queue
+    tier — expensive, not broken, so it stays a backstop."""
+    states = {
+        "umans": _state("umans"),
+        "ollama": _state("ollama", in_peak=True),
+    }
+    plan = route_decision(states, TABLE, "any_key", CONFIG, now=0.0)
+    assert "ollama" not in plan.immediate_candidates
+    assert plan.immediate_candidates == ("umans",)
+    # Standard demotion semantics: the demoted provider IS the queue tier —
+    # it serves only after immediate acquisition on cheaper candidates fails.
+    assert plan.queue_candidate == "ollama"
+
+
+def test_in_peak_demotes_primary_too() -> None:
+    """Peak may demote the primary (like the 24h signal): expensive is
+    expensive regardless of table position. The demoted primary keeps the
+    queue backstop and terminal fallback."""
+    states = {
+        "umans": _state("umans", in_peak=True),
+        "ollama": _state("ollama"),
+    }
+    plan = route_decision(states, TABLE, "any_key", CONFIG, now=0.0)
+    assert plan.immediate_candidates == ("ollama",)
+    assert plan.queue_candidate == "umans"
+    assert plan.terminal_fallback == "umans"
+
+
+def test_in_peak_provider_still_serves_when_alone() -> None:
+    """Demotion is not exclusion: with nothing cheaper available, the
+    in-peak provider takes the request via the queue path."""
+    states = {
+        "umans": _state("umans", availability=Availability.CLOSED),
+        "ollama": _state("ollama", in_peak=True),
+    }
+    plan = route_decision(states, TABLE, "any_key", CONFIG, now=0.0)
+    assert plan.immediate_candidates == ()
+    assert plan.queue_candidate == "ollama"
+
+
+def test_pace_never_fronts_in_peak_provider() -> None:
+    """Peak x pace: the demotion runs before strategy ordering, so an
+    in-peak provider never enters the surplus race — even with the best
+    surplus on the board."""
+    config = RoutingConfig(strategy=RoutingStrategy.PACE)
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    states = {
+        "zai": _state(
+            "zai",
+            weekly_remaining_fraction=0.95,
+            weekly_reset_in=3600.0,
+            in_peak=True,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.30, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    assert plan.immediate_candidates == ("ollama",)
+    assert plan.queue_candidate == "zai"
+
+    # Off-peak, the same surplus fronts zai.
+    states["zai"] = _state(
+        "zai",
+        weekly_remaining_fraction=0.95,
+        weekly_reset_in=3600.0,
+        in_peak=False,
+    )
+    plan = route_decision(states, table, "k", config, now=100.0)
+    assert plan.immediate_candidates[0] == "zai"
 
 
 def test_pace_strategy_default_is_ordered() -> None:

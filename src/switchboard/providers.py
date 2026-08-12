@@ -23,6 +23,8 @@ from switchboard.control import Availability, ProviderState, SignalFreshness
 from switchboard.dashboard import DashboardTruthSource
 from switchboard.gate import PermitGate
 from switchboard.limit import BreakerConfig
+from switchboard.peak import PeakWindow, parse_peak_windows
+from switchboard.peak import in_peak as _peak_in_peak
 from switchboard.reconcile import ReconciliationLoop
 from switchboard.truth import (
     Provider,
@@ -68,6 +70,10 @@ class ProviderContext:
     #: Prefix applied to the credential — "Bearer " for authorization,
     #: usually empty for x-api-key.
     auth_prefix: str = "Bearer "
+    #: Parsed peak-pricing windows (Plan 025). Empty = no peak pricing.
+    #: snapshot_provider_state evaluates these against the wall clock to set
+    #: ProviderState.in_peak; the routing core never reads a clock.
+    peak_windows: tuple[PeakWindow, ...] = ()
 
 
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
@@ -99,6 +105,7 @@ def build_provider_context(
     direct_usage_cookie: str = "",
     direct_usage_stale_ttl: float = 900.0,
     direct_usage_poll_interval: float = 30.0,
+    peak_windows: tuple[PeakWindow, ...] = (),
 ) -> ProviderContext:
     """Construct a :class:`ProviderContext` from the vendored building blocks.
 
@@ -221,6 +228,7 @@ def build_provider_context(
             if auth_prefix is not None
             else ("Bearer " if auth_header_name.lower() == "authorization" else "")
         ),
+        peak_windows=peak_windows,
     )
 
 
@@ -335,6 +343,24 @@ def build_provider_contexts_from_config(
 
         poll_interval_idle = _optional_float(provider_cfg, "poll_interval_idle")
 
+        # Peak-pricing windows (Plan 025). A bad spec fails construction with
+        # the provider and spec named — a window that silently didn't parse
+        # would mean burning quota at the expensive rate with no sign why.
+        peak_windows: tuple[PeakWindow, ...] = ()
+        raw_windows = provider_cfg.get("peak_windows")
+        if raw_windows is not None:
+            if not isinstance(raw_windows, list) or not all(
+                isinstance(w, str) for w in raw_windows
+            ):
+                raise ValueError(
+                    f"provider '{name}': peak_windows must be a list of "
+                    "window strings, e.g. [\"mon-fri 14:00-18:00 +08:00\"]"
+                )
+            try:
+                peak_windows = parse_peak_windows(raw_windows)
+            except ValueError as exc:
+                raise ValueError(f"provider '{name}': {exc}") from None
+
         history_store: HistoryStore | None = None
         history: History | None = None
         if history_store_path:
@@ -372,6 +398,7 @@ def build_provider_contexts_from_config(
             direct_usage_cookie=direct_usage_cookie,
             direct_usage_stale_ttl=direct_usage_stale_ttl,
             direct_usage_poll_interval=direct_usage_poll_interval,
+            peak_windows=peak_windows,
         )
 
     return contexts
@@ -506,6 +533,12 @@ def snapshot_provider_state(
     if usage_history_tracker is not None:
         usage_24h_utilization = usage_history_tracker.utilization(name)
 
+    # Peak-pricing window (Plan 025). The wall-clock read lives HERE, in the
+    # shell — the routing core receives the boolean and stays clock-free.
+    provider_in_peak = bool(ctx.peak_windows) and _peak_in_peak(
+        ctx.peak_windows, _time.time()
+    )
+
     return ProviderState(
         name=name,
         availability=availability,
@@ -520,6 +553,7 @@ def snapshot_provider_state(
         usage_24h_utilization=usage_24h_utilization,
         weekly_remaining_fraction=weekly_remaining_fraction,
         weekly_reset_in=weekly_reset_in,
+        in_peak=provider_in_peak,
     )
 
 

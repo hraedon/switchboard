@@ -121,6 +121,26 @@ def _direct_usage_health(ctx: ProviderContext) -> dict[str, Any]:
     }
 
 
+def _peak_status(ctx: ProviderContext) -> dict[str, Any]:
+    """Peak-window state for a provider with windows configured, else {}.
+
+    Absent block = no peak pricing configured, so the dashboard renders no
+    badge rather than a permanent "off-peak" (Plan 025).
+    """
+    if not ctx.peak_windows:
+        return {}
+    from switchboard.peak import in_peak, next_boundary
+
+    now = time.time()
+    return {
+        "peak": {
+            "in_peak": in_peak(ctx.peak_windows, now),
+            "boundary_epoch": next_boundary(ctx.peak_windows, now),
+            "windows": [w.spec for w in ctx.peak_windows],
+        }
+    }
+
+
 def _provider_status(
     ctx: ProviderContext,
     overload_tracker: Any | None = None,
@@ -179,6 +199,9 @@ def _provider_status(
         "weekly_reset_epoch": (
             reading.weekly_reset_epoch if reading else None
         ),
+        # Peak-pricing window state (Plan 025). Absent block = no windows
+        # configured; boundary_epoch feeds the card's countdown.
+        **_peak_status(ctx),
         # Direct usage solicitation health (Plan 022 WI-3). Absent for
         # providers not using it. `parse_failures` rising means the vendor
         # surface changed shape and this provider's weekly signal is gone —
