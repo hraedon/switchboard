@@ -555,6 +555,206 @@ check('Add-after-edit POSTs (not a stale PUT to the edited provider)',
       && !fetchCalls.some(c => c.url === '/admin/providers/umans'),
       fetchCalls.map(c => c.url));
 
+// --- 21. ADD FORM: credential mode selector (Plan 025) ---------------------
+resetFormEls();
+responsesByUrl = {};
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+setEditing(true);
+vm.runInContext('editingProviderName = null;', sandbox);
+sandbox.renderProviderForm();
+check('add form renders the credential mode selector',
+      $('add-provider').innerHTML.includes('id="pf-key-mode"'));
+check('add form defaults the selector to env',
+      $('pf-key-mode').value === 'env', $('pf-key-mode').value);
+
+// Switch to stored: the cred block rewrites to the paste-key input.
+$('pf-key-mode').value = 'stored';
+$('pf-key-mode').onchange();
+check('stored mode rewrites the cred block with a key input',
+      $('pf-cred-block').innerHTML.includes('id="pf-key-new"'),
+      $('pf-cred-block').innerHTML.slice(0, 200));
+
+// Saving stored mode without a key is caught client-side.
+$('pf-name').value = 'newpaid';
+$('pf-base').value = 'https://np.example/v1';
+fetchCalls = [];
+await sandbox._saveProvider();
+check('add stored without a key does not POST',
+      !fetchCalls.some(c => c.url === '/admin/providers'));
+check('add stored without a key shows a message',
+      /API key/i.test($('pf-error').textContent), $('pf-error').textContent);
+
+// With a key typed, the POST carries key_mode stored + the credential.
+$('pf-key-new').value = 'sk-brandnew';
+fetchCalls = [];
+await sandbox._saveProvider();
+const addStored = fetchCalls.find(c => c.url === '/admin/providers');
+const addStoredBody = addStored ? JSON.parse(addStored.opts.body) : {};
+check('add with pasted key POSTs key_mode stored',
+      addStoredBody.key_mode === 'stored'
+      && addStoredBody.api_key_stored === 'sk-brandnew',
+      addStored && addStored.opts.body);
+
+// --- 22. ADD FORM: explicit passthrough mode --------------------------------
+resetFormEls();
+setEditing(true);
+vm.runInContext('editingProviderName = null;', sandbox);
+sandbox.renderProviderForm();
+$('pf-name').value = 'pt';
+$('pf-base').value = 'https://pt.example';
+$('pf-key-mode').value = 'passthrough';
+$('pf-key-mode').onchange();
+fetchCalls = [];
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await sandbox._saveProvider();
+const ptCall = fetchCalls.find(c => c.url === '/admin/providers');
+check('explicit passthrough POSTs key_mode passthrough',
+      ptCall && JSON.parse(ptCall.opts.body).key_mode === 'passthrough',
+      ptCall && ptCall.opts.body);
+
+// --- 23. EDIT FORM: switching modes (Plan 025) ------------------------------
+// env → stored without typing a key must be refused: there is no stored
+// copy to keep, so a blank save would strand the provider credential-less.
+resetFormEls();
+responsesByUrl = {};
+responsesByUrl['/admin/providers'] = {
+  ok: true, status: 200,
+  json: async () => ({
+    providers: [{
+      name: 'umans', upstream: 'https://u.example/v1', target: 3,
+      provider_type: 'generic', key_mode: 'env', api_key_env: 'UMANS_KEY',
+      auth_header: 'authorization', enabled: true,
+    }],
+  }),
+};
+responsesByUrl['/admin/config/effective'] = {
+  ok: true, status: 200,
+  json: async () => ({ providers: [{ name: 'umans', env_locked: [] }] }),
+};
+setEditing(false);
+await sandbox.editProvider('umans');
+check('edit form selector reflects the row mode',
+      $('pf-key-mode').value === 'env', $('pf-key-mode').value);
+$('pf-key-mode').value = 'stored';
+$('pf-key-mode').onchange();
+fetchCalls = [];
+responsesByUrl = {};
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await sandbox._saveProvider();
+check('mode switch to stored without a key does not PUT',
+      !fetchCalls.some(c => c.url === '/admin/providers/umans'));
+check('mode switch to stored without a key explains itself',
+      /stored mode/i.test($('pf-error').textContent), $('pf-error').textContent);
+// Typing the key completes the switch.
+$('pf-key-new').value = 'sk-switched';
+fetchCalls = [];
+await sandbox._saveProvider();
+const swCall = fetchCalls.find(c => c.url === '/admin/providers/umans');
+const swBody = swCall ? JSON.parse(swCall.opts.body) : {};
+check('mode switch to stored PUTs the new credential',
+      swBody.key_mode === 'stored' && swBody.api_key_stored === 'sk-switched',
+      swCall && swCall.opts.body);
+
+// --- 23b. EDIT FORM: switching to passthrough ------------------------------
+resetFormEls();
+responsesByUrl = {};
+responsesByUrl['/admin/providers'] = {
+  ok: true, status: 200,
+  json: async () => ({
+    providers: [{
+      name: 'umans', upstream: 'https://u.example/v1', target: 3,
+      provider_type: 'generic', key_mode: 'env', api_key_env: 'UMANS_KEY',
+      auth_header: 'authorization', enabled: true,
+    }],
+  }),
+};
+responsesByUrl['/admin/config/effective'] = {
+  ok: true, status: 200,
+  json: async () => ({ providers: [{ name: 'umans', env_locked: [] }] }),
+};
+setEditing(false);
+await sandbox.editProvider('umans');
+$('pf-key-mode').value = 'passthrough';
+$('pf-key-mode').onchange();
+fetchCalls = [];
+responsesByUrl = {};
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await sandbox._saveProvider();
+const pdCall = fetchCalls.find(c => c.url === '/admin/providers/umans');
+check('mode switch to passthrough PUTs key_mode passthrough',
+      pdCall && JSON.parse(pdCall.opts.body).key_mode === 'passthrough',
+      pdCall && pdCall.opts.body);
+
+// --- 24. EDIT FORM: dashboard_provider + peak_windows round-trip ------------
+resetFormEls();
+responsesByUrl = {};
+responsesByUrl['/admin/providers'] = {
+  ok: true, status: 200,
+  json: async () => ({
+    providers: [{
+      name: 'zai', upstream: 'https://z.example/v4', target: 2,
+      provider_type: 'generic', key_mode: 'env', api_key_env: 'ZAI_KEY',
+      auth_header: 'authorization', enabled: true,
+      dashboard_provider: 'zai',
+      peak_windows: ['mon-fri 14:00-18:00 +08:00'],
+    }],
+  }),
+};
+responsesByUrl['/admin/config/effective'] = {
+  ok: true, status: 200,
+  json: async () => ({ providers: [{ name: 'zai', env_locked: [] }] }),
+};
+setEditing(false);
+await sandbox.editProvider('zai');
+check('edit form prefills dashboard_provider',
+      $('pf-dashboard-provider').value === 'zai', $('pf-dashboard-provider').value);
+check('edit form prefills peak windows one per line',
+      $('pf-peak-windows').value === 'mon-fri 14:00-18:00 +08:00',
+      $('pf-peak-windows').value);
+// Add a second window and save: both are sent as a list.
+$('pf-peak-windows').value = 'mon-fri 14:00-18:00 +08:00\ndaily 08:00-22:00 +08:00';
+fetchCalls = [];
+responsesByUrl = {};
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await sandbox._saveProvider();
+const zCall = fetchCalls.find(c => c.url === '/admin/providers/zai');
+const zBody = zCall ? JSON.parse(zCall.opts.body) : {};
+check('PUT carries dashboard_provider',
+      zBody.dashboard_provider === 'zai', zCall && zCall.opts.body);
+check('PUT carries peak_windows as a list',
+      JSON.stringify(zBody.peak_windows) ===
+        JSON.stringify(['mon-fri 14:00-18:00 +08:00', 'daily 08:00-22:00 +08:00']),
+      zCall && zCall.opts.body);
+
+// --- 25. provider card renders the peak badge -------------------------------
+nextResponse = {
+  ok: true, status: 200,
+  json: async () => ({
+    providers: {
+      zai: {
+        gate_closed_reason: 'open', effective_permits: 2, in_flight: 0,
+        queue_depth: 0, ready: true, total_429s: 0,
+        total_requests_forwarded: 1,
+        peak: {
+          in_peak: true,
+          boundary_epoch: Date.now() / 1000 + 3600,
+          windows: ['mon-fri 14:00-18:00 +08:00'],
+        },
+      },
+    },
+    route_table: { default: ['zai'] },
+  }),
+};
+vm.runInContext('editingProvider = false; scanPinned = false; editingModel = false;', sandbox);
+await sandbox.load();
+const appView = $('app').innerHTML;
+check('in-peak provider card shows the peak badge',
+      /badge saturated[^>]*>peak</.test(appView), appView.slice(0, 400));
+check('peak section shows the demoted state',
+      /in peak \(demoted\)/.test(appView));
+check('peak section shows the window spec',
+      appView.includes('mon-fri 14:00-18:00 +08:00'));
+
 // --- report ---------------------------------------------------------------
 let failed = 0;
 for (const r of results) {

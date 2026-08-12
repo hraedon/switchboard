@@ -142,9 +142,9 @@ precedence unchanged).
   the var name; switching to `passthrough` is a one-click downgrade with the
   warning inline. Staying in `stored` keeps the existing write-only
   leave-blank-to-keep behaviour.
-- Edit (and Add's advanced rows) expose `dashboard_provider` and
-  `peak_windows` (one spec per line in a textarea-like input; sent as a
-  list).
+- Edit exposes `dashboard_provider` and `peak_windows` (one spec per line
+  in a textarea; sent as a list — emptying it clears the row's windows).
+  Add stays a quick form: create, then Edit for the advanced fields.
 - Provider cards show a `peak` badge with the boundary countdown when the
   provider has windows configured (`peak (ends 2h 10m)` / `off-peak (peak in
   3h)`), fed by two new per-provider status fields.
