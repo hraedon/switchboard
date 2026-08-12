@@ -34,6 +34,8 @@ from switchboard.config_reset import (
 )
 from switchboard.config_store import ConfigStoreManager
 from switchboard.control import MUTABLE_ROUTING_FIELDS as _MUTABLE_ROUTING_FIELDS
+from switchboard.control import RETIRED_ROUTING_FIELDS as _RETIRED_ROUTING_FIELDS
+from switchboard.control import retired_routing_field_message
 from switchboard.session import (
     SESSION_COOKIE,
     LoginThrottle,
@@ -1389,7 +1391,7 @@ async def handle_route_plan(
     admin_token: str | None,
     cors_allow_origin: str | None = None,
 ) -> None:
-    """GET /admin/route-plan?model=<m>&key=<raw-key> — explain the decision.
+    """GET /admin/route-plan?model=<m> (+ ``x-route-plan-key``) — explain it.
 
     Plan 026 W1.4. The operator's question is "who would serve model X right
     now, and why". Before this, answering it meant re-deriving the decision by
@@ -1405,11 +1407,23 @@ async def handle_route_plan(
 
     The raw key is accepted so an operator can ask about a *specific* client's
     route. switchboard never echoes, logs, or stores it — the response reports
-    only whether a keyed entry matched. **Caution:** it travels in the query
-    string, and uvicorn's access log records query strings, so an operator who
-    passes ``key=`` on a deployment with access logging on writes that key to
-    the log. Omit it unless you are asking about a keyed route specifically;
-    the dashboard never sends it.
+    only whether a keyed entry matched.
+
+    Two ways to pass it, and they are not equivalent:
+
+    * ``x-route-plan-key: <raw-key>`` — **preferred.** Request headers are not
+      recorded by uvicorn's access log, so the key does not end up on disk
+      through the one path switchboard does not control.
+    * ``?key=<raw-key>`` — kept for curl convenience, but query strings *are*
+      access-logged, so a deployment with access logging on writes the key to
+      the log. Prefer the header; omit either unless you are actually asking
+      about a keyed route.
+
+    When both are present the header wins — the caller who set a header
+    deliberately chose the non-logging path, and silently preferring the
+    logged value would defeat it.
+
+    The dashboard's Routing Explain card sends neither.
     """
     cors = cors_extra_headers(cors_allow_origin, None)
     if admin_token and not check_admin_auth(scope, admin_token):
@@ -1419,7 +1433,15 @@ async def handle_route_plan(
     raw_qs = scope.get("query_string") or b""
     qs = parse_qs(raw_qs.decode("utf-8", "replace"))
     model = (qs.get("model") or [""])[0] or None
-    raw_key = (qs.get("key") or [""])[0] or None
+    header_key = next(
+        (
+            v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+            if k == b"x-route-plan-key"
+        ),
+        "",
+    )
+    raw_key = header_key or ((qs.get("key") or [""])[0] or None) or None
 
     try:
         snap = proxy_app.snapshot_route_plan(model=model, raw_key=raw_key)
@@ -1594,14 +1616,18 @@ async def handle_routing_config_update(
     Mutable fields: ``strategy``, ``pace_burn_rate_per_day``, ``pace_flap_margin``,
     ``dwell_interval``, ``failback_delay``, ``headroom_threshold``,
     ``headroom_ranking``, ``token_budget_threshold``, ``usage_24h_threshold``,
-    ``opportunistic_enabled``, ``opportunistic_min_headroom``,
-    ``opportunistic_reset_window``, ``opportunistic_margin``,
     ``quarantine_threshold``.
 
     NOT mutable: ``affinity_max_entries`` (resizing the live table would evict
     active pins), ``pin_conversations`` (requires a body-buffering restart to
     take effect safely), ``failover_threshold_seconds``/``failover_margin``
     (retained for display only).
+
+    RETIRED (400, with the reason and the replacement): the ``opportunistic_*``
+    fields — Plan 026 removed opportunistic quota burn from the decision. A
+    config file or a stored overlay still parses them, because a retired
+    preference must not cost a boot, but a *write* is refused: this is the
+    surface where the error reaches a human who can stop relying on it.
     """
     from switchboard.control import (
         RoutingConfig,
@@ -1705,9 +1731,14 @@ async def handle_routing_config_update(
             "are mutually exclusive — use strategy alone"
         )
 
-    # Reject immutable / display-only fields and unknown keys
+    # Reject retired, immutable / display-only, and unknown keys. Retired is
+    # checked first and answers with its own message: "not mutable at runtime —
+    # restart to change" would tell an operator to restart into a mechanism that
+    # no longer exists.
     for key in payload:
-        if key not in _MUTABLE_ROUTING_FIELDS:
+        if key in _RETIRED_ROUTING_FIELDS:
+            errors.append(retired_routing_field_message(key))
+        elif key not in _MUTABLE_ROUTING_FIELDS:
             errors.append(
                 f"{key} is not mutable at runtime — restart to change"
             )

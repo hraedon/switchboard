@@ -55,7 +55,9 @@ class RoutingStrategy(Enum):
     """How to order immediate candidates (Plan 020 Wave 4, D5).
 
     * ``ORDERED`` — table order (default, current behavior). The primary fronts
-      unless an affinity pin or opportunistic burn overrides it.
+      unless an affinity pin overrides it. Fronting the primary is *ordered's
+      own ranking*, not a universal law: post-dwell failback and failback
+      hysteresis apply here and only here (Plan 026 W2.1).
     * ``HEADROOM`` — order by ``usage_headroom`` descending (Plan 015). Data-
       bearing candidates precede ones without headroom data; ties break on
       table order. Same as ``headroom_ranking = True``.
@@ -240,11 +242,18 @@ class RoutingConfig:
     # apply to this signal).
     opportunistic_enabled: bool = False
     opportunistic_min_headroom: float = 0.5
-    # only when >= half the window remains
     opportunistic_reset_window: float = 21600.0
-    # seconds; only inside the last 6 h
     opportunistic_margin: float = 0.10
-    # winner must lead the runner-up by this
+    # RETIRED by Plan 026 W2.2 — the four ``opportunistic_*`` fields are read
+    # but have no effect.  Opportunistic quota burn (Plan 016) is superseded by
+    # ``strategy = "pace"``, which ranks the IMMEDIATE tier on the *weekly*
+    # quota surplus instead of guessing from a session-window reset: 016's
+    # reset-window heuristic actively favoured the expensive provider (a ~5 h
+    # session reset always sits inside the 6 h burn window), and pace expresses
+    # the same use-it-or-lose-it philosophy as an ordering rather than an
+    # exception.  They stay on the dataclass so an old TOML file or a stored
+    # overlay row loads without error — a retired preference must never cost a
+    # boot (see :data:`RETIRED_ROUTING_FIELDS`).
     pin_conversations: bool = False
     # When True, the proxy pins each conversation (by a fingerprint of its
     # first user message) to the selected provider and does NOT fail back to
@@ -347,8 +356,9 @@ ROUTING_STRATEGIES: tuple[str, ...] = tuple(s.value for s in RoutingStrategy)
 # are reported.  Everything else in RoutingConfig is rejected at runtime:
 # ``affinity_max_entries`` (resizing the live table would evict active pins),
 # ``pin_conversations`` (it decides whether the proxy buffers request bodies,
-# which is a startup decision), and ``failover_threshold_seconds`` /
-# ``failover_margin`` (retained for display only).
+# which is a startup decision), ``failover_threshold_seconds`` /
+# ``failover_margin`` (retained for display only), and the retired
+# ``opportunistic_*`` fields (:data:`RETIRED_ROUTING_FIELDS`).
 MUTABLE_ROUTING_FIELDS: tuple[str, ...] = (
     "strategy",
     "pace_burn_rate_per_day",
@@ -359,12 +369,39 @@ MUTABLE_ROUTING_FIELDS: tuple[str, ...] = (
     "headroom_ranking",
     "token_budget_threshold",
     "usage_24h_threshold",
+    "quarantine_threshold",
+)
+
+#: Fields a plan removed from the decision but not from the dataclass
+#: (Plan 026 W2.2).  Retirement is deliberately *not* deletion: an operator's
+#: TOML file and the persisted routing overlay both outlive the mechanism they
+#: configured, and failing a boot — or a whole config-validate — over a knob
+#: that is now merely pointless would trade an availability incident for a
+#: tidiness gain.  So a retired field stays parseable and stays on
+#: :class:`RoutingConfig`, is announced once at boot when it is set to
+#: something that used to do work, and is refused by the *write* surface, where
+#: an error reaches a human who can act on it.
+RETIRED_ROUTING_FIELDS: tuple[str, ...] = (
     "opportunistic_enabled",
     "opportunistic_min_headroom",
     "opportunistic_reset_window",
     "opportunistic_margin",
-    "quarantine_threshold",
 )
+
+
+def retired_routing_field_message(field: str) -> str:
+    """Why writing ``field`` is refused, and what to do instead.
+
+    One wording, used by every surface that rejects a retired field, so the
+    operator who scripted a ``PUT`` against Plan 016's knobs learns the same
+    thing the boot log tells them.
+    """
+    return (
+        f"{field} is retired (Plan 026): opportunistic quota burn was removed "
+        f'from the routing decision — use strategy = "pace", which ranks on '
+        f"the weekly quota surplus. Config files and stored overlays still "
+        f"parse the field, but it has no effect."
+    )
 
 
 def validate_routing_field(field: str, value: object) -> str | None:
@@ -772,66 +809,6 @@ def pace_rank(
     return changed
 
 
-def _opportunistic_target(
-    immediate: list[str],
-    primary: str,
-    states: dict[str, ProviderState],
-    config: RoutingConfig,
-) -> str | None:
-    """Select an opportunistic quota-burn target, or None.
-
-    A candidate qualifies when it is not the primary, is in ``immediate``
-    (therefore FRESH and AVAILABLE), reports measured headroom above the
-    configured floor, and reports a quota reset within the burn window.
-    The best qualifier wins only if it leads the runner-up by the configured
-    margin (a single qualifier needs no margin).  Ties break on ``immediate``
-    order (table order after ranking).
-    """
-    if not config.opportunistic_enabled:
-        return None
-
-    qualifiers: list[tuple[str, float]] = []
-    for name in immediate:
-        if name == primary:
-            continue
-        state = states.get(name)
-        if state is None:
-            continue
-        headroom = state.usage_headroom
-        if (
-            headroom is None
-            or not math.isfinite(headroom)
-            or headroom < config.opportunistic_min_headroom
-        ):
-            continue
-        resets_in = state.quota_resets_in
-        if (
-            resets_in is None
-            or not math.isfinite(resets_in)
-            or not (0.0 < resets_in <= config.opportunistic_reset_window)
-        ):
-            continue
-        qualifiers.append((name, headroom))
-
-    if not qualifiers:
-        return None
-
-    # argmax headroom; deterministic tiebreak: earlier in immediate order.
-    order = {name: idx for idx, name in enumerate(immediate)}
-
-    def _sort_key(item: tuple[str, float]) -> tuple[float, int]:
-        return (-item[1], order[item[0]])
-
-    qualifiers.sort(key=_sort_key)
-    best_name, best_headroom = qualifiers[0]
-    if len(qualifiers) == 1:
-        return best_name
-    runnerup_headroom = qualifiers[1][1]
-    if best_headroom - runnerup_headroom >= config.opportunistic_margin:
-        return best_name
-    return None
-
-
 # ── The routing pipeline (Plan 026) ───────────────────────────────────────
 #
 # One staged pipeline with an explicit ranking contract, in place of ten
@@ -1150,6 +1127,26 @@ def _stage_rank(
     return pace_changed, scores
 
 
+def _ranks_immediate_tier(config: RoutingConfig) -> bool:
+    """Does the configured strategy impose its own IMMEDIATE-tier ranking?
+
+    True for ``headroom`` and ``pace`` (and for the legacy
+    ``headroom_ranking = True``, which *is* ``headroom``); False for
+    ``ordered``, whose ranking is table position — which is to say, the primary
+    first.
+
+    This is the predicate that bounds failback (Plan 026 W2.1).  Post-dwell
+    failback-to-primary and ``failback_delay`` hysteresis are ``ordered``'s
+    ranking asserting itself after a pin expires, not a universal law, so under
+    a ranking strategy an expired pin simply goes inert and stage 4's order
+    stands.  Written once, here, because the alternative is what Plan 026
+    exists to end: the same rule discovered separately for each strategy, as
+    happened when the leak was fixed for ``pace`` alone on 2026-08-11 and left
+    ``headroom`` carrying an identical copy of it.
+    """
+    return config.strategy != RoutingStrategy.ORDERED or config.headroom_ranking
+
+
 def _stage_stickiness(
     immediate: list[str],
     states: dict[str, ProviderState],
@@ -1165,8 +1162,14 @@ def _stage_stickiness(
     Promotes at most one provider to the front of the IMMEDIATE tier, and
     never moves anything across a tier boundary — a pinned provider that gets
     demoted is not in ``immediate``, so its pin has no effect automatically.
-    Also the home of Plan 016's opportunistic burn, which is subordinate to
-    any active pin.
+    That is the one law, and it is what makes a pin safe to hold: entering a
+    peak window, or crossing a budget threshold, revokes the pin's effect
+    without anything here having to know the signal exists.
+
+    Failback is tier-bounded *and* strategy-bounded (Plan 026 W2.1): dwell
+    holds a pin under every strategy, but what happens when dwell expires
+    depends on whether the strategy has a ranking of its own — see
+    :func:`_ranks_immediate_tier`.
 
     Mutates ``immediate`` in place; returns the affinity reason code (``""``
     when nothing overrode the ranking).
@@ -1190,19 +1193,20 @@ def _stage_stickiness(
             immediate.insert(0, affinity.provider)
             affinity_reason = "affinity_dwell"
         elif (
-            config.strategy == RoutingStrategy.PACE
+            _ranks_immediate_tier(config)
             and not config.pin_conversations
         ):
-            # PACE: once dwell expires, the pin goes inert — neither
-            # failback-to-primary nor extended stickiness applies, because
-            # both would overwrite the surplus ordering _stage_rank just
-            # produced. Without this, every dwell expiry re-fronted the
-            # table primary (reason "primary_available"), so pace leaked one
-            # primary request per dwell interval per affinity key — a
-            # pin/failback cycle that diluted exactly the burn-surplus-first
-            # ordering the operator asked for. The primary is not privileged
-            # under PACE (see the opportunistic block below); it wins the
-            # front only on surplus.
+            # Under a RANKING strategy (pace / headroom), once dwell expires
+            # the pin goes inert — neither failback-to-primary nor extended
+            # stickiness applies, because both would overwrite the ordering
+            # _stage_rank just produced. Without this, every dwell expiry
+            # re-fronted the table primary (reason "primary_available"), so a
+            # ranking strategy leaked one primary request per dwell interval
+            # per affinity key — a pin/failback cycle that diluted exactly the
+            # ordering the operator asked for. It was fixed for pace on
+            # 2026-08-11 and headroom kept an identical copy of the bug;
+            # Plan 026 W2.1 states the rule once instead. The primary is not
+            # privileged by a ranking strategy: it wins the front on its score.
             pass
         elif primary in immediate and not config.pin_conversations:
             primary_clock = (
@@ -1234,8 +1238,8 @@ def _stage_stickiness(
     else:
         # Conversation pinning (Plan 019 §6): when a pin is active on the
         # *primary* (the if-block's `affinity.provider != primary` guard
-        # routed us here), hold it — do NOT let opportunistic quota-burn
-        # front a fallback and permanently migrate a pinned conversation.
+        # routed us here), hold it — so a ranking strategy cannot front a
+        # fallback and permanently migrate a pinned conversation.
         if (
             config.pin_conversations
             and affinity is not None
@@ -1244,31 +1248,23 @@ def _stage_stickiness(
             immediate.remove(affinity.provider)
             immediate.insert(0, affinity.provider)
             affinity_reason = "affinity_pinned"
-        elif config.strategy != RoutingStrategy.PACE:
-            # ORDERED / HEADROOM only: consider an opportunistic burn, and
-            # otherwise front the primary.
+        elif config.strategy != RoutingStrategy.PACE and primary in immediate:
+            # With no pin to honour, ORDERED fronts the primary because table
+            # position IS its ranking, and HEADROOM does too: Plan 015 ranks
+            # the *fallbacks* by headroom and leaves the primary in front
+            # (docs/routing-model.md §3.3), so headroom ranking decides where
+            # traffic goes only once the primary is unavailable.
             #
-            # PACE deliberately skips BOTH. _stage_rank has already ordered
-            # `immediate` by weekly quota surplus, which is Plan 016's
-            # use-it-or-lose-it philosophy promoted from an opportunistic
-            # exception to the primary ordering (Plan 020 D5). Re-fronting the
-            # primary here would undo exactly the ordering the operator asked
-            # for, and running opportunism on top would let a session-window
-            # signal override a weekly-window decision. So under PACE the
-            # primary can lose the front — it is NOT demoted (it stays
-            # immediate-eligible, queue backstop, and terminal fallback), but
-            # it is not privileged either. An affinity pin still outranks the
-            # ranking; that is handled above.
-            target = _opportunistic_target(
-                immediate, primary, states, config
-            )
-            if target is not None:
-                immediate.remove(target)
-                immediate.insert(0, target)
-                affinity_reason = "opportunistic"
-            elif primary in immediate:
-                immediate.remove(primary)
-                immediate.insert(0, primary)
+            # PACE deliberately skips it. _stage_rank has already ordered
+            # `immediate` by weekly quota surplus — Plan 016's use-it-or-lose-it
+            # philosophy promoted from an exception to the primary ordering
+            # (Plan 020 D5) — and re-fronting the primary here would undo
+            # exactly what the operator asked for. So under PACE the primary can
+            # lose the front. It is NOT demoted (it stays immediate-eligible,
+            # queue backstop, and terminal fallback), but it is not privileged
+            # either. An affinity pin still outranks the ranking; handled above.
+            immediate.remove(primary)
+            immediate.insert(0, primary)
 
     return affinity_reason
 
@@ -1362,7 +1358,7 @@ def route_decision(
        ``HEADROOM`` session headroom desc, ``PACE`` weekly surplus desc with
        its flap deadband).  QUEUE/BACKSTOP keep candidate order.
     5. **Stickiness** — :func:`_stage_stickiness`: affinity dwell, failback
-       hysteresis, conversation pins, opportunistic burn.  Fronts at most one
+       hysteresis, conversation pins.  Fronts at most one
        IMMEDIATE member; never crosses a tier boundary.  Then
        :func:`_stage_queue_candidate` picks at most one queue candidate.
     6. **Emit** — :func:`_stage_assess` attaches the per-candidate
@@ -1392,6 +1388,13 @@ def route_decision(
     * **Bounded stickiness** — after failover, the routing core prefers the
       affinity provider for at least ``dwell_interval`` seconds before
       considering failback to the primary.
+    * **Tier-bounded stickiness** — a pin promotes within a tier and never
+      across one, so a pinned provider that gets demoted (peak window, budget,
+      trailing-24h) loses the pin's effect with no signal-specific guard.
+    * **Failback belongs to ``ordered``** — post-dwell failback to the primary
+      and ``failback_delay`` hysteresis apply only under ``strategy =
+      "ordered"``, whose ranking they express; under ``headroom`` and ``pace``
+      an expired pin goes inert and the ranking stands (Plan 026 W2.1).
     * **Failback hysteresis** — when ``failback_delay > 0``, failback to the
       primary requires the primary to have been continuously FRESH+AVAILABLE
       for at least ``failback_delay`` seconds.  A single unhealthy poll resets
@@ -1400,10 +1403,6 @@ def route_decision(
       immediate candidates are ordered by ``usage_headroom`` descending before
       affinity/primary fronting; absence of data never outranks a measured
       provider.
-    * **Opportunistic quota burn (Plan 016)** — opt-in; subordinate to an
-      active affinity pin; de-preference only: the primary remains
-      immediate-eligible, queue backstop, and terminal fallback.  Stale or
-      unmeasured data never promotes.
     * **Self-explaining** — ``assessments`` carries ``(name, tier, signals,
       score, rank)`` per surviving candidate; ``reason`` is derived, and its
       strings are unchanged from before the pipeline existed.

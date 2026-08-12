@@ -481,7 +481,7 @@ preference. The default preserves the behaviour switchboard has always had.
 
 | Strategy | Behaviour |
 |---|---|
-| `ordered` (default) | Table order. The primary fronts unless an affinity pin or an opportunistic burn overrides it. |
+| `ordered` (default) | Table order. The primary fronts unless an affinity pin overrides it. Post-dwell failback to the primary and `failback_delay` hysteresis apply under this strategy **only** (Plan 026 W2.1); under `headroom` and `pace` an expired pin goes inert and the ranking stands. |
 | `headroom` | Order by `usage_headroom` descending (Plan 015) — the provider with the most remaining **session** headroom goes first. Equivalent to the older `headroom_ranking = true`; setting both is rejected. |
 | `pace` | Order by **weekly quota surplus** descending (Plan 020 D5). A provider that will not plausibly spend its remaining weekly quota before it resets has a positive surplus and is burned first — use it or lose it. |
 
@@ -505,6 +505,18 @@ Three properties matter when you are deciding whether to trust it:
   stays immediate-eligible, the queue backstop, and the terminal fallback.
 - **An affinity pin still wins.** Pace reorders candidates; it does not break
   conversation pinning or dwell.
+- **A pin that has expired does not.** Once `dwell_interval` passes, a pin under
+  `pace` or `headroom` goes inert and the ranking stands — there is no failback
+  to the primary and `failback_delay` does not apply (Plan 026 W2.1). Only
+  `ordered` fails back, because "primary first" is its ranking.
+
+**If your config still sets `opportunistic_*`:** those four fields are retired
+(Plan 026 W2.2) and do nothing. `pace` is the replacement — it is the same
+use-it-or-lose-it idea scored on the weekly window instead of guessing from a
+session-window reset, which in this estate systematically favoured the expensive
+provider. The fields still parse, so an old file or a stored overlay will not
+break a boot; boot logs one `RETIRED` warning when `opportunistic_enabled` is
+true, and `PUT /admin/config/routing` answers 400 if you try to set one.
 
 `pace_flap_margin` (default `0.05`) is a deadband: when the leader's surplus
 advantage over the runner-up is smaller than the margin, table order is kept

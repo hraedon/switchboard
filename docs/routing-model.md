@@ -73,7 +73,7 @@ rather than threading a new branch through the decision.
 | 2 | **Filter** | `_stage_filter` | hard constraints only, strictly subtractive: model servability (Plan 010), capability surfaces (Plan 008 §4). Quarantine (Plan 023) enters here too, expressed by the shell through `servable_providers` |
 | 3 | **Classify** | `_stage_classify` | every survivor gets exactly one tier; structurally unusable states (missing, `CLOSED`, UNKNOWN freshness) drop out; the signals that fired travel with the candidate |
 | 4 | **Rank** | `_stage_rank` | order the IMMEDIATE tier by the strategy's scoring key |
-| 5 | **Stickiness** | `_stage_stickiness` | affinity dwell, failback hysteresis, conversation pins, opportunistic burn; then `_stage_queue_candidate` picks at most one queue candidate |
+| 5 | **Stickiness** | `_stage_stickiness` | affinity dwell, failback hysteresis, conversation pins; then `_stage_queue_candidate` picks at most one queue candidate |
 | 6 | **Emit** | `_stage_assess` | the plan, plus a per-candidate explanation |
 
 ### 3.1 Tiers (stage 3)
@@ -118,26 +118,59 @@ The strategy is nothing but the choice of scoring key for the IMMEDIATE tier:
 
 | `[routing] strategy` | Key | Notes |
 |---|---|---|
-| `ordered` (default) | table position | the primary fronts unless a pin or an opportunistic burn overrides |
+| `ordered` (default) | table position | the primary fronts unless a pin overrides; post-dwell failback and `failback_delay` hysteresis belong to this strategy alone (§3.4) |
 | `headroom` | `usage_headroom` desc | Plan 015; `headroom_ranking = true` is the same thing |
 | `pace` | weekly quota surplus desc | Plan 020 D5: `remaining_fraction − burn_rate × days_until_reset`; only FRESH weekly signals are scored, unscored providers follow in table order and are never starved; `pace_flap_margin` is a deadband on the top two, not hysteresis with memory |
 
 `QUEUE` and `BACKSTOP` keep candidate order — stale never outranks fresh, and a
 queue backstop is not a preference contest.
 
+**Retired: opportunistic quota burn (Plan 016, removed by Plan 026 W2.2).** An
+opt-in signal used to front a fallback that had session headroom to spare and a
+quota window about to reset. `pace` supersedes it — the same use-it-or-lose-it
+philosophy promoted from an exception to a primary ordering — and its
+reset-window heuristic actively favoured the *expensive* provider, because a
+~5 h session reset always sits inside the 6 h window it read as "spend this
+now". The `opportunistic_*` fields are still parsed from TOML and from a stored
+overlay, so an old config file cannot cost a boot, but they change nothing; boot
+logs one warning when `opportunistic_enabled` is true, and
+`PUT /admin/config/routing` refuses to write them.
+
 ### 3.4 Stickiness (stage 5)
 
-Affinity dwell (Plan 008 §5), failback hysteresis (Plan 014), conversation pins
-(Plan 019) and opportunistic burn (Plan 016) all front **at most one** IMMEDIATE
-member. One law, stated once: *stickiness may promote a provider within its
-tier, never across a tier boundary* — so a pinned provider that gets demoted
-(entering its peak window, say) loses the pin's effect automatically, because it
-is no longer in the tier the overlay reorders.
+Affinity dwell (Plan 008 §5), failback hysteresis (Plan 014) and conversation
+pins (Plan 019) each front **at most one** IMMEDIATE member. One law, stated
+once: *stickiness may promote a provider within its tier, never across a tier
+boundary* — so a pinned provider that gets demoted (entering its peak window,
+say) loses the pin's effect automatically, because it is no longer in the tier
+the overlay reorders. That is what makes a pin safe to hold: a new demotion
+signal revokes pins correctly without knowing pins exist.
 
-Under `pace`, an expired pin goes inert rather than re-fronting the primary:
-failing back would overwrite exactly the surplus ordering stage 4 produced.
-(`headroom` still re-fronts the primary today; Plan 026 W2.1 generalizes the
-rule.)
+**Failback belongs to `ordered`** (Plan 026 W2.1). Dwell holds a pin under every
+strategy, but what happens when dwell expires depends on whether the strategy
+has a ranking of its own:
+
+| Strategy | Pin within dwell | Pin after dwell |
+|---|---|---|
+| `ordered` | held (`affinity_dwell`) | fail back to the primary, gated by `failback_delay` hysteresis (`affinity_hysteresis`) |
+| `headroom`, `pace` | held (`affinity_dwell`) | **inert** — the ranking stands |
+
+Fronting the primary is *ordered's own ranking* asserting itself after a pin
+expires, not a universal law. Under a ranking strategy, failing back would
+overwrite exactly the ordering stage 4 produced: before W2.1 every dwell expiry
+re-fronted the table primary, so the estate leaked one primary request per dwell
+interval per affinity key. That was fixed for `pace` alone on 2026-08-11 and
+`headroom` carried an identical copy of the bug; `_ranks_immediate_tier` now
+states the rule once, and `headroom_ranking = true` counts as `headroom`.
+
+`pin_conversations` (Plan 019) is unchanged and outranks all of this: it holds
+its pin past dwell under every strategy, for as long as the pinned provider
+stays in the IMMEDIATE tier.
+
+One asymmetry remains deliberately: with **no pin at all**, `headroom` still
+fronts the primary, because Plan 015 ranks the *fallbacks* by headroom and
+leaves the primary in front. So under `headroom` the ranking decides where
+traffic goes once the primary is unavailable — or once a pin has expired.
 
 ### 3.5 Queue-candidate selection (stage 5)
 
@@ -190,7 +223,6 @@ the pipeline existed:
 | `affinity_dwell` | Affinity provider is pinned within `dwell_interval` |
 | `affinity_hysteresis` | Affinity pin held past dwell while the primary reproves itself (Plan 014) |
 | `affinity_pinned` | Conversation pinning (Plan 019) holds the pin past dwell while the pinned provider stays FRESH + AVAILABLE |
-| `opportunistic` | No affinity pin; a quota-bearing fallback with expiring headroom took the front (Plan 016) |
 | `pace_failover` | Pace ranked a non-primary highest by weekly quota surplus (Plan 020 D5) |
 | `queue_only` | No immediate candidates; queue on a candidate |
 | `no_eligible_candidates` | Every candidate is closed or unknown |
@@ -199,16 +231,25 @@ the pipeline existed:
 
 Two consumers read the assessments:
 
-* **`GET /admin/route-plan?model=<m>&key=<raw-key>`** — the explain surface.
-  Admin-authed, read-only, both params optional (no model = unfiltered, no key
-  = the default route). It runs the *real* pipeline with `affinity=None` — an
-  explanation that can disagree with the decision is worse than none — and
-  touches no pin, no metric, and no healthy-since clock. The raw key is used to
-  compute a digest and is never echoed, logged, or stored by switchboard —
-  though it does travel in the query string, and uvicorn's access log records
-  those, so omit `key=` unless you are asking about a keyed route specifically.
-  The dashboard's Routing Explain card renders the response and never sends a
-  key.
+* **`GET /admin/route-plan?model=<m>`** — the explain surface. Admin-authed,
+  read-only, everything optional (no model = unfiltered, no key = the default
+  route). It runs the *real* pipeline with `affinity=None` — an explanation that
+  can disagree with the decision is worse than none — and touches no pin, no
+  metric, and no healthy-since clock. The dashboard's Routing Explain card
+  renders the response and sends no key.
+
+  To ask about a **specific client's** route, pass that client's raw key. The
+  raw key is only hashed to a digest and is never echoed, logged, or stored by
+  switchboard, but *how* you pass it matters:
+
+  | | Access-logged? | |
+  |---|---|---|
+  | `x-route-plan-key: <raw-key>` | no — uvicorn does not log request headers | **preferred** |
+  | `?key=<raw-key>` | yes — uvicorn's access log records query strings | kept for curl convenience |
+
+  When both are present the header wins: a caller who set it deliberately chose
+  the non-logging path. The header is also listed as a switchboard control
+  header, so a request that carries it is never forwarded upstream with it.
 * **the decision log** — `recent_decisions` entries gain an additive `signals`
   map (`{provider: [names]}`) for the candidates that had any, so "why did
   traffic move off alpha at 14:00" is answerable from `/status.json` rather
@@ -242,10 +283,16 @@ Properties this guarantees:
   requires the primary to have been continuously FRESH+AVAILABLE for at least
   `failback_delay` seconds. A single unhealthy poll resets the continuity
   clock; the clock is read for the *effective* (post-filter) primary.
-- **Opportunistic quota burn (Plan 016).** Opt-in; subordinate to an active
-  affinity pin; de-preference only — the primary stays immediate-eligible,
-  queue backstop, and terminal fallback. Stale or unmeasured data never
-  promotes.
+- **Tier-bounded stickiness.** A pin promotes within a tier and never across
+  one, and post-dwell failback applies only under `ordered` (§3.4).
+- **One effective primary.** The plan's `terminal_fallback` *is* the effective
+  (post-filter) primary, and the shell reads it from there rather than
+  recomputing `candidates[0]` (Plan 026 W2.3). Before that, a model map or a
+  quarantine that excluded the configured primary made every request for that
+  model count a failover and create an affinity pin against a provider that was
+  never a candidate. Consequence for metrics: `failovers` no longer counts
+  model-map or quarantine filtering of the primary — only a genuine move off
+  the provider that could have served.
 - **Pure.** `now`, `healthy_since`, and all provider states are arguments. No
   I/O, no clock, stdlib only (enforced by `tests/test_import_boundary.py`).
 - **Deterministic.** Same inputs → same plan. Testable without a network.

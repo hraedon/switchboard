@@ -213,6 +213,12 @@ _CONTROL_HEADERS = frozenset(
     {
         "x-switchboard-route-key",
         "x-switchboard-qos",
+        # Only meaningful to GET /admin/route-plan (Plan 026), which forwards
+        # nothing — but it carries a raw API key, and a control header that
+        # reached an upstream would hand one vendor another vendor's
+        # credential. Listed explicitly because the name predates the
+        # ``x-switchboard-`` prefix rule below and so is not covered by it.
+        "x-route-plan-key",
     }
 )
 
@@ -364,6 +370,13 @@ class RoutingMetrics:
         signals: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         """Record a routing decision and whether it was a failover.
+
+        ``primary`` is the **effective** primary — the plan's own
+        ``terminal_fallback``, i.e. the first candidate that survived model-map
+        and quarantine filtering (Plan 026 W2.3). So ``failovers`` counts a move
+        off a provider that could have served this request, and no longer counts
+        a model simply not being offered by the configured primary, which used
+        to inflate the counter on every request for such a model.
 
         ``signals`` (Plan 026 W1.5) is the decision's per-candidate signal
         names — ``{provider: ["in_peak", ...]}`` — for the candidates that had
@@ -1402,8 +1415,6 @@ class ProxyApp:
                     usage_history_tracker=self._usage_history_tracker,
                 )
 
-        primary = candidates[0]
-
         # Track a continuous-healthy clock per provider, not just the
         # configured primary: when a model map excludes the original primary,
         # route_decision re-derives the effective primary and needs *that*
@@ -1469,6 +1480,16 @@ class ProxyApp:
             servable_providers=servable_providers,
             healthy_since=dict(self._provider_healthy_since),
         )
+
+        # The EFFECTIVE primary, computed once by the core and read here — not
+        # re-derived as `candidates[0]` (Plan 026 W2.3). The shell used to keep
+        # its own pre-filter copy while the core derived the post-filter one, so
+        # whenever the model map or quarantine excluded the configured primary,
+        # every single request looked like a failover (metric) and created an
+        # affinity pin (state) against a provider that was never a candidate.
+        # `terminal_fallback` is that effective primary: the first surviving
+        # candidate, and the provider whose gate gives the canonical rejection.
+        primary = plan.terminal_fallback
 
         admitted: tuple[str, ProviderContext] | None = None
         try:

@@ -88,10 +88,13 @@ async def _get(
     *,
     token: str | None = _TOKEN,
     method: str = "GET",
+    key_header: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     headers: list[tuple[bytes, bytes]] = []
     if token is not None:
         headers.append((b"authorization", f"Bearer {token}".encode()))
+    if key_header is not None:
+        headers.append((b"x-route-plan-key", key_header.encode()))
     scope = {
         "type": "http",
         "method": method,
@@ -221,6 +224,75 @@ async def test_route_plan_follows_a_keyed_route() -> None:
     assert body["terminal_fallback"] == "beta"
     # The raw key is never echoed back, in any field.
     assert "sk-live" not in json.dumps(body)
+
+
+@pytest.mark.asyncio
+async def test_route_plan_follows_a_keyed_route_from_the_header() -> None:
+    """The key belongs in a header, because query strings are access-logged.
+
+    uvicorn writes the request line — path *and* query string — to its access
+    log, so ``?key=sk-live`` puts a live API key on disk through the one path
+    switchboard does not control. The header carries the same value past a
+    logger that does not record headers.
+    """
+    from switchboard.control import hash_route_key
+
+    app = await _build()
+    app._route_table.add_entry(hash_route_key("sk-live"), ["beta", "alpha"])
+    status, body = await _get(app, key_header="sk-live")
+    assert status == 200
+    assert body["keyed_route"] is True
+    assert body["candidates"] == ["beta", "alpha"]
+    assert body["terminal_fallback"] == "beta"
+    assert "sk-live" not in json.dumps(body)
+
+
+@pytest.mark.asyncio
+async def test_route_plan_prefers_the_header_over_the_query_param() -> None:
+    """A caller who set the header chose the non-logging path deliberately;
+    silently preferring the logged value would defeat the point."""
+    from switchboard.control import hash_route_key
+
+    app = await _build()
+    app._route_table.add_entry(hash_route_key("sk-header"), ["beta", "alpha"])
+    app._route_table.add_entry(hash_route_key("sk-query"), ["alpha"])
+    status, body = await _get(app, "key=sk-query", key_header="sk-header")
+    assert status == 200
+    assert body["candidates"] == ["beta", "alpha"]
+
+
+@pytest.mark.asyncio
+async def test_route_plan_empty_header_falls_back_to_the_query_param() -> None:
+    """An empty header is not an answer — curl's ``-H 'x-route-plan-key;'``
+    sends one, and treating it as "explain the default route" would silently
+    answer a different question than the query param asked."""
+    from switchboard.control import hash_route_key
+
+    app = await _build()
+    app._route_table.add_entry(hash_route_key("sk-query"), ["beta"])
+    status, body = await _get(app, "key=sk-query", key_header="")
+    assert status == 200
+    assert body["keyed_route"] is True
+    assert body["candidates"] == ["beta"]
+
+
+@pytest.mark.asyncio
+async def test_route_plan_key_header_is_never_forwarded_upstream() -> None:
+    """It carries a raw API key, so it is a switchboard control header: a
+    request that happened to include it must not hand one vendor another
+    vendor's credential (AGENTS.md cache-transparency rule)."""
+    from switchboard.proxy import _CONTROL_HEADERS
+
+    assert "x-route-plan-key" in _CONTROL_HEADERS
+
+    app = await _build()
+    filtered = app._filter_request_headers(
+        [
+            (b"content-type", b"application/json"),
+            (b"x-route-plan-key", b"sk-live"),
+        ]
+    )
+    assert [n for n, _ in filtered] == ["content-type"]
 
 
 @pytest.mark.asyncio
