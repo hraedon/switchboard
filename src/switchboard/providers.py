@@ -85,6 +85,7 @@ def build_provider_context(
     poll_interval: float = 5.0,
     dashboard_url: str | None = None,
     dashboard_token: str | None = None,
+    dashboard_provider: str | None = None,
     dashboard_poll_interval: float = 30.0,
     dashboard_stale_ttl: float = 900.0,
     poll_interval_idle: float | None = None,
@@ -154,10 +155,15 @@ def build_provider_context(
         and dashboard_url is not None
         and dashboard_token is not None
     ):
+        # The dashboard names providers by its own ids ("zai", "ollama",
+        # "opencode", ...), which rarely match switchboard's route keys
+        # ("zai-coding-plan", "ollama-cloud", "opencode-go"). Without the
+        # dashboard_provider mapping, the lookup silently never matched and
+        # the truth source served the fail-safe forever.
         truth_source = DashboardTruthSource(
             dashboard_url=dashboard_url,
             bearer_token=dashboard_token,
-            provider_name=name,
+            provider_name=dashboard_provider or name,
             stale_ttl=dashboard_stale_ttl,
         )
         poll_interval = dashboard_poll_interval
@@ -279,6 +285,10 @@ def build_provider_contexts_from_config(
             usage_key = os.environ.get(usage_key_env, "")
 
         dashboard_url = _optional_str(provider_cfg, "dashboard_url")
+        # Optional mapping to the dashboard's provider id when it differs
+        # from this provider's name (e.g. "opencode-go" reads the dashboard's
+        # "opencode" reading). Defaults to the provider name.
+        dashboard_provider = _optional_str(provider_cfg, "dashboard_provider")
 
         dashboard_token: str | None = None
         dashboard_token_env = _optional_str(provider_cfg, "dashboard_token_env")
@@ -348,6 +358,7 @@ def build_provider_contexts_from_config(
             usage_key=usage_key,
             dashboard_url=dashboard_url,
             dashboard_token=dashboard_token,
+            dashboard_provider=dashboard_provider,
             dashboard_stale_ttl=dashboard_stale_ttl,
             dashboard_poll_interval=dashboard_poll_interval,
             poll_interval_idle=poll_interval_idle,

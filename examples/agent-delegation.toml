@@ -102,3 +102,10 @@ zai-coding-plan = "glm-5.2"
 #   [provider.ollama-cloud]
 #   dashboard_url = "https://usage.internal.example"
 #   dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"
+#   dashboard_provider = "ollama"
+#
+# dashboard_provider maps this provider to the dashboard's own id when the
+# names differ — the dashboard emits "zai" / "ollama" / "opencode" / "codex"
+# / "claude", while switchboard route keys are usually longer
+# ("zai-coding-plan", "ollama-cloud", "opencode-go"). Without the mapping the
+# lookup never matches and the provider silently gets no pressure signal.

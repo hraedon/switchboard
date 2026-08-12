@@ -145,6 +145,14 @@ def _validate_provider_config(
     if direct_usage is not None and not isinstance(direct_usage, bool):
         errors.append(f"provider '{name}': direct_usage must be a boolean")
 
+    dashboard_provider = cfg.get("dashboard_provider")
+    if dashboard_provider is not None and (
+        not isinstance(dashboard_provider, str) or not dashboard_provider.strip()
+    ):
+        errors.append(
+            f"provider '{name}': dashboard_provider must be a non-empty string"
+        )
+
     for key in ("direct_usage_stale_ttl", "direct_usage_poll_interval"):
         val = cfg.get(key)
         if val is not None and (

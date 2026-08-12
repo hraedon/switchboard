@@ -419,6 +419,35 @@ def test_build_provider_contexts_from_config_zai_dashboard_truth_source() -> Non
     assert ctx.truth_source._provider_name == "zai"
 
 
+def test_build_provider_contexts_dashboard_provider_mapping() -> None:
+    """`dashboard_provider` maps a switchboard provider name to the
+    dashboard's provider id. The dashboard emits its own ids ("opencode",
+    "ollama", "zai"); switchboard route keys ("opencode-go", ...) rarely
+    match, and an unmapped lookup silently never finds a reading."""
+    config = {
+        "provider": {
+            "opencode-go": {
+                "upstream": "https://opencode.ai/zen/go/v1",
+                "type": "generic",
+                "target": 4,
+                "dashboard_url": "http://usage-dashboard.example.com",
+                "dashboard_token_env": "USAGE_DASHBOARD_TOKEN",
+                "dashboard_provider": "opencode",
+            },
+        }
+    }
+    import os
+    os.environ["USAGE_DASHBOARD_TOKEN"] = "dashboard-secret"
+    try:
+        contexts = build_provider_contexts_from_config(config)
+    finally:
+        del os.environ["USAGE_DASHBOARD_TOKEN"]
+
+    ctx = contexts["opencode-go"]
+    assert isinstance(ctx.truth_source, DashboardTruthSource)
+    assert ctx.truth_source._provider_name == "opencode"
+
+
 # --- Plan 016: quota_resets_in derivation ---
 
 
