@@ -305,12 +305,17 @@ function _credBlockHtml(mode, existing, tomlStored, isLocked, lockNote, lockAttr
       </div>`;
   }
   if (mode === 'passthrough') {
+    const eraseWarn = existing && existing.key_mode === 'stored'
+      ? `<div class="form-row"><span style="color:var(--red);font-size:0.85rem">
+         &#9888; saving in passthrough mode ERASES this provider&apos;s stored API key
+         from the config store — switching back later means re-entering it</span></div>`
+      : '';
     return `
       <div class="form-row">
         <label>API key</label>
         <span style="color:var(--muted);font-size:0.85rem">passthrough — no credential;
         the client&apos;s key is forwarded verbatim to this upstream</span>
-      </div>`;
+      </div>${eraseWarn}`;
   }
   const envVal = existing ? esc(existing.api_key_env || '') : '';
   return `
@@ -693,8 +698,11 @@ async function _saveProvider() {
     url = '/admin/providers/' + encodeURIComponent(editingProviderName);
     method = 'PUT';
   } else {
-    // Add mode (Plan 025): all three credential modes. env with a blank var
-    // name omits key_mode so the server default applies (quick-add).
+    // Add mode (Plan 025): all three credential modes. There is NO server
+    // default for key_mode (the store requires it), so a quick-add with the
+    // env field left blank is sent as explicit passthrough — same semantics
+    // a bare TOML provider gets — rather than 400ing on a missing field
+    // (cross-lineage review, finding 3).
     body = { name, upstream, provider_type: 'generic', target, auth_header };
     if (key_mode === 'stored') {
       if (!keyNew) {
@@ -706,7 +714,7 @@ async function _saveProvider() {
     } else if (key_mode === 'env' && api_key_env) {
       body.key_mode = 'env';
       body.api_key_env = api_key_env;
-    } else if (key_mode === 'passthrough') {
+    } else {
       body.key_mode = 'passthrough';
     }
     url = '/admin/providers';
@@ -1083,6 +1091,17 @@ function renderModelAddForm(knownProviders, editModelName, editAliases, editPref
       errEl.textContent = 'preference names provider(s) with no alias: '
         + unaliased.join(', ');
       return;
+    }
+    // Editing: clearing an alias removes that provider from the model
+    // (the POST replaces the whole set) — destructive with no undo, so it
+    // gets the same confirm() as the sibling delete actions.
+    if (editing && editAliases) {
+      const removed = Object.keys(editAliases).filter(p => !(p in aliases));
+      if (removed.length && !confirm(
+            'Remove ' + removed.join(', ') + ' from ' + editModelName + '? '
+            + 'Cleared aliases are deleted from the mapping.')) {
+        return;
+      }
     }
     const payload = { model, aliases };
     if (preference.length) payload.preference = preference;
@@ -1555,9 +1574,15 @@ function _explainHtml(body) {
     const score = (a.score === null || a.score === undefined)
       ? '<span style="color:var(--muted)">—</span>'
       : Number(a.score).toFixed(3);
-    const sig = (a.signals || []).length
+    let sig = (a.signals || []).length
       ? a.signals.map(s => `<code>${esc(s)}</code>`).join(' ')
       : '<span style="color:var(--muted)">—</span>';
+    // Per-assessment preference marker (cross-lineage review, N3): the API
+    // exposes preference_rank; render it so "why is this one in front" is
+    // answerable from the card, not only from curl.
+    if (a.preference_rank !== null && a.preference_rank !== undefined) {
+      sig = `<code>pref#${Number(a.preference_rank)}</code> ` + sig;
+    }
     return `<tr${selected ? ' style="font-weight:600"' : ''}>`
       + `<td>${esc(a.provider)}${selected ? ' &larr; selected' : ''}</td>`
       + `<td><span class="badge ${tierCls}">${esc(a.tier)}</span></td>`

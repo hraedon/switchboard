@@ -52,13 +52,25 @@ class ModelMapManager:
         self._valid_providers = valid_providers
 
         if db is not None:
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS model_map "
-                "(model TEXT PRIMARY KEY, aliases TEXT, preference TEXT)"
-            )
-            self._migrate_columns()
-            db.commit()
-            self._load_from_db()
+            # Failure-handling parity with ConfigStoreManager (cross-lineage
+            # review, N1): boot must not crash on a bad store file — start
+            # with an empty map and let later writes raise and surface the
+            # problem to the admin instead.
+            try:
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS model_map "
+                    "(model TEXT PRIMARY KEY, aliases TEXT, preference TEXT)"
+                )
+                self._migrate_columns()
+                db.commit()
+            except sqlite3.Error:
+                log.warning(
+                    "model map: could not ensure model_map table; map "
+                    "starts empty and writes may fail",
+                    exc_info=True,
+                )
+            else:
+                self._load_from_db()
 
     def _migrate_columns(self) -> None:
         """Add columns that postdate the table's first ship (Plan 026 W3.1).

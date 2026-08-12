@@ -1074,7 +1074,16 @@ def _stage_classify(
             fired.append("degraded")
 
         if not fresh_enough:
-            backstop.append(name)
+            # BACKSTOP only while it has capacity: a DEGRADED provider whose
+            # gate is saturated/zeroed (an authoritative source failing
+            # closed) would make the backstop a doomed queue wait, turning
+            # the fail-fast 503 into a slow one (cross-lineage review of the
+            # containment branch, finding N1). No-capacity DEGRADED
+            # non-primaries drop, as they did before the backstop existed.
+            if state.availability == Availability.AVAILABLE:
+                backstop.append(name)
+            else:
+                continue
         elif demoted or state.availability == Availability.BUSY:
             queue.append(name)
         elif state.availability == Availability.AVAILABLE:

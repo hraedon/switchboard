@@ -1619,6 +1619,11 @@ class ProxyApp:
             self._affinity.move_to_end(affinity_key)
             self._evict_affinity()
         elif affinity is not None and affinity.provider != primary:
+            # Note (cross-lineage review, N2): `primary` is the EFFECTIVE
+            # primary since W2.3, so a model-map edit that changes which
+            # provider is effective can pop a pin here and count a
+            # "failback" that is really a config-driven re-derivation.
+            # Cosmetic metric drift, accepted; the pop itself is correct.
             if self._affinity.pop(affinity_key, None) is not None:
                 self._metrics.record_affinity_failback()
 
@@ -1753,6 +1758,19 @@ class ProxyApp:
                     self._affinity.move_to_end(affinity_key)
                     self._evict_affinity()
                     self._metrics.record_affinity_pin()
+                elif rerouted_to is not None and served:
+                    # The reroute landed on the EFFECTIVE primary. Since W2.3
+                    # `primary` is the plan's effective primary, so this
+                    # branch is reachable (pre-026 it never was: primary was
+                    # the pre-filter table head). A pin naming the provider
+                    # that just 429ed must not survive — it would dwell-front
+                    # the exhausted provider next request and pay a failed
+                    # round trip per request until its gate saturates
+                    # (cross-lineage review of Plan 026, blocking finding B1).
+                    stale = self._affinity.get(affinity_key)
+                    if stale is not None and stale.provider != primary:
+                        self._affinity.pop(affinity_key, None)
+                        self._metrics.record_affinity_failback()
                 if (
                     not forward_failed
                     and self._reroute_max_attempts > 0

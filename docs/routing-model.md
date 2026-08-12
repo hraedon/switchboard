@@ -154,6 +154,13 @@ provider out of `QUEUE`, reorder `BACKSTOP`, or affect queue-candidate selection
 write — a preference for an alias-less provider could only ever be dead config,
 so `POST /admin/model-map` refuses it by name, as it does a repeated name.
 
+One reason-string caveat (cross-lineage review, N4): when a preference fronts a
+fallback under `pace`, the emitted reason is `failover`, not `pace_failover` —
+the preference partition means the pace key never reorders across groups, so
+`pace_changed` stays false. The decision is correct and the assessments carry
+`preference_rank`; only the one-word reason loses the pace distinction. Accepted
+as-is rather than growing a new reason string.
+
 **Composition with the pace flap margin.** `pace_flap_margin` is a deadband on
 the top two *scored* candidates (§3.3), and preference is lexicographically
 above the score, so the two compose the only way that keeps both meaningful:

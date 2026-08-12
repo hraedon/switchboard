@@ -154,7 +154,14 @@ check('omits the model-preference row when the model has none',
 // --- 3b. a per-model preference is shown when set (Plan 026 W3) -----------
 planResponse = {
   ok: true, status: 200,
-  json: async () => ({ ...PLAN, preference: ['beta', 'alpha'] }),
+  json: async () => ({
+    ...PLAN,
+    preference: ['beta', 'alpha'],
+    assessments: PLAN.assessments.map(a =>
+      a.provider === 'beta' ? { ...a, preference_rank: 0 }
+      : a.provider === 'alpha' ? { ...a, preference_rank: 1 }
+      : { ...a, preference_rank: null }),
+  }),
 };
 vm.runInContext('explainPinned = false', sandbox);
 sandbox.renderRoutingExplain(STATUS);
@@ -163,6 +170,11 @@ await $('explain-btn').onclick();
 const prefOut = $('explain-results').innerHTML;
 check('renders the model preference order',
       /model preference/.test(prefOut) && prefOut.includes('beta → alpha'),
+      prefOut.slice(0, 600));
+// Cross-lineage review N3: the per-assessment rank renders on the row, so
+// "why is this one in front" is answerable from the card.
+check('renders the per-assessment preference rank',
+      prefOut.includes('pref#0') && prefOut.includes('pref#1'),
       prefOut.slice(0, 600));
 // Restore the unpreferred plan for the freeze-flag checks below.
 planResponse = { ok: true, status: 200, json: async () => PLAN };

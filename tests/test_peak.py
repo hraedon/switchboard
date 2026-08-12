@@ -157,3 +157,10 @@ def test_next_boundary_rolls_over_weekend() -> None:
     now = _epoch(2026, 8, 14, 19, 0)  # Friday evening → Monday 14:00
     boundary = next_boundary(ZAI, now)
     assert boundary == _epoch(2026, 8, 17, 14, 0)
+
+
+def test_parse_rejects_offset_past_fourteen_hours() -> None:
+    with pytest.raises(ValueError):
+        parse_peak_window("daily 01:00-02:00 +14:30")
+    # exactly +14:00 is the largest real offset and stays valid
+    assert parse_peak_window("daily 01:00-02:00 +14:00").utc_offset_minutes == 840
