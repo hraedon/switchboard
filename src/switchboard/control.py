@@ -14,7 +14,7 @@ import hashlib
 import hmac
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -453,6 +453,72 @@ def coerce_routing_value(field: str, value: Any) -> Any:
     return float(value)
 
 
+class Tier(Enum):
+    """The one tier a surviving candidate is assigned (Plan 026 §2 stage 3).
+
+    Lexicographic, not weighted: a tier boundary is how the operator actually
+    reasons ("never expensive if avoidable" is a boundary, not a coefficient).
+
+    * ``IMMEDIATE`` — eligible to serve now: fresh + AVAILABLE, un-demoted.
+    * ``QUEUE`` — serve only via the queue path: BUSY, or demoted by a
+      pressure/cost signal (peak window, low headroom, token budget,
+      trailing-24h). Demoted, never dropped.
+    * ``BACKSTOP`` — last resort, after every fresh candidate: a non-primary
+      whose truth signal is DEGRADED. Its scrape failed, not necessarily the
+      provider, so it beats a 503 — but stale never outranks fresh.
+
+    Candidates removed by the *filter* stage (missing state, ``CLOSED``,
+    unservable model, missing capability, UNKNOWN freshness) hold no tier at
+    all: they are out of the plan, and nothing downstream may resurrect them.
+    """
+
+    IMMEDIATE = "immediate"
+    QUEUE = "queue"
+    BACKSTOP = "backstop"
+
+
+#: Every signal name that can travel with an assessment, in emission order
+#: (Plan 026 W1.3). ``busy`` and ``degraded`` are facts about the provider's
+#: live state; the middle four are the demotion predicates in
+#: :data:`_DEMOTION_SIGNALS`. A name here is a stable part of the explain
+#: surface's contract — the GUI and the decision log both render it.
+SIGNAL_NAMES: tuple[str, ...] = (
+    "busy",
+    "low_headroom",
+    "over_budget",
+    "over_24h",
+    "in_peak",
+    "degraded",
+)
+
+
+@dataclass(frozen=True)
+class CandidateAssessment:
+    """Why one candidate sits where it does (Plan 026 §2 stage 6).
+
+    The decision used to be a single ``reason`` string, so "why did this
+    request go to zai?" meant re-deriving seven signals by hand. An assessment
+    per surviving candidate makes the decision self-explaining:
+
+    * ``tier`` — the :class:`Tier` the classify stage assigned.
+    * ``signals`` — the names from :data:`SIGNAL_NAMES` that fired for this
+      candidate, in that order. Empty for a clean immediate candidate.
+    * ``score`` — the ranking key the configured strategy scored it on
+      (session headroom under ``HEADROOM``, weekly surplus under ``PACE``),
+      or ``None`` when the strategy does not score (``ORDERED``), the
+      candidate is unscored, or it is not in the IMMEDIATE tier.
+    * ``rank`` — 0-based position **within its own tier**, after ranking and
+      the stickiness overlay. ``tier == IMMEDIATE and rank == 0`` is the
+      provider the plan will try first.
+    """
+
+    name: str
+    tier: Tier
+    signals: tuple[str, ...] = ()
+    score: float | None = None
+    rank: int = 0
+
+
 @dataclass(frozen=True)
 class AdmissionPlan:
     """Ordered admission plan produced by the routing decision.
@@ -468,12 +534,18 @@ class AdmissionPlan:
        queue budget.
     5. After queue timeout, return an honest 503 derived from
        ``terminal_fallback``'s structural signal.
+
+    ``assessments`` is the per-candidate explanation (Plan 026 W1.1),
+    defaulted so every existing constructor keeps working. It carries the
+    surviving candidates only — one entry per classified candidate, ordered
+    IMMEDIATE then QUEUE then BACKSTOP, each tier in its final order.
     """
 
     immediate_candidates: tuple[str, ...]
     queue_candidate: str | None
     terminal_fallback: str
     reason: str
+    assessments: tuple[CandidateAssessment, ...] = ()
 
 
 def hash_route_key(raw_key: str, secret: str | None = None) -> str:
@@ -760,151 +832,223 @@ def _opportunistic_target(
     return None
 
 
-def route_decision(
-    states: dict[str, ProviderState],
-    table: RouteTable,
-    route_key: str,
-    config: RoutingConfig,
-    *,
-    now: float,
-    affinity: RouteAffinity | None = None,
-    servable_providers: frozenset[str] | None = None,
-    healthy_since: dict[str, float] | None = None,
-) -> AdmissionPlan:
-    """Pure routing decision. Returns an :class:`AdmissionPlan`.
+# ── The routing pipeline (Plan 026) ───────────────────────────────────────
+#
+# One staged pipeline with an explicit ranking contract, in place of ten
+# plans' mechanisms composing by accident:
+#
+#   1. resolve    route table → ordered candidates
+#   2. filter     hard constraints only, strictly subtractive
+#   3. classify   every survivor gets exactly one Tier
+#   4. rank       order the IMMEDIATE tier by the strategy's scoring key
+#   5. stickiness affinity dwell / failback / conversation pins
+#   6. emit       the plan, plus a per-candidate explanation
+#
+# Each stage is a private pure function and each demotion signal is a named
+# predicate, so adding a signal is additive rather than surgical. Wave 1 is
+# behaviour-preserving: the stages are exactly today's rules, relocated.
 
-    The decision proceeds in this order (Plans 006, 008, 014, 015, 016):
 
-    1. Resolve the route key to an ordered candidate list.
-    2. Filter out candidates that do not serve the request's model when a model
-       map is configured (Plan 010 Feature B).
-    3. Filter out candidates whose capabilities don't satisfy the route's
-       required capabilities (Plan 008 §4).
-    4. Reject missing and closed candidates.
-    5. Separate fresh candidates from unknown/stale candidates and demote
-       pressured non-primary candidates to queue-eligible (headroom, token
-       budget, trailing-24h usage; Plan 013 allows the last to demote the
-       primary).
-    6. Place candidates with immediate permits (AVAILABLE) first.
-    7. Order immediate candidates by the configured strategy: ``ORDERED``
-       (default, table order), ``HEADROOM`` (``usage_headroom`` descending,
-       Plan 015; ``headroom_ranking = True`` is equivalent), or ``PACE``
-       (weekly quota surplus descending, Plan 020 D5). Data-bearing candidates
-       precede ones without data; ties break on table order. Pace applies
-       a ``pace_flap_margin`` deadband so near-equal providers don't
-       alternate per-request.
-    8. Apply affinity stickiness / dwell / failback logic (Plan 008 §5).
-       After ``dwell_interval``, if the primary is in immediate and
-       ``failback_delay`` is configured, failback requires the primary to have
-       been continuously FRESH+AVAILABLE for at least ``failback_delay``
-       seconds (Plan 014).  When no affinity pin is active, opportunistically
-       front a qualifying quota-burn fallback carrying measured headroom above
-       ``opportunistic_min_headroom`` and a reset within
-       ``opportunistic_reset_window`` (Plan 016); subordinate to affinity,
-       de-preference only.
-    9. Preserve primary preference among equally admissible candidates when
-       neither an affinity pin nor an opportunistic target pinned the front.
-    10. Select at most one explicit queue candidate.
-    11. Preserve the configured primary as the terminal safe-failure target
-        so its gate can provide the canonical rejection when nothing is usable.
-        (When model or capability filtering removes the configured primary,
-        the terminal fallback is the first *surviving* candidate, so the
-        canonical rejection comes from a provider that can actually serve the
-        request — and the queue backstop tracks that same effective primary.)
+def _signal_low_headroom(
+    state: ProviderState, config: RoutingConfig, is_primary: bool
+) -> bool:
+    """Session-window headroom below ``headroom_threshold`` (Plan 015).
 
-    ``healthy_since`` maps provider name → the monotonic instant that provider
-    first became continuously FRESH+AVAILABLE.  It is consulted by name for the
-    *effective* primary (post-filtering), so a model map that excludes the
-    configured primary does not leave the hysteresis check reading the wrong
-    provider's clock.  ``None`` or a missing entry means "never observed
-    healthy" and holds the affinity pin until a clock is established.
+    Never demotes the primary — a proactive utilization signal must not
+    de-prefer the provider whose own gate already handles its limits
+    (AGENTS.md hard rule 1).
+    """
+    return (
+        not is_primary
+        and config.headroom_threshold > 0
+        and state.usage_headroom is not None
+        and math.isfinite(state.usage_headroom)
+        and state.usage_headroom < config.headroom_threshold
+    )
 
-    Guarantees:
 
-    * **Fail safe** — when all providers are closed, the plan's
-      ``terminal_fallback`` is the primary; the proxy forwards to it and lets
-      its gate return 503.  Never silently drop a request.
-    * **Stale data never improves preference** — unknown/stale providers are
-      excluded from failover by default (``fresh-only-for-failover`` policy).
-    * **Model-servability filtering** — when the requested model is mapped in
-      a configured model map, only providers that declare an alias for it are
-      eligible.
-    * **Capability filtering** — providers whose declared surfaces don't
-      include all required surfaces are excluded before admission ranking.
-    * **Bounded stickiness** — after failover, the routing core prefers the
-      affinity provider for at least ``dwell_interval`` seconds before
-      considering failback to the primary.
-    * **Failback hysteresis** — when ``failback_delay > 0``, failback to the
-      primary requires the primary to have been continuously FRESH+AVAILABLE
-      for at least ``failback_delay`` seconds.  A single unhealthy poll resets
-      the continuity clock.
-    * **Opt-in headroom ranking** — when ``headroom_ranking`` is enabled,
-      immediate candidates are ordered by ``usage_headroom`` descending before
-      affinity/primary fronting; absence of data never outranks a measured
-      provider.
-    * **Opportunistic quota burn (Plan 016)** — opt-in; subordinate to an
-      active affinity pin; de-preference only: the primary remains
-      immediate-eligible, queue backstop, and terminal fallback.  Stale or
-      unmeasured data never promotes.
-    * **Pure** — ``now``, ``healthy_since``, and all states are arguments.  No
-      I/O, no clock.
-    * **Deterministic** — same inputs produce the same plan.
+def _signal_over_budget(
+    state: ProviderState, config: RoutingConfig, is_primary: bool
+) -> bool:
+    """Token utilization at or above this provider's budget threshold.
+
+    A per-provider ``soft_threshold`` (Plan 012 §4) overrides the global
+    ``token_budget_threshold`` when set; ``None`` falls back to the global,
+    whose default 0.0 disables the signal entirely.  This is what makes an
+    operator's ``[token_budget.<p>] soft_threshold = 0.85`` actually take
+    effect.  Never demotes the primary, for the same reason as headroom.
+    """
+    budget_threshold = (
+        state.token_soft_threshold
+        if state.token_soft_threshold is not None
+        else config.token_budget_threshold
+    )
+    return (
+        not is_primary
+        and budget_threshold > 0
+        and state.token_utilization is not None
+        and math.isfinite(state.token_utilization)
+        and state.token_utilization >= budget_threshold
+    )
+
+
+def _signal_over_24h(
+    state: ProviderState, config: RoutingConfig, is_primary: bool
+) -> bool:
+    """Trailing-24h usage at or above ``usage_24h_threshold`` (Plan 013).
+
+    Unlike headroom and budget this one MAY demote the primary (no
+    ``not is_primary`` guard): trailing-day volume is exactly what the
+    primary's own gate cannot see coming (Plan 013 §2).  De-preference only —
+    the primary stays a queue backstop and the terminal fallback.
+    """
+    return (
+        config.usage_24h_threshold > 0
+        and state.usage_24h_utilization is not None
+        and math.isfinite(state.usage_24h_utilization)
+        and state.usage_24h_utilization >= config.usage_24h_threshold
+    )
+
+
+def _signal_in_peak(
+    state: ProviderState, config: RoutingConfig, is_primary: bool
+) -> bool:
+    """Inside a configured peak-pricing window (Plan 025).
+
+    Like ``over_24h`` it may demote the primary — expensive is expensive
+    regardless of table position — and like every demotion it de-prefers
+    only.  Demotion happens before ranking, so an in-peak provider never
+    enters the surplus race.  The wall-clock read lives in the shell; the
+    core receives the boolean.
+    """
+    return state.in_peak
+
+
+#: The demotion predicates, in emission order.  Each is
+#: ``(state, config, is_primary) -> bool`` and each is named by the signal it
+#: reports, so a new pressure/cost signal is one row here plus one name in
+#: :data:`SIGNAL_NAMES` — never a new branch threaded through the decision.
+_DEMOTION_SIGNALS: tuple[
+    tuple[str, Callable[[ProviderState, RoutingConfig, bool], bool]], ...
+] = (
+    ("low_headroom", _signal_low_headroom),
+    ("over_budget", _signal_over_budget),
+    ("over_24h", _signal_over_24h),
+    ("in_peak", _signal_in_peak),
+)
+
+
+@dataclass
+class _Filtered:
+    """Stage 2's output: the surviving candidates, or a hard rejection."""
+
+    candidates: tuple[str, ...]
+    primary: str
+    #: A terminal reason code (``model_unservable`` / ``capability_filtered``)
+    #: when nothing survived; ``""`` when the set is usable.
+    rejection: str = ""
+
+
+@dataclass
+class _Classified:
+    """Stage 3's output: one tier per surviving candidate, plus its signals."""
+
+    immediate: list[str]
+    queue: list[str]
+    backstop: list[str]
+    signals: dict[str, tuple[str, ...]]
+
+
+def _stage_resolve(
+    table: RouteTable, route_key: str
+) -> tuple[tuple[str, ...], RouteEntry | None]:
+    """Stage 1 — resolve the route key to an ordered candidate list.
+
+    The keyed entry wins; otherwise the default route.  Order is preference
+    order, and position 0 is the configured primary.
     """
     entry = table.entries.get(route_key)
     candidates = entry.providers if entry is not None else table.default_providers
-
     if not candidates:
         raise ValueError("no providers configured")
+    return candidates, entry
 
+
+def _stage_filter(
+    candidates: tuple[str, ...],
+    entry: RouteEntry | None,
+    states: dict[str, ProviderState],
+    servable_providers: frozenset[str] | None,
+) -> _Filtered:
+    """Stage 2 — hard constraints, strictly subtractive.
+
+    Model servability (Plan 010 Feature B) and declared capability surfaces
+    (Plan 008 §4).  A candidate removed here is OUT: no later stage may
+    resurrect it — that is what makes "demote, never drop" checkable, because
+    only this stage excludes and it excludes on hard constraints alone.
+    (Quarantine stays in the shell, expressed through ``servable_providers``.)
+
+    When a filter empties the set, the *current* primary is preserved as the
+    terminal fallback so a fully-unservable request still gets a canonical
+    rejection from a gate rather than a silent drop.
+    """
     primary = candidates[0]
 
-    # --- Model-servability filtering (Plan 010 Feature B) ---
-    # When the request's model is mapped, only providers that declare an alias
-    # for it are eligible — failover never routes a model to a provider that
-    # doesn't serve it.  ``None`` means unmapped/no-map: no filtering (today's
-    # behaviour).  The configured primary is preserved as terminal_fallback so a
-    # fully-unservable request still gets a canonical rejection from its gate.
     if servable_providers is not None:
         servable = tuple(n for n in candidates if n in servable_providers)
         if not servable:
-            return AdmissionPlan(
-                immediate_candidates=(),
-                queue_candidate=None,
-                terminal_fallback=primary,
-                reason="model_unservable",
-            )
+            return _Filtered(candidates, primary, rejection="model_unservable")
         candidates = servable
         primary = candidates[0]
 
-    # --- Capability filtering (Plan 008 §4) ---
     required_caps = entry.required_capabilities if entry is not None else frozenset()
     if required_caps:
-        filtered: list[str] = []
+        surviving: list[str] = []
         for name in candidates:
             state = states.get(name)
             if state is None:
-                filtered.append(name)
+                surviving.append(name)
                 continue
             if _satisfies_capabilities(state, required_caps):
-                filtered.append(name)
-        if not filtered:
-            return AdmissionPlan(
-                immediate_candidates=(),
-                queue_candidate=None,
-                terminal_fallback=primary,
-                reason="capability_filtered",
+                surviving.append(name)
+        if not surviving:
+            return _Filtered(
+                candidates, primary, rejection="capability_filtered"
             )
-        candidates = tuple(filtered)
+        candidates = tuple(surviving)
         primary = candidates[0]
 
+    return _Filtered(candidates, primary)
+
+
+def _stage_classify(
+    candidates: tuple[str, ...],
+    states: dict[str, ProviderState],
+    config: RoutingConfig,
+    primary: str,
+) -> _Classified:
+    """Stage 3 — assign every surviving candidate exactly one tier.
+
+    * Missing state, ``CLOSED``, and UNKNOWN freshness drop out (the last is
+      the fresh-only-for-failover policy: unknown data never maps to zero
+      pressure).
+    * FRESH — and DEGRADED for the primary, whose last-known-good may keep it
+      serving — is tier-eligible: IMMEDIATE when AVAILABLE with no demotion
+      signal, QUEUE when BUSY or demoted.
+    * A non-primary DEGRADED candidate is a BACKSTOP: never an immediate
+      failover target (docs/routing-model.md §2.2), but demoted rather than
+      dropped, ranked after every fresh candidate (Plan 022 containment — an
+      advisory signal must not be what availability hinges on).
+
+    Signals travel with the candidate: the demotion predicates that fired,
+    plus ``busy``/``degraded`` as facts about its live state.  A signal is
+    reported for every classified candidate whether or not it changed the
+    tier, so the explanation says what was true, not merely what bit.
+    """
     immediate: list[str] = []
-    queue_eligible: list[str] = []
-    # DEGRADED non-primaries, appended to queue_eligible AFTER every fresh
-    # entry: stale data never makes a fallback more attractive than any fresh
-    # candidate, but a fallback whose usage scrape failed is still a better
-    # last resort than a 503 (Plan 022 containment — the signal is advisory,
-    # availability is not allowed to hinge on it).
-    degraded_backstop: list[str] = []
+    queue: list[str] = []
+    backstop: list[str] = []
+    signals: dict[str, tuple[str, ...]] = {}
 
     for name in candidates:
         state = states.get(name)
@@ -913,76 +1057,68 @@ def route_decision(
         if state.availability == Availability.CLOSED:
             continue
 
+        if state.signal_freshness == SignalFreshness.UNKNOWN:
+            # Excluded from failover preference entirely.
+            continue
+
         is_primary = name == primary
+        # FRESH, or the primary on DEGRADED last-known-good. A non-primary
+        # DEGRADED candidate is the remaining case: the backstop tier.
+        fresh_enough = (
+            state.signal_freshness == SignalFreshness.FRESH or is_primary
+        )
 
-        if (
-            state.signal_freshness == SignalFreshness.FRESH
-            or (
-                state.signal_freshness == SignalFreshness.DEGRADED
-                and is_primary
-            )
-        ):
-            low_headroom = (
-                not is_primary
-                and config.headroom_threshold > 0
-                and state.usage_headroom is not None
-                and math.isfinite(state.usage_headroom)
-                and state.usage_headroom < config.headroom_threshold
-            )
-            # Per-provider soft_threshold (Plan 012 §4) overrides the global
-            # token_budget_threshold when set; None falls back to the global,
-            # whose default 0.0 disables the signal entirely.  This is what
-            # makes an operator's ``[token_budget.<p>] soft_threshold = 0.85``
-            # actually take effect — previously it was parsed, validated, and
-            # displayed but never consumed (dead config).
-            budget_threshold = (
-                state.token_soft_threshold
-                if state.token_soft_threshold is not None
-                else config.token_budget_threshold
-            )
-            over_budget = (
-                not is_primary
-                and budget_threshold > 0
-                and state.token_utilization is not None
-                and math.isfinite(state.token_utilization)
-                and state.token_utilization
-                >= budget_threshold
-            )
-            # Plan 013: trailing-24h usage — a proactive signal that
-            # may demote the primary (no `not is_primary` guard).  Demotion
-            # de-prefers only: the primary stays queue-eligible backstop.
-            over_24h = (
-                config.usage_24h_threshold > 0
-                and state.usage_24h_utilization is not None
-                and math.isfinite(state.usage_24h_utilization)
-                and state.usage_24h_utilization >= config.usage_24h_threshold
-            )
-            # Plan 025: peak-pricing window. Like over_24h it may demote the
-            # primary — expensive is expensive regardless of table position —
-            # and like every demotion it de-prefers only: the provider stays
-            # a queue backstop and the terminal fallback. Demotion happens
-            # before strategy ordering, so an in-peak provider never enters
-            # the pace surplus race.
-            if low_headroom or over_budget or over_24h or state.in_peak:
-                queue_eligible.append(name)
-            elif state.availability == Availability.AVAILABLE:
-                immediate.append(name)
-            elif state.availability == Availability.BUSY:
-                queue_eligible.append(name)
-        elif state.signal_freshness == SignalFreshness.DEGRADED:
-            # Non-primary DEGRADED: never an immediate failover target
-            # (fresh-only-for-failover, docs/routing-model.md §2.2), but
-            # demoted rather than dropped — it remains a queue backstop
-            # ranked after every fresh candidate.
-            degraded_backstop.append(name)
-        # UNKNOWN: excluded from failover preference (fresh-only-for-failover)
+        fired: list[str] = []
+        if state.availability == Availability.BUSY:
+            fired.append("busy")
+        demoted = False
+        for signal_name, predicate in _DEMOTION_SIGNALS:
+            if predicate(state, config, is_primary):
+                fired.append(signal_name)
+                demoted = True
+        if state.signal_freshness == SignalFreshness.DEGRADED:
+            fired.append("degraded")
 
-    # --- Immediate-candidate ordering (Plan 015 / Plan 020 D5) ---
-    # The strategy determines how immediate candidates are ordered before
-    # affinity/primary fronting. ORDERED (default) leaves table order intact.
-    # HEADROOM orders by usage_headroom descending (Plan 015). PACE orders by
-    # weekly quota surplus descending (Plan 020 D5). ``headroom_ranking = True``
-    # is treated as ``strategy = HEADROOM`` for backward compat.
+        if not fresh_enough:
+            backstop.append(name)
+        elif demoted or state.availability == Availability.BUSY:
+            queue.append(name)
+        elif state.availability == Availability.AVAILABLE:
+            immediate.append(name)
+        else:
+            # Unreachable today: CLOSED left above, and UNKNOWN availability
+            # cannot coexist with FRESH/DEGRADED freshness (both derive from
+            # the reconcile loop's ``ready``). Dropping is the fail-safe
+            # branch, and it drops the assessment with it.
+            continue
+        signals[name] = tuple(fired)
+
+    return _Classified(
+        immediate=immediate, queue=queue, backstop=backstop, signals=signals
+    )
+
+
+def _stage_rank(
+    immediate: list[str],
+    states: dict[str, ProviderState],
+    candidates: tuple[str, ...],
+    config: RoutingConfig,
+) -> tuple[bool, dict[str, float | None]]:
+    """Stage 4 — order the IMMEDIATE tier by the strategy's scoring key.
+
+    The strategy is nothing but that choice of key: ``ORDERED`` = table
+    position, ``HEADROOM`` = session headroom descending (Plan 015;
+    ``headroom_ranking = True`` is the same thing), ``PACE`` = weekly quota
+    surplus descending (Plan 020 D5, with its ``pace_flap_margin`` deadband).
+    QUEUE and BACKSTOP keep candidate order — stale never outranks fresh, and
+    a queue backstop is not a preference contest.
+
+    Mutates ``immediate`` in place.  Returns ``(pace_changed, scores)``:
+    ``pace_changed`` is what distinguishes the ``pace_failover`` reason from a
+    plain failover, and ``scores`` is the per-candidate ranking key for the
+    explanation (``None`` where the strategy does not score, or the provider
+    is unscored).
+    """
     pace_changed = False
     use_headroom = (
         config.strategy == RoutingStrategy.HEADROOM or config.headroom_ranking
@@ -1000,7 +1136,41 @@ def route_decision(
     elif config.strategy == RoutingStrategy.PACE and len(immediate) > 1:
         pace_changed = pace_rank(immediate, states, candidates, config)
 
-    # --- Affinity stickiness / dwell / failback (Plan 008 §5) ---
+    scores: dict[str, float | None] = {}
+    for name in immediate:
+        st = states.get(name)
+        if st is None:
+            scores[name] = None
+        elif use_headroom:
+            scores[name] = st.usage_headroom
+        elif config.strategy == RoutingStrategy.PACE:
+            scores[name] = pace_surplus(st, config.pace_burn_rate_per_day)
+        else:
+            scores[name] = None
+    return pace_changed, scores
+
+
+def _stage_stickiness(
+    immediate: list[str],
+    states: dict[str, ProviderState],
+    primary: str,
+    config: RoutingConfig,
+    *,
+    affinity: RouteAffinity | None,
+    healthy_since: dict[str, float] | None,
+    now: float,
+) -> str:
+    """Stage 5 — the stickiness overlay: dwell, failback, conversation pins.
+
+    Promotes at most one provider to the front of the IMMEDIATE tier, and
+    never moves anything across a tier boundary — a pinned provider that gets
+    demoted is not in ``immediate``, so its pin has no effect automatically.
+    Also the home of Plan 016's opportunistic burn, which is subordinate to
+    any active pin.
+
+    Mutates ``immediate`` in place; returns the affinity reason code (``""``
+    when nothing overrode the ranking).
+    """
     affinity_reason = ""
     affinity_state = (
         states.get(affinity.provider) if affinity is not None else None
@@ -1025,7 +1195,7 @@ def route_decision(
         ):
             # PACE: once dwell expires, the pin goes inert — neither
             # failback-to-primary nor extended stickiness applies, because
-            # both would overwrite the surplus ordering pace_rank just
+            # both would overwrite the surplus ordering _stage_rank just
             # produced. Without this, every dwell expiry re-fronted the
             # table primary (reason "primary_available"), so pace leaked one
             # primary request per dwell interval per affinity key — a
@@ -1078,8 +1248,8 @@ def route_decision(
             # ORDERED / HEADROOM only: consider an opportunistic burn, and
             # otherwise front the primary.
             #
-            # PACE deliberately skips BOTH. pace_rank (step 7) has already
-            # ordered `immediate` by weekly quota surplus, which is Plan 016's
+            # PACE deliberately skips BOTH. _stage_rank has already ordered
+            # `immediate` by weekly quota surplus, which is Plan 016's
             # use-it-or-lose-it philosophy promoted from an opportunistic
             # exception to the primary ordering (Plan 020 D5). Re-fronting the
             # primary here would undo exactly the ordering the operator asked
@@ -1100,24 +1270,175 @@ def route_decision(
                 immediate.remove(primary)
                 immediate.insert(0, primary)
 
-    # Select at most one queue candidate: prefer primary if eligible.
-    queue_candidate: str | None = None
-    if primary in queue_eligible:
-        queue_candidate = primary
-    elif queue_eligible:
-        queue_candidate = queue_eligible[0]
-    elif primary in immediate:
-        # No provider is BUSY or demoted, so queue_eligible is empty. But
-        # if all immediate acquisitions lose their snapshot race the request
-        # should still wait on the primary (the documented queue backstop)
-        # rather than failing at once — docs/routing-model.md §4 step 4:
-        # "then queue on configured primary for at most queue_timeout".
-        queue_candidate = primary
-    elif degraded_backstop:
-        # Truly last resort: every fresh candidate is gone and the primary is
-        # ineligible, but a DEGRADED fallback exists. Queueing on it beats the
-        # no_eligible_candidates 503 — its signal failed, not the provider.
-        queue_candidate = degraded_backstop[0]
+    return affinity_reason
+
+
+def _stage_queue_candidate(
+    primary: str, classified: _Classified
+) -> str | None:
+    """Stage 5b — select at most one queue candidate.
+
+    The preference order is a ranking contract, not a series of guards:
+
+    1. the primary, if it is queue-eligible (its gate gives the canonical wait)
+    2. the first other QUEUE-tier member
+    3. the primary from the IMMEDIATE tier — with nothing BUSY or demoted,
+       a request whose immediate acquisitions all lose the snapshot race
+       should still wait on the documented backstop rather than fail at once
+       (docs/routing-model.md §4 step 4)
+    4. the first BACKSTOP — every fresh candidate is gone and the primary is
+       ineligible, but queueing on a DEGRADED fallback beats a 503: its
+       signal failed, not the provider.
+
+    Step 4 last is the "stale never outranks fresh" invariant in its
+    load-bearing position.
+    """
+    if primary in classified.queue:
+        return primary
+    if classified.queue:
+        return classified.queue[0]
+    if primary in classified.immediate:
+        return primary
+    if classified.backstop:
+        return classified.backstop[0]
+    return None
+
+
+def _stage_assess(
+    classified: _Classified, scores: dict[str, float | None]
+) -> tuple[CandidateAssessment, ...]:
+    """Stage 6 — the per-candidate explanation the plan carries out.
+
+    One assessment per surviving candidate, ordered IMMEDIATE → QUEUE →
+    BACKSTOP with each tier in its final order, so position in the tuple is
+    the decision's own preference order.  ``rank`` is the 0-based index
+    within the tier; only IMMEDIATE members carry a ``score``, because only
+    that tier is ranked by the strategy.
+    """
+    out: list[CandidateAssessment] = []
+    for tier, names in (
+        (Tier.IMMEDIATE, classified.immediate),
+        (Tier.QUEUE, classified.queue),
+        (Tier.BACKSTOP, classified.backstop),
+    ):
+        for rank, name in enumerate(names):
+            out.append(
+                CandidateAssessment(
+                    name=name,
+                    tier=tier,
+                    signals=classified.signals.get(name, ()),
+                    score=scores.get(name) if tier is Tier.IMMEDIATE else None,
+                    rank=rank,
+                )
+            )
+    return tuple(out)
+
+
+def route_decision(
+    states: dict[str, ProviderState],
+    table: RouteTable,
+    route_key: str,
+    config: RoutingConfig,
+    *,
+    now: float,
+    affinity: RouteAffinity | None = None,
+    servable_providers: frozenset[str] | None = None,
+    healthy_since: dict[str, float] | None = None,
+) -> AdmissionPlan:
+    """Pure routing decision. Returns an :class:`AdmissionPlan`.
+
+    The staged pipeline (Plan 026 §2; the mechanisms are Plans 006, 008,
+    010, 012 to 016, 019, 020, 022, 025):
+
+    1. **Resolve** — :func:`_stage_resolve`: route table → ordered candidates.
+    2. **Filter** — :func:`_stage_filter`: hard constraints only (model
+       servability, capability surfaces), strictly subtractive.  A filtered
+       candidate is OUT; nothing downstream resurrects it.
+    3. **Classify** — :func:`_stage_classify`: every survivor gets exactly one
+       :class:`Tier`, and the signals that fired travel with it.  Missing
+       state, ``CLOSED`` and UNKNOWN freshness drop out here.
+    4. **Rank** — :func:`_stage_rank`: order the IMMEDIATE tier by the
+       configured strategy's scoring key (``ORDERED`` table position,
+       ``HEADROOM`` session headroom desc, ``PACE`` weekly surplus desc with
+       its flap deadband).  QUEUE/BACKSTOP keep candidate order.
+    5. **Stickiness** — :func:`_stage_stickiness`: affinity dwell, failback
+       hysteresis, conversation pins, opportunistic burn.  Fronts at most one
+       IMMEDIATE member; never crosses a tier boundary.  Then
+       :func:`_stage_queue_candidate` picks at most one queue candidate.
+    6. **Emit** — :func:`_stage_assess` attaches the per-candidate
+       assessments and ``reason`` is derived from the outcome.
+
+    ``healthy_since`` maps provider name → the monotonic instant that provider
+    first became continuously FRESH+AVAILABLE.  It is consulted by name for the
+    *effective* primary (post-filtering), so a model map that excludes the
+    configured primary does not leave the hysteresis check reading the wrong
+    provider's clock.  ``None`` or a missing entry means "never observed
+    healthy" and holds the affinity pin until a clock is established.
+
+    Guarantees:
+
+    * **Fail safe** — when all providers are closed, the plan's
+      ``terminal_fallback`` is the primary; the proxy forwards to it and lets
+      its gate return 503.  Never silently drop a request.
+    * **Demote, never drop** — no cost or pressure signal removes a candidate
+      from the plan; only stage 2 excludes, and only on hard constraints.
+    * **Stale never outranks fresh** — UNKNOWN is excluded from failover, and
+      a DEGRADED fallback sorts after every fresh candidate.
+    * **Model-servability filtering** — when the requested model is mapped in
+      a configured model map, only providers that declare an alias for it are
+      eligible.
+    * **Capability filtering** — providers whose declared surfaces don't
+      include all required surfaces are excluded before admission ranking.
+    * **Bounded stickiness** — after failover, the routing core prefers the
+      affinity provider for at least ``dwell_interval`` seconds before
+      considering failback to the primary.
+    * **Failback hysteresis** — when ``failback_delay > 0``, failback to the
+      primary requires the primary to have been continuously FRESH+AVAILABLE
+      for at least ``failback_delay`` seconds.  A single unhealthy poll resets
+      the continuity clock.
+    * **Opt-in headroom ranking** — when ``headroom_ranking`` is enabled,
+      immediate candidates are ordered by ``usage_headroom`` descending before
+      affinity/primary fronting; absence of data never outranks a measured
+      provider.
+    * **Opportunistic quota burn (Plan 016)** — opt-in; subordinate to an
+      active affinity pin; de-preference only: the primary remains
+      immediate-eligible, queue backstop, and terminal fallback.  Stale or
+      unmeasured data never promotes.
+    * **Self-explaining** — ``assessments`` carries ``(name, tier, signals,
+      score, rank)`` per surviving candidate; ``reason`` is derived, and its
+      strings are unchanged from before the pipeline existed.
+    * **Pure** — ``now``, ``healthy_since``, and all states are arguments.  No
+      I/O, no clock.
+    * **Deterministic** — same inputs produce the same plan.
+    """
+    candidates, entry = _stage_resolve(table, route_key)
+
+    filtered = _stage_filter(candidates, entry, states, servable_providers)
+    if filtered.rejection:
+        return AdmissionPlan(
+            immediate_candidates=(),
+            queue_candidate=None,
+            terminal_fallback=filtered.primary,
+            reason=filtered.rejection,
+        )
+    candidates = filtered.candidates
+    primary = filtered.primary
+
+    classified = _stage_classify(candidates, states, config, primary)
+    immediate = classified.immediate
+
+    pace_changed, scores = _stage_rank(immediate, states, candidates, config)
+
+    affinity_reason = _stage_stickiness(
+        immediate, states, primary, config,
+        affinity=affinity,
+        healthy_since=healthy_since,
+        now=now,
+    )
+
+    queue_candidate = _stage_queue_candidate(primary, classified)
+
+    assessments = _stage_assess(classified, scores)
 
     if not immediate and queue_candidate is None:
         return AdmissionPlan(
@@ -1125,6 +1446,7 @@ def route_decision(
             queue_candidate=None,
             terminal_fallback=primary,
             reason="no_eligible_candidates",
+            assessments=assessments,
         )
 
     if immediate:
@@ -1132,7 +1454,11 @@ def route_decision(
             reason = affinity_reason
         elif immediate[0] == primary:
             reason = "primary_available"
-        elif config.strategy == RoutingStrategy.PACE and pace_changed and primary in immediate:
+        elif (
+            config.strategy == RoutingStrategy.PACE
+            and pace_changed
+            and primary in immediate
+        ):
             reason = "pace_failover"
         else:
             reason = "failover"
@@ -1144,6 +1470,7 @@ def route_decision(
         queue_candidate=queue_candidate,
         terminal_fallback=primary,
         reason=reason,
+        assessments=assessments,
     )
 
 

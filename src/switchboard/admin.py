@@ -1382,6 +1382,116 @@ async def handle_config_get(
     )
 
 
+async def handle_route_plan(
+    send: Send,
+    scope: Scope,
+    proxy_app: Any,
+    admin_token: str | None,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """GET /admin/route-plan?model=<m>&key=<raw-key> — explain the decision.
+
+    Plan 026 W1.4. The operator's question is "who would serve model X right
+    now, and why". Before this, answering it meant re-deriving the decision by
+    hand from seven signals; the routing pipeline now carries a
+    :class:`~switchboard.control.CandidateAssessment` per surviving candidate,
+    and this surface hands them over.
+
+    Read-only in every sense that matters: no affinity pin is read or written,
+    no metric moves, no healthy-since clock advances (see
+    :meth:`~switchboard.proxy.ProxyApp.snapshot_route_plan`). Both
+    query params are optional — no ``model`` means unfiltered, no ``key`` means
+    the default route.
+
+    The raw key is accepted so an operator can ask about a *specific* client's
+    route. switchboard never echoes, logs, or stores it — the response reports
+    only whether a keyed entry matched. **Caution:** it travels in the query
+    string, and uvicorn's access log records query strings, so an operator who
+    passes ``key=`` on a deployment with access logging on writes that key to
+    the log. Omit it unless you are asking about a keyed route specifically;
+    the dashboard never sends it.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if admin_token and not check_admin_auth(scope, admin_token):
+        await send_json(send, 401, {"error": "unauthorized"}, extra_headers=cors)
+        return
+
+    raw_qs = scope.get("query_string") or b""
+    qs = parse_qs(raw_qs.decode("utf-8", "replace"))
+    model = (qs.get("model") or [""])[0] or None
+    raw_key = (qs.get("key") or [""])[0] or None
+
+    try:
+        snap = proxy_app.snapshot_route_plan(model=model, raw_key=raw_key)
+    except ValueError:
+        # route_decision's own guard: the route resolved to an empty candidate
+        # list. Same shape the request path answers with, so the explanation
+        # of a misconfigured estate matches what a client would see.
+        await send_json(
+            send, 503,
+            {"error": "no providers configured", "reason": "no_providers"},
+            extra_headers=cors,
+        )
+        return
+
+    plan = snap.plan
+    assessments = [
+        {
+            "provider": a.name,
+            "tier": a.tier.value,
+            "signals": list(a.signals),
+            "score": a.score,
+            "rank": a.rank,
+            "availability": (
+                snap.states[a.name].availability.value
+                if a.name in snap.states else None
+            ),
+            "freshness": (
+                snap.states[a.name].signal_freshness.value
+                if a.name in snap.states else None
+            ),
+        }
+        for a in plan.assessments
+    ]
+
+    # Why a candidate holds no tier at all. Only the filter stage excludes, so
+    # an operator asking "where did provider X go" gets an answer here rather
+    # than from an absence.
+    assessed = {a.name for a in plan.assessments}
+    excluded: list[dict[str, str]] = []
+    for name in snap.candidates:
+        if name in assessed:
+            continue
+        state = snap.states.get(name)
+        if state is None:
+            why = "not_running"
+        elif state.availability.value == "closed":
+            why = "closed"
+        elif state.signal_freshness.value == "unknown":
+            why = "unknown_freshness"
+        else:
+            why = "filtered"
+        excluded.append({"provider": name, "why": why})
+
+    await send_json(
+        send, 200,
+        {
+            "model": snap.model,
+            "keyed_route": snap.keyed_route,
+            "strategy": proxy_app.routing_config.strategy.value,
+            "candidates": list(snap.candidates),
+            "quarantined": list(snap.quarantined),
+            "assessments": assessments,
+            "excluded": excluded,
+            "immediate": list(plan.immediate_candidates),
+            "queue_candidate": plan.queue_candidate,
+            "terminal_fallback": plan.terminal_fallback,
+            "reason": plan.reason,
+        },
+        extra_headers=[*cors, (b"cache-control", b"no-store")],
+    )
+
+
 async def handle_quarantine_list(
     send: Send,
     quarantine: Any,

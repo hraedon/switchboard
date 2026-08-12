@@ -56,99 +56,198 @@ maps to zero pressure.
 
 ## 3. The routing decision (the pure function)
 
-`route_decision(states, table, route_key, config, now=now,
-healthy_since=None) -> AdmissionPlan`
+`route_decision(states, table, route_key, config, now=now, affinity=None,
+servable_providers=None, healthy_since=None) -> AdmissionPlan`
 
-The decision proceeds in this order (Plans 006, 008, 014, 015, 016):
+The decision is a **staged pipeline with an explicit ranking contract**
+(Plan 026). Before that plan it was a sediment of ten plans' mechanisms
+composing by accident, through guards written when someone noticed an
+interaction — N mechanisms with N² pairwise interactions, each pair handled
+bespoke. The pipeline makes stage membership definitional: every mechanism
+belongs to exactly one stage, and adding a mechanism means adding to a stage
+rather than threading a new branch through the decision.
 
-1. **Resolve** the route key to an ordered candidate list.
-2. **Filter** candidates by model servability when the request's model is
-   mapped (Plan 010 Feature B).
-3. **Filter** candidates by declared capability surfaces (Plan 008 §4).
-4. **Reject** missing and closed candidates.
-5. **Separate** fresh candidates from unknown/stale candidates and demote
-   pressured non-primary candidates to queue-eligible (headroom, token budget,
-   trailing-24h usage; Plan 013 allows the last to demote the primary).
-6. **Place** candidates with immediate permits (AVAILABLE) first.
-7. **Order** immediate candidates by the configured strategy: `ORDERED`
-   (default, table order), `HEADROOM` (`usage_headroom` descending, Plan 015;
-   `headroom_ranking = True` is equivalent), or `PACE` (weekly quota surplus
-   descending, Plan 020 D5). Data-bearing candidates precede ones without
-   data; ties break on table order. Pace applies a `pace_flap_margin`
-   deadband so near-equal providers don't alternate per-request.
-8. **Apply** affinity stickiness / dwell / failback logic (Plan 008 §5). After
-   `dwell_interval`, if the primary is in immediate and `failback_delay` is
-   configured, failback requires the primary to have been continuously
-   FRESH+AVAILABLE for at least `failback_delay` seconds (Plan 014).  When no
-   affinity pin is active, opportunistically front a qualifying quota-burn
-   fallback carrying measured headroom above `opportunistic_min_headroom` and a
-   reset within `opportunistic_reset_window` (Plan 016); subordinate to
-   affinity, de-preference only.
-9. **Preserve** primary preference among equally admissible candidates when
-   neither an affinity pin nor an opportunistic target pinned the front.
-10. **Select** at most one explicit queue candidate.
-11. **Preserve** the configured primary as the terminal safe-failure target
-    so its gate can provide the canonical rejection when nothing is usable.
+| # | Stage | Function | What lives here |
+|---|---|---|---|
+| 1 | **Resolve** | `_stage_resolve` | route table → ordered candidates; position 0 is the configured primary |
+| 2 | **Filter** | `_stage_filter` | hard constraints only, strictly subtractive: model servability (Plan 010), capability surfaces (Plan 008 §4). Quarantine (Plan 023) enters here too, expressed by the shell through `servable_providers` |
+| 3 | **Classify** | `_stage_classify` | every survivor gets exactly one tier; structurally unusable states (missing, `CLOSED`, UNKNOWN freshness) drop out; the signals that fired travel with the candidate |
+| 4 | **Rank** | `_stage_rank` | order the IMMEDIATE tier by the strategy's scoring key |
+| 5 | **Stickiness** | `_stage_stickiness` | affinity dwell, failback hysteresis, conversation pins, opportunistic burn; then `_stage_queue_candidate` picks at most one queue candidate |
+| 6 | **Emit** | `_stage_assess` | the plan, plus a per-candidate explanation |
 
-The function returns an `AdmissionPlan`:
+### 3.1 Tiers (stage 3)
+
+Lexicographic tiers, not a weighted cost function: a tier boundary is how the
+operator actually reasons ("never expensive if avoidable" is a boundary, not a
+coefficient).
+
+| Tier | Meaning | Members today |
+|---|---|---|
+| `IMMEDIATE` | eligible to serve now | FRESH + `AVAILABLE`, no demotion signal (and the primary on DEGRADED last-known-good) |
+| `QUEUE` | serve only via the queue path | `BUSY`; or demoted by peak window / low headroom / token budget / trailing-24h |
+| `BACKSTOP` | last resort, after every fresh candidate | non-primary DEGRADED |
+
+A candidate the filter stage removed holds **no tier at all** and appears in no
+assessment: it is out of the plan, and no later stage may resurrect it.
+
+### 3.2 Signals (stage 3)
+
+Each demotion signal is a named pure predicate `(state, config, is_primary) ->
+bool`, so a new pressure or cost signal is one row in `_DEMOTION_SIGNALS` plus
+one name in `SIGNAL_NAMES` — additive, never surgical. The names travel with
+the decision:
+
+| Signal | Fires when | May demote the primary? |
+|---|---|---|
+| `busy` | `availability == BUSY` (a fact, not a demotion) | n/a |
+| `low_headroom` | session `usage_headroom < headroom_threshold` (Plan 015) | no |
+| `over_budget` | `token_utilization >=` this provider's `soft_threshold`, else the global `token_budget_threshold` (Plan 012 §4) | no |
+| `over_24h` | `usage_24h_utilization >= usage_24h_threshold` (Plan 013) | **yes** |
+| `in_peak` | inside a configured peak-pricing window (Plan 025) | **yes** |
+| `degraded` | `signal_freshness == DEGRADED` (a fact) | n/a |
+
+`low_headroom` and `over_budget` never demote the primary — a proactive
+utilization signal must not de-prefer the provider whose own gate already
+handles its limits. The two that may are the ones the gate cannot see coming
+(trailing-day volume) or that are not about capacity at all (price).
+
+### 3.3 Ranking (stage 4)
+
+The strategy is nothing but the choice of scoring key for the IMMEDIATE tier:
+
+| `[routing] strategy` | Key | Notes |
+|---|---|---|
+| `ordered` (default) | table position | the primary fronts unless a pin or an opportunistic burn overrides |
+| `headroom` | `usage_headroom` desc | Plan 015; `headroom_ranking = true` is the same thing |
+| `pace` | weekly quota surplus desc | Plan 020 D5: `remaining_fraction − burn_rate × days_until_reset`; only FRESH weekly signals are scored, unscored providers follow in table order and are never starved; `pace_flap_margin` is a deadband on the top two, not hysteresis with memory |
+
+`QUEUE` and `BACKSTOP` keep candidate order — stale never outranks fresh, and a
+queue backstop is not a preference contest.
+
+### 3.4 Stickiness (stage 5)
+
+Affinity dwell (Plan 008 §5), failback hysteresis (Plan 014), conversation pins
+(Plan 019) and opportunistic burn (Plan 016) all front **at most one** IMMEDIATE
+member. One law, stated once: *stickiness may promote a provider within its
+tier, never across a tier boundary* — so a pinned provider that gets demoted
+(entering its peak window, say) loses the pin's effect automatically, because it
+is no longer in the tier the overlay reorders.
+
+Under `pace`, an expired pin goes inert rather than re-fronting the primary:
+failing back would overwrite exactly the surplus ordering stage 4 produced.
+(`headroom` still re-fronts the primary today; Plan 026 W2.1 generalizes the
+rule.)
+
+### 3.5 Queue-candidate selection (stage 5)
+
+A ranking contract, not a series of guards. In order:
+
+1. the primary, if it is queue-eligible;
+2. the first other `QUEUE`-tier member;
+3. the primary from `IMMEDIATE` — with nothing BUSY or demoted, a request whose
+   immediate acquisitions all lose the snapshot race should still wait on the
+   documented backstop rather than fail at once (§4 step 4);
+4. the first `BACKSTOP` — every fresh candidate is gone and the primary is
+   ineligible, but queueing on a DEGRADED fallback beats a 503: its signal
+   failed, not necessarily the provider (Plan 022 containment).
+
+Step 4 sitting last is "stale never outranks fresh" in its load-bearing
+position.
+
+### 3.6 The plan, and the explanation (stage 6)
 
 ```python
 @dataclass(frozen=True)
 class AdmissionPlan:
     immediate_candidates: tuple[str, ...]   # try these first (non-blocking)
     queue_candidate: str | None             # wait on this if immediate fails
-    terminal_fallback: str                  # safe-failure target (always primary)
+    terminal_fallback: str                  # safe-failure target
     reason: str                             # bounded reason code
+    assessments: tuple[CandidateAssessment, ...] = ()
+
+@dataclass(frozen=True)
+class CandidateAssessment:
+    name: str
+    tier: Tier                    # IMMEDIATE | QUEUE | BACKSTOP
+    signals: tuple[str, ...] = () # the names from SIGNAL_NAMES that fired
+    score: float | None = None    # the strategy's ranking key, IMMEDIATE only
+    rank: int = 0                 # 0-based position within its own tier
 ```
 
-### Reason codes
+`assessments` carries one entry per **surviving** candidate, ordered
+IMMEDIATE → QUEUE → BACKSTOP with each tier in its final order, so position in
+the tuple is the decision's own preference order. `tier == IMMEDIATE and
+rank == 0` is what will be tried first.
+
+`reason` is derived from the outcome and its strings are unchanged from before
+the pipeline existed:
 
 | Reason | Meaning |
 |---|---|
-| `primary_available` | Primary is in immediate candidates |
-| `failover` | A non-primary is in immediate candidates |
+| `primary_available` | Primary fronts the immediate candidates |
+| `failover` | A non-primary fronts the immediate candidates |
 | `affinity_dwell` | Affinity provider is pinned within `dwell_interval` |
-| `affinity_hysteresis` | Affinity pin held past dwell while primary reproves itself (Plan 014) |
-| `affinity_pinned` | Conversation pinning (Plan 019) holds the pin past dwell — no failback to primary while the pinned provider stays FRESH + AVAILABLE |
-| `opportunistic` | No affinity pin; a quota-bearing fallback with expiring headroom took front preference (Plan 016) |
-| `pace_failover` | Pace strategy ranked a non-primary provider highest by weekly quota surplus (Plan 020 D5) |
+| `affinity_hysteresis` | Affinity pin held past dwell while the primary reproves itself (Plan 014) |
+| `affinity_pinned` | Conversation pinning (Plan 019) holds the pin past dwell while the pinned provider stays FRESH + AVAILABLE |
+| `opportunistic` | No affinity pin; a quota-bearing fallback with expiring headroom took the front (Plan 016) |
+| `pace_failover` | Pace ranked a non-primary highest by weekly quota surplus (Plan 020 D5) |
 | `queue_only` | No immediate candidates; queue on a candidate |
-| `no_eligible_candidates` | All candidates are closed or unknown |
+| `no_eligible_candidates` | Every candidate is closed or unknown |
 | `model_unservable` | No configured provider serves the requested model |
 | `capability_filtered` | No candidate satisfies the route's required capabilities |
+
+Two consumers read the assessments:
+
+* **`GET /admin/route-plan?model=<m>&key=<raw-key>`** — the explain surface.
+  Admin-authed, read-only, both params optional (no model = unfiltered, no key
+  = the default route). It runs the *real* pipeline with `affinity=None` — an
+  explanation that can disagree with the decision is worse than none — and
+  touches no pin, no metric, and no healthy-since clock. The raw key is used to
+  compute a digest and is never echoed, logged, or stored by switchboard —
+  though it does travel in the query string, and uvicorn's access log records
+  those, so omit `key=` unless you are asking about a keyed route specifically.
+  The dashboard's Routing Explain card renders the response and never sends a
+  key.
+* **the decision log** — `recent_decisions` entries gain an additive `signals`
+  map (`{provider: [names]}`) for the candidates that had any, so "why did
+  traffic move off alpha at 14:00" is answerable from `/status.json` rather
+  than by reconstructing a state that has since moved on.
+
+### 3.7 Invariants
+
+Each has a named test in `tests/test_pipeline_invariants.py`.
+
+- **Demote, never drop.** No cost, pressure, or staleness signal may remove a
+  provider from the plan entirely. Only stage 2 excludes, and it excludes on
+  hard constraints alone.
+- **Stale never outranks fresh.** UNKNOWN is excluded from failover; a DEGRADED
+  fallback sorts after every fresh tier member in queue-candidate selection and
+  is never an immediate target.
+- **Signals are facts; policy lives in Classify/Rank.** The shell computes
+  booleans and numbers (`in_peak`, surplus, headroom, freshness). Nothing in
+  the shell orders candidates.
 
 Properties this guarantees:
 
 - **Fail safe.** When all providers are closed, the plan's `terminal_fallback`
   is the primary; the proxy forwards to it and lets its gate return 503. Never
-  silently drop a request.
-- **Stale data never improves preference.** Unknown/stale providers are
-  excluded from failover by default.
-- **Bounded stickiness.** After failover, the routing core prefers the affinity
+  silently drop a request. When model or capability filtering removes the
+  configured primary, the terminal fallback is the first *surviving* candidate,
+  so the canonical rejection comes from a provider that could actually serve
+  the request.
+- **Bounded stickiness.** After failover, the core prefers the affinity
   provider for at least `dwell_interval` seconds before considering failback.
 - **Failback hysteresis.** When `failback_delay > 0`, failback to the primary
   requires the primary to have been continuously FRESH+AVAILABLE for at least
-  `failback_delay` seconds. A single unhealthy poll resets the continuity clock.
+  `failback_delay` seconds. A single unhealthy poll resets the continuity
+  clock; the clock is read for the *effective* (post-filter) primary.
 - **Opportunistic quota burn (Plan 016).** Opt-in; subordinate to an active
-  affinity pin; de-preference only. A qualifying fallback with measured headroom
-  and a near-term quota reset may front `immediate`, but the primary remains
-  immediate-eligible, queue backstop, and terminal fallback. Stale or
-  unmeasured quota data never promotes.
-- **Pace routing (Plan 020 D5).** Opt-in via `[routing] strategy = "pace"`.
-  Ranks immediate candidates by weekly quota surplus (`remaining_fraction −
-  burn_rate × days_until_reset`) descending — a provider that will not
-  plausibly spend its remaining quota before reset is use-it-or-lose-it and
-  should be burned first. Only providers with a FRESH weekly signal are
-  scored; unscored providers rank after scored ones in table order (never
-  starved). `pace_flap_margin` is a deadband on the ranking: when the
-  leader's advantage over the runner-up is smaller than the margin, table
-  order is kept. It compares the top two candidates rather than remembering
-  the currently-serving one, so it suppresses per-request alternation without
-  being hysteresis in the with-memory sense. The primary is never demoted —
-  it may lose the front but stays immediate-eligible, queue backstop, and
-  terminal fallback.
-- **Pure.** `now`, `healthy_since`, and all provider states are
-  arguments. No I/O, no clock.
+  affinity pin; de-preference only — the primary stays immediate-eligible,
+  queue backstop, and terminal fallback. Stale or unmeasured data never
+  promotes.
+- **Pure.** `now`, `healthy_since`, and all provider states are arguments. No
+  I/O, no clock, stdlib only (enforced by `tests/test_import_boundary.py`).
 - **Deterministic.** Same inputs → same plan. Testable without a network.
 
 ## 4. Admission algorithm (the async shell)
@@ -236,6 +335,12 @@ Routing metrics use a bounded ring buffer for recent decisions (max 128
 entries). Evicted decisions are counted. No Prometheus labels are created from
 arbitrary client-provided values — route key hashes are truncated in display
 output. Provider names in metrics come from config, not from clients.
+
+Each entry carries `route_key_hash`, `selected` and `primary`, plus — when any
+candidate had a signal — the additive `signals` map from §3.6. The map is
+bounded by the candidate count inside a ring already bounded at 128, and is
+omitted entirely on an unremarkable decision, so existing consumers see exactly
+the three keys they always did.
 
 ## 9. What switchboard deliberately does not model
 
