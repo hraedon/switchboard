@@ -595,6 +595,24 @@ check('add with pasted key POSTs key_mode stored',
       && addStoredBody.api_key_stored === 'sk-brandnew',
       addStored && addStored.opts.body);
 
+// --- 21b. ADD FORM: quick-add with blank env sends explicit passthrough ----
+// There is no server default for key_mode; the pre-fix form omitted it and
+// the create 400ed. Review finding 3.
+resetFormEls();
+setEditing(true);
+vm.runInContext('editingProviderName = null;', sandbox);
+sandbox.renderProviderForm();
+$('pf-name').value = 'quick';
+$('pf-base').value = 'https://q.example';
+// selector stays at its default (env); the env var field is left blank.
+fetchCalls = [];
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await sandbox._saveProvider();
+const quickCall = fetchCalls.find(c => c.url === '/admin/providers');
+check('quick-add with blank env sends key_mode passthrough',
+      quickCall && JSON.parse(quickCall.opts.body).key_mode === 'passthrough',
+      quickCall && quickCall.opts.body);
+
 // --- 22. ADD FORM: explicit passthrough mode --------------------------------
 resetFormEls();
 setEditing(true);
@@ -684,6 +702,32 @@ const pdCall = fetchCalls.find(c => c.url === '/admin/providers/umans');
 check('mode switch to passthrough PUTs key_mode passthrough',
       pdCall && JSON.parse(pdCall.opts.body).key_mode === 'passthrough',
       pdCall && pdCall.opts.body);
+
+// --- 23c. stored → passthrough switch warns about erasing the key ----------
+// Review finding 4: the downgrade permanently erases the stored credential.
+resetFormEls();
+responsesByUrl = {};
+responsesByUrl['/admin/providers'] = {
+  ok: true, status: 200,
+  json: async () => ({
+    providers: [{
+      name: 'paid', upstream: 'https://p.example/v1', target: 2,
+      provider_type: 'generic', key_mode: 'stored', api_key_hint: '4321',
+      auth_header: 'authorization', enabled: true,
+    }],
+  }),
+};
+responsesByUrl['/admin/config/effective'] = {
+  ok: true, status: 200,
+  json: async () => ({ providers: [{ name: 'paid', env_locked: [] }] }),
+};
+setEditing(false);
+await sandbox.editProvider('paid');
+$('pf-key-mode').value = 'passthrough';
+$('pf-key-mode').onchange();
+check('stored→passthrough switch shows the erase warning',
+      /ERASES/.test($('pf-cred-block').innerHTML),
+      $('pf-cred-block').innerHTML.slice(0, 240));
 
 // --- 24. EDIT FORM: dashboard_provider + peak_windows round-trip ------------
 resetFormEls();

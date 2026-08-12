@@ -598,3 +598,31 @@ def test_plan025_section_builds_context_with_windows() -> None:
     )
     (w,) = contexts["zai"].peak_windows
     assert w.utc_offset_minutes == 480
+
+
+def test_plan025_tampered_peak_windows_row_is_skipped_on_load(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A DB row whose peak_windows cell holds malformed JSON is refused on
+    load (row skipped with a warning), not silently accepted as "no
+    windows" — silently dropping a peak guard means expensive burn with no
+    sign why (cross-lineage review, finding 1)."""
+    path = str(tmp_path / "store.sqlite")
+    mgr = ConfigStoreManager(sqlite_path=path)
+    mgr.upsert("zai", _stored_fields(
+        peak_windows=["mon-fri 14:00-18:00 +08:00"],
+    ))
+    mgr.close()
+
+    db = sqlite3.connect(path)
+    db.execute(
+        "UPDATE provider_config SET peak_windows = '{oops' WHERE name='zai'"
+    )
+    db.commit()
+    db.close()
+
+    with caplog.at_level(logging.WARNING):
+        reloaded = ConfigStoreManager(sqlite_path=path)
+    assert reloaded.get("zai") is None
+    assert any("skipping malformed" in r.message for r in caplog.records)
+    reloaded.close()
