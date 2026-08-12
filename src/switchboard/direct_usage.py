@@ -550,6 +550,10 @@ class DirectUsageTruthSource:
     last-known-good with ``ok=False`` (same fail-safe as the dashboard source).
     """
 
+    # Advisory: a usage scrape optimises routing; a broken scrape must not
+    # close the gate (Plan 022 containment — see ReconciliationLoop).
+    advisory = True
+
     def __init__(
         self,
         fetcher: UsageFetcher,

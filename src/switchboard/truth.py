@@ -130,6 +130,10 @@ class PolledTruthSource:
 class HeaderTruthSource:
     """Holds the latest LimitState built from response ratelimit headers."""
 
+    # Authoritative: the headers ARE the provider's rate-limit truth, so a
+    # stale reading fails the gate closed (see ReconciliationLoop).
+    advisory = False
+
     def __init__(
         self, *, provider: str = "anthropic", fresh_ttl: float = 15.0
     ) -> None:
@@ -185,6 +189,9 @@ class HeaderTruthSource:
 
 class NullTruthSource:
     """No external truth — generic provider."""
+
+    # No signal at all; nothing to fail closed on (fetch always returns ok).
+    advisory = True
 
     def __init__(self, *, provider: str = "generic") -> None:
         self._provider = provider

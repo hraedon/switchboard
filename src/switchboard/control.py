@@ -894,6 +894,12 @@ def route_decision(
 
     immediate: list[str] = []
     queue_eligible: list[str] = []
+    # DEGRADED non-primaries, appended to queue_eligible AFTER every fresh
+    # entry: stale data never makes a fallback more attractive than any fresh
+    # candidate, but a fallback whose usage scrape failed is still a better
+    # last resort than a 503 (Plan 022 containment — the signal is advisory,
+    # availability is not allowed to hinge on it).
+    degraded_backstop: list[str] = []
 
     for name in candidates:
         state = states.get(name)
@@ -952,6 +958,12 @@ def route_decision(
                 immediate.append(name)
             elif state.availability == Availability.BUSY:
                 queue_eligible.append(name)
+        elif state.signal_freshness == SignalFreshness.DEGRADED:
+            # Non-primary DEGRADED: never an immediate failover target
+            # (fresh-only-for-failover, docs/routing-model.md §2.2), but
+            # demoted rather than dropped — it remains a queue backstop
+            # ranked after every fresh candidate.
+            degraded_backstop.append(name)
         # UNKNOWN: excluded from failover preference (fresh-only-for-failover)
 
     # --- Immediate-candidate ordering (Plan 015 / Plan 020 D5) ---
@@ -996,6 +1008,21 @@ def route_decision(
             immediate.remove(affinity.provider)
             immediate.insert(0, affinity.provider)
             affinity_reason = "affinity_dwell"
+        elif (
+            config.strategy == RoutingStrategy.PACE
+            and not config.pin_conversations
+        ):
+            # PACE: once dwell expires, the pin goes inert — neither
+            # failback-to-primary nor extended stickiness applies, because
+            # both would overwrite the surplus ordering pace_rank just
+            # produced. Without this, every dwell expiry re-fronted the
+            # table primary (reason "primary_available"), so pace leaked one
+            # primary request per dwell interval per affinity key — a
+            # pin/failback cycle that diluted exactly the burn-surplus-first
+            # ordering the operator asked for. The primary is not privileged
+            # under PACE (see the opportunistic block below); it wins the
+            # front only on surplus.
+            pass
         elif primary in immediate and not config.pin_conversations:
             primary_clock = (
                 healthy_since.get(primary) if healthy_since else None
@@ -1075,6 +1102,11 @@ def route_decision(
         # rather than failing at once — docs/routing-model.md §4 step 4:
         # "then queue on configured primary for at most queue_timeout".
         queue_candidate = primary
+    elif degraded_backstop:
+        # Truly last resort: every fresh candidate is gone and the primary is
+        # ineligible, but a DEGRADED fallback exists. Queueing on it beats the
+        # no_eligible_candidates 503 — its signal failed, not the provider.
+        queue_candidate = degraded_backstop[0]
 
     if not immediate and queue_candidate is None:
         return AdmissionPlan(

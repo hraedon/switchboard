@@ -216,6 +216,61 @@ def test_degraded_fallback_not_failover_target() -> None:
     assert plan.queue_candidate == "umans"
 
 
+def test_degraded_fallback_is_last_resort_backstop() -> None:
+    """A DEGRADED fallback is demoted, not dropped: when the primary is
+    CLOSED and no fresh candidate exists, the request queues on the degraded
+    fallback instead of 503ing. Its *signal* failed, not the provider —
+    availability must not hinge on an advisory scrape (Plan 022)."""
+    states = {
+        "umans": _state("umans", availability=Availability.CLOSED),
+        "ollama": _state(
+            "ollama",
+            availability=Availability.AVAILABLE,
+            signal_freshness=SignalFreshness.DEGRADED,
+        ),
+    }
+    plan = route_decision(states, TABLE, "any_key", CONFIG, now=0.0)
+    assert plan.immediate_candidates == ()
+    assert plan.queue_candidate == "ollama"
+    assert plan.reason == "queue_only"
+
+
+def test_degraded_fallback_never_outranks_fresh_backstop() -> None:
+    """The degraded backstop is strictly last: with a fresh primary
+    available, the queue slot stays on the primary, and the degraded
+    fallback is neither immediate nor the queue candidate."""
+    states = {
+        "umans": _state("umans"),
+        "ollama": _state(
+            "ollama",
+            availability=Availability.AVAILABLE,
+            signal_freshness=SignalFreshness.DEGRADED,
+        ),
+    }
+    plan = route_decision(states, TABLE, "any_key", CONFIG, now=0.0)
+    assert "ollama" not in plan.immediate_candidates
+    assert plan.queue_candidate == "umans"
+
+
+def test_degraded_fallback_yields_to_fresh_busy_fallback() -> None:
+    """A fresh-but-BUSY fallback outranks a degraded one for the queue slot:
+    stale data never makes a candidate more attractive than fresh data."""
+    table = RouteTable(
+        entries={}, default_providers=("umans", "ollama", "zai")
+    )
+    states = {
+        "umans": _state("umans", availability=Availability.CLOSED),
+        "ollama": _state(
+            "ollama",
+            availability=Availability.AVAILABLE,
+            signal_freshness=SignalFreshness.DEGRADED,
+        ),
+        "zai": _state("zai", availability=Availability.BUSY),
+    }
+    plan = route_decision(states, table, "any_key", CONFIG, now=0.0)
+    assert plan.queue_candidate == "zai"
+
+
 def test_both_busy_queue_on_primary() -> None:
     states = {
         "umans": _state("umans", availability=Availability.BUSY),
@@ -1993,6 +2048,88 @@ def test_pace_with_affinity_still_pins() -> None:
     # ollama has worse surplus, but the dwell pin holds it at front.
     assert plan.immediate_candidates[0] == "ollama"
     assert plan.reason == "affinity_dwell"
+
+
+def test_pace_post_dwell_pin_goes_inert() -> None:
+    """Once dwell expires under PACE the pin goes inert: the surplus ordering
+    stands, and the table primary is NOT re-fronted. Before this fix the
+    failback branch unconditionally re-fronted the primary after every dwell
+    expiry, leaking one primary request per dwell interval per affinity key —
+    a pin/failback cycle that diluted the burn-surplus-first ordering."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE, dwell_interval=30.0,
+    )
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.10, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.90, weekly_reset_in=86400.0,
+        ),
+    }
+    # Pin on the surplus winner, dwell long expired (selected_at=0, now=100).
+    affinity = _affinity("ollama", selected_at=0.0)
+    plan = route_decision(
+        states, table, "k", config, now=100.0, affinity=affinity,
+    )
+    # ollama fronts on surplus, not on the (expired) pin; zai stays eligible.
+    assert plan.immediate_candidates[0] == "ollama"
+    assert "zai" in plan.immediate_candidates
+    assert plan.reason == "pace_failover"
+
+
+def test_pace_post_dwell_ignores_failback_hysteresis() -> None:
+    """failback_delay is a failback concept; under PACE there is no failback
+    to gate, so an expired pin must not be held by hysteresis either — the
+    surplus ordering decides."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE,
+        dwell_interval=30.0,
+        failback_delay=300.0,
+    )
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.90, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.10, weekly_reset_in=86400.0,
+        ),
+    }
+    # Pin on the surplus LOSER, dwell expired. Hysteresis would have held it.
+    affinity = _affinity("ollama", selected_at=0.0)
+    plan = route_decision(
+        states, table, "k", config, now=100.0, affinity=affinity,
+    )
+    assert plan.immediate_candidates[0] == "zai"
+    assert plan.reason == "primary_available"
+
+
+def test_pace_post_dwell_conversation_pin_still_holds() -> None:
+    """pin_conversations (Plan 019 §6) outranks the PACE inert-pin rule: a
+    pinned conversation stays put past dwell as long as the pinned provider
+    is FRESH + AVAILABLE."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE,
+        dwell_interval=30.0,
+        pin_conversations=True,
+    )
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.90, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.10, weekly_reset_in=86400.0,
+        ),
+    }
+    affinity = _affinity("ollama", selected_at=0.0)
+    plan = route_decision(
+        states, table, "k", config, now=100.0, affinity=affinity,
+    )
+    assert plan.immediate_candidates[0] == "ollama"
+    assert plan.reason == "affinity_pinned"
 
 
 def test_pace_strategy_default_is_ordered() -> None:

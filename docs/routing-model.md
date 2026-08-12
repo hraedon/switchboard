@@ -31,7 +31,7 @@ A provider's **signal freshness** is:
 | Freshness | Meaning |
 |---|---|
 | **FRESH** | Ready and last fetch succeeded — may be selected or preferred normally |
-| **DEGRADED** | Ready but last fetch failed — last-known-good; primary may keep serving, not a new failover target |
+| **DEGRADED** | Ready but last fetch failed — last-known-good; primary may keep serving; a fallback is demoted to a last-resort queue backstop, never an immediate failover target |
 | **UNKNOWN** | Not ready — excluded from failover preference; unknown data never maps to zero pressure |
 
 ### 2.1 Live saturation (WI-006.1)
@@ -46,9 +46,13 @@ saturation.
 
 Stale or unknown data can never make a fallback more attractive. The default
 policy is **fresh-only-for-failover**: only FRESH candidates are eligible for
-failover. DEGRADED data may keep an already-primary route serving within a
-bounded TTL, but it is not a new failover target. UNKNOWN is excluded from
-failover entirely. Unknown data never maps to zero pressure.
+immediate failover. DEGRADED data may keep an already-primary route serving,
+but it is not a new immediate failover target; a DEGRADED fallback is demoted
+to a *last-resort queue backstop*, selected only when every fresh candidate
+and the primary are ineligible — its signal failed, not necessarily the
+provider, and availability must not hinge on an advisory signal (Plan 022
+containment). UNKNOWN is excluded from failover entirely. Unknown data never
+maps to zero pressure.
 
 ## 3. The routing decision (the pure function)
 
