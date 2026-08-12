@@ -166,6 +166,30 @@ if ($('del-route-0') && $('del-route-0').onclick) await $('del-route-0').onclick
 check('row delete button calls deleteRoute for its key',
       fetchCalls.some(c => c.url === '/admin/routes/k1'));
 
+// --- 9b. model-map row Edit opens a pre-filled edit form -------------------
+check('model-map table has an edit button', !!$('edit-model-0'));
+$('edit-model-0').onclick();
+check('edit sets editingModel', getEditingModel() === true);
+check('edit form pre-fills the model name', $('mf-model').value === 'glm-5.2',
+      $('mf-model').value);
+check('edit form locks the model name (map key)',
+      /id="mf-model"[^>]*disabled/.test($('model-add').innerHTML));
+check('edit form pre-fills the existing alias',
+      $('mf-umans-alias').value === 'umans-glm-5.2', $('mf-umans-alias').value);
+$('mf-umans-alias').value = 'umans-glm-5.2-tuned';
+fetchCalls = [];
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await $('mf-save').onclick();
+const editCall = fetchCalls.find(
+  c => c.url === '/admin/model-map' && c.opts && c.opts.method === 'POST');
+check('edit save POSTs the updated alias set', !!editCall);
+check('edit save sends model name + edited alias',
+      editCall && JSON.stringify(JSON.parse(editCall.opts.body)) ===
+        JSON.stringify({ model: 'glm-5.2',
+                         aliases: { umans: 'umans-glm-5.2-tuned' } }),
+      editCall && editCall.opts.body);
+check('edit save clears editingModel', getEditingModel() === false);
+
 // --- 10. XSS: route/model content is escaped in the tables ----------------
 nextResponse = {
   ok: true, status: 200,
