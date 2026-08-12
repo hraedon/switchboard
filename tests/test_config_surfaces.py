@@ -29,6 +29,7 @@ from switchboard.admin import (
 from switchboard.cli import _ConfigError, _validate_config
 from switchboard.control import (
     MUTABLE_ROUTING_FIELDS,
+    RETIRED_ROUTING_FIELDS,
     ROUTING_BOOL_FIELDS,
     ROUTING_FIELD_BOUNDS,
     ROUTING_STRATEGIES,
@@ -149,7 +150,6 @@ async def test_disabled_sentinel_zero_is_accepted_by_both() -> None:
         "headroom_threshold",
         "token_budget_threshold",
         "usage_24h_threshold",
-        "opportunistic_margin",
         "pace_flap_margin",
     ):
         assert _toml_accepts(field, 0.0), f"TOML rejected {field}=0.0"
@@ -159,9 +159,33 @@ async def test_disabled_sentinel_zero_is_accepted_by_both() -> None:
 @pytest.mark.asyncio
 async def test_inclusive_maximum_is_accepted_by_both() -> None:
     """1.0 is in range for these; the admin API used to reject it."""
-    for field in ("pace_burn_rate_per_day", "opportunistic_min_headroom"):
+    for field in ("pace_burn_rate_per_day",):
         assert _toml_accepts(field, 1.0), f"TOML rejected {field}=1.0"
         assert await _api_accepts(field, 1.0), f"admin API rejected {field}=1.0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", RETIRED_ROUTING_FIELDS)
+async def test_retired_fields_parse_from_toml_but_are_refused_by_the_api(
+    field: str,
+) -> None:
+    """The one place the surfaces are *deliberately* asymmetric (Plan 026 W2.2).
+
+    A retired field keeps its TOML bounds because an operator's config file
+    outlives the mechanism it configured, and failing a boot over a knob that is
+    merely pointless would trade availability for tidiness. A *write* is a
+    different act: it is a human deciding to rely on the mechanism right now, so
+    it is refused with the reason and the replacement. This asymmetry is the
+    reason the parametrized surface-agreement test above iterates
+    ``MUTABLE_ROUTING_FIELDS`` rather than every bounded field.
+    """
+    probe: object = True if field in ROUTING_BOOL_FIELDS else 0.5
+    assert _toml_accepts(field, probe), f"TOML rejected {field}={probe!r}"
+    status, body = await _put({field: probe})
+    assert status == 400
+    assert "retired" in body["error"]
+    assert "Plan 026" in body["error"]
+    assert "pace" in body["error"]
 
 
 async def _put(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:

@@ -103,6 +103,7 @@ button {
 <div id="route-add"></div>
 <div id="model-add"></div>
 <div id="routing-config-editor"></div>
+<div id="routing-explain"></div>
 <div id="app">Loading...</div>
 <script>
 // The default route is the only control on this page that WRITES, so it lives
@@ -931,8 +932,10 @@ async function _fetchProviderModels(provider) {
 // name (the map key) is locked, alias inputs are pre-filled, and saving
 // POSTs the full replacement alias set — POST /admin/model-map is
 // add-or-update server-side, so clearing an alias removes that provider
-// from the model.
-function renderModelAddForm(knownProviders, editModelName, editAliases) {
+// from the model. `editPreference` (Plan 026 W3) pre-fills the optional
+// preference order; leaving that field blank omits it from the POST, which
+// clears any stored preference for the same add-or-replace reason.
+function renderModelAddForm(knownProviders, editModelName, editAliases, editPreference) {
   const el = document.getElementById('model-add');
   const provs = (knownProviders || []).slice().sort();
   const editing = !!editModelName;
@@ -971,6 +974,14 @@ function renderModelAddForm(knownProviders, editModelName, editAliases) {
         ${editNote}
       </div>
       ${aliasRows || '<p style="color:var(--muted)">No providers configured.</p>'}
+      <div class="form-row">
+        <label for="mf-preference">Preference order (optional)</label>
+        <input id="mf-preference" autocomplete="off"
+               placeholder="comma-separated, e.g. zai, umans">
+        <span style="color:var(--muted);font-size:0.75rem">reorders the
+        immediate tier for this model: named providers first, in this order.
+        Each must have an alias above. Blank = no preference.</span>
+      </div>
       <div id="mf-error" style="color:var(--red);font-size:0.85rem;margin-bottom:0.5rem"></div>
       <button id="mf-save">${editing ? 'Save changes' : 'Save'}</button>
       <button id="mf-cancel" style="background:transparent;border:1px solid var(--border)">Cancel</button>
@@ -982,6 +993,11 @@ function renderModelAddForm(knownProviders, editModelName, editAliases) {
   {
     const nameEl = document.getElementById('mf-model');
     if (nameEl) nameEl.value = editing ? editModelName : '';
+    const prefEl = document.getElementById('mf-preference');
+    if (prefEl) {
+      prefEl.value = (editing && Array.isArray(editPreference))
+        ? editPreference.join(', ') : '';
+    }
     for (const p of provs) {
       const e = document.getElementById(_domId(p) + '-alias');
       if (e) e.value = (editing && editAliases && editAliases[p]) ? editAliases[p] : '';
@@ -1055,12 +1071,27 @@ function renderModelAddForm(knownProviders, editModelName, editAliases) {
       errEl.textContent = 'fill in at least one provider alias';
       return;
     }
+    // Preference: comma-separated, trimmed, blanks dropped. Sent only when
+    // non-empty — the POST replaces the whole entry, so omitting the field is
+    // how a blank input clears a stored preference (and the handler treats an
+    // absent field, null, and [] alike). Names are checked server-side against
+    // this request's aliases; a local pre-check keeps the round trip honest.
+    const prefRaw = ((document.getElementById('mf-preference') || {}).value || '');
+    const preference = prefRaw.split(',').map(s => s.trim()).filter(s => s);
+    const unaliased = preference.filter(p => !aliases[p]);
+    if (unaliased.length) {
+      errEl.textContent = 'preference names provider(s) with no alias: '
+        + unaliased.join(', ');
+      return;
+    }
+    const payload = { model, aliases };
+    if (preference.length) payload.preference = preference;
     try {
       const resp = await fetch('/admin/model-map', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         credentials: 'same-origin',
-        body: JSON.stringify({ model, aliases }),
+        body: JSON.stringify(payload),
       });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) { errEl.textContent = data.error || ('HTTP ' + resp.status); return; }
@@ -1447,6 +1478,143 @@ function renderRoutingConfigForm(rc) {
     }
   };
 }
+// ── Routing Explain (Plan 026 W1.6) ──────────────────────────────────────
+// "Who would serve model X right now, and why." The routing pipeline carries
+// a per-candidate assessment (tier, signals, score, rank); this card asks
+// /admin/route-plan for them so the answer is the decision's own, not a
+// re-derivation. Lives outside #app, and `explainPinned` freezes the card
+// while results are shown — same shape as scanPinned, because a 5 s poll
+// wiping the answer the operator is reading is the failure mode here.
+let explainPinned = false;
+
+const _TIER_STYLE = {
+  immediate: 'open', queue: 'saturated', backstop: 'unknown',
+};
+
+function renderRoutingExplain(data) {
+  if (explainPinned) return;
+  const el = document.getElementById('routing-explain');
+  const models = Object.keys(data.model_map || {}).sort();
+  el.innerHTML = `
+    <h2>Routing Explain</h2>
+    <div class="card">
+      <p style="margin:0 0 0.6rem;color:var(--muted);font-size:0.85rem">
+        Ask where a model would go right now, and why. Read-only: it never
+        moves a pin, a metric, or a live conversation. Leave the model blank
+        to explain the default route unfiltered.
+      </p>
+      <div class="form-row">
+        <label for="explain-model">Model</label>
+        <input id="explain-model" list="explain-model-known" autocomplete="off"
+               placeholder="${models.length ? esc(models[0]) : 'e.g. glm-5.2'}">
+        <datalist id="explain-model-known">
+          ${models.map(m => `<option value="${esc(m)}">`).join('')}
+        </datalist>
+      </div>
+      <button id="explain-btn">Explain</button>
+      <div id="explain-results" style="margin-top:0.6rem"></div>
+    </div>`;
+  const btn = document.getElementById('explain-btn');
+  if (btn) btn.onclick = runRouteExplain;
+}
+
+async function runRouteExplain() {
+  // Pin BEFORE the first await: a poll landing during the fetch would
+  // otherwise re-render the card and drop the results into a dead element.
+  explainPinned = true;
+  const model = document.getElementById('explain-model').value.trim();
+  const out = document.getElementById('explain-results');
+  out.innerHTML = '<span style="color:var(--muted)">explaining…</span>';
+  let body;
+  try {
+    const url = '/admin/route-plan'
+      + (model ? '?model=' + encodeURIComponent(model) : '');
+    const resp = await fetch(url, { credentials: 'same-origin' });
+    body = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      out.innerHTML = `<div style="color:var(--red);font-size:0.85rem">`
+        + `${esc(body.error || 'request failed (' + resp.status + ')')}</div>`
+        + _explainDismissHtml();
+      _wireExplainDismiss();
+      return;
+    }
+  } catch (e) {
+    out.innerHTML = `<div style="color:var(--red);font-size:0.85rem">${esc(e)}</div>`
+      + _explainDismissHtml();
+    _wireExplainDismiss();
+    return;
+  }
+  out.innerHTML = _explainHtml(body) + _explainDismissHtml();
+  _wireExplainDismiss();
+}
+
+function _explainHtml(body) {
+  const rows = (body.assessments || []).map(a => {
+    const selected = a.tier === 'immediate' && a.rank === 0;
+    const tierCls = _TIER_STYLE[a.tier] || 'unknown';
+    const score = (a.score === null || a.score === undefined)
+      ? '<span style="color:var(--muted)">—</span>'
+      : Number(a.score).toFixed(3);
+    const sig = (a.signals || []).length
+      ? a.signals.map(s => `<code>${esc(s)}</code>`).join(' ')
+      : '<span style="color:var(--muted)">—</span>';
+    return `<tr${selected ? ' style="font-weight:600"' : ''}>`
+      + `<td>${esc(a.provider)}${selected ? ' &larr; selected' : ''}</td>`
+      + `<td><span class="badge ${tierCls}">${esc(a.tier)}</span></td>`
+      + `<td>${sig}</td><td>${score}</td><td>${a.rank + 1}</td></tr>`;
+  }).join('');
+  let html = `<div class="stat"><span class="k">reason</span>`
+    + `<span class="v"><code>${esc(body.reason || '?')}</code></span></div>`
+    + `<div class="stat"><span class="k">strategy</span>`
+    + `<span class="v">${esc(body.strategy || '?')}</span></div>`
+    + `<div class="stat"><span class="k">immediate order</span><span class="v">`
+    + `${(body.immediate || []).length
+        ? esc((body.immediate || []).join(' → '))
+        : '<em>none</em>'}</span></div>`
+    + `<div class="stat"><span class="k">queue candidate</span><span class="v">`
+    + `${body.queue_candidate ? esc(body.queue_candidate) : '<em>none</em>'}`
+    + `</span></div>`
+    + `<div class="stat"><span class="k">terminal fallback</span>`
+    + `<span class="v">${esc(body.terminal_fallback || '?')}</span></div>`;
+  // Per-model preference (Plan 026 W3): shown only when the model has one, so
+  // the card does not grow a permanently empty row.
+  if ((body.preference || []).length) {
+    html += `<div class="stat"><span class="k">model preference</span>`
+      + `<span class="v">${esc(body.preference.join(' → '))}</span></div>`;
+  }
+  if (rows) {
+    html += '<table style="margin-top:0.5rem"><tr><th>provider</th><th>tier</th>'
+      + '<th>signals</th><th>score</th><th>order</th></tr>' + rows + '</table>';
+  } else {
+    html += '<p style="color:var(--muted);font-size:0.85rem">'
+      + 'No candidate holds a tier — every one was filtered out.</p>';
+  }
+  const excluded = body.excluded || [];
+  if (excluded.length) {
+    html += '<p style="margin:0.5rem 0 0.2rem;color:var(--muted);font-size:0.8rem">'
+      + 'Excluded by the filter stage (no tier):</p>';
+    html += excluded.map(e =>
+      `<div class="stat"><span class="k">${esc(e.provider)}</span>`
+      + `<span class="v" style="color:var(--muted)">${esc(e.why)}</span></div>`
+    ).join('');
+  }
+  if ((body.quarantined || []).length) {
+    html += `<p style="margin:0.4rem 0 0;color:var(--amber);font-size:0.8rem">`
+      + `quarantined for this model: ${esc(body.quarantined.join(', '))}</p>`;
+  }
+  return html;
+}
+
+function _explainDismissHtml() {
+  return '<div style="margin-top:0.5rem">'
+    + '<button id="explain-dismiss" class="mini-btn">Dismiss</button></div>';
+}
+
+function _wireExplainDismiss() {
+  const d = document.getElementById('explain-dismiss');
+  if (d) d.onclick = () => { explainPinned = false; load(); };
+}
+
 async function load() {
   const resp = await fetch('/status.json');
   if (!resp.ok) {
@@ -1461,6 +1629,7 @@ async function load() {
   renderRouteAdd(data);
   renderModelAdd(data);
   renderRoutingConfigEditor(data);
+  renderRoutingExplain(data);
 
   // Separate surface from status.json, and optional: a dashboard served
   // without an admin token still renders everything else rather than failing
@@ -1658,6 +1827,9 @@ async function load() {
   // matrix shows every configured provider per model, with the alias filled in
   // or a dash where the provider lacks one.
   const mm = data.model_map || {};
+  // Parallel to model_map (Plan 026 W3): { model: [provider, ...] }. Kept
+  // out of model_map's values so the alias matrix's shape is unchanged.
+  const mpref = data.model_preferences || {};
   const mmModels = Object.keys(mm);
   const allProviders = Object.keys(data.providers || {}).sort();
   html += '<h2>Model Map</h2>';
@@ -1671,7 +1843,11 @@ async function load() {
     html += '<th></th></tr></thead><tbody>';
     mmModels.sort().forEach((model, mi) => {
       const aliases = mm[model] || {};
-      html += `<tr><td><code>${esc(model)}</code></td>`;
+      const pref = Array.isArray(mpref[model]) ? mpref[model] : [];
+      const prefNote = pref.length
+        ? `<div style="color:var(--muted);font-size:0.75rem">prefer: ${pref.map(esc).join(' &rarr; ')}</div>`
+        : '';
+      html += `<tr><td><code>${esc(model)}</code>${prefNote}</td>`;
       for (const pn of allProviders) {
         const alias = aliases[pn];
         if (alias != null) {
@@ -1753,7 +1929,10 @@ async function load() {
     if (ebtn) ebtn.onclick = () => {
       scanPinned = false;
       editingModel = true;
-      renderModelAddForm(allProviders, model, mm[model] || {});
+      renderModelAddForm(
+        allProviders, model, mm[model] || {},
+        Array.isArray(mpref[model]) ? mpref[model] : [],
+      );
     };
   });
   // Wire quarantine Release buttons (Plan 023 WI-4).

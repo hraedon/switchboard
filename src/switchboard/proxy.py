@@ -36,7 +36,7 @@ import math
 import os
 import time
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -70,6 +70,7 @@ from switchboard.admin import (
     handle_route_default_set,
     handle_route_delete,
     handle_route_list,
+    handle_route_plan,
     handle_routing_config_update,
     handle_threshold_events,
     handle_usage_history,
@@ -85,6 +86,7 @@ from switchboard.control import (
     AdmissionPlan,
     Availability,
     ModelMap,
+    ProviderState,
     RouteAffinity,
     RoutingConfig,
     SignalFreshness,
@@ -211,6 +213,12 @@ _CONTROL_HEADERS = frozenset(
     {
         "x-switchboard-route-key",
         "x-switchboard-qos",
+        # Only meaningful to GET /admin/route-plan (Plan 026), which forwards
+        # nothing — but it carries a raw API key, and a control header that
+        # reached an upstream would hand one vendor another vendor's
+        # credential. Listed explicitly because the name predates the
+        # ``x-switchboard-`` prefix rule below and so is not covered by it.
+        "x-route-plan-key",
     }
 )
 
@@ -292,6 +300,36 @@ class _RerouteProbe:
     transport_error: str = ""
 
 
+@dataclass(frozen=True)
+class RoutePlanSnapshot:
+    """What would happen to a request right now, and why (Plan 026 W1.4).
+
+    Produced by :meth:`ProxyApp.snapshot_route_plan` for the read-only
+    explain surface.  It is the *same* shell work the request path does —
+    route resolution under key rotation, the model map, quarantine, provider
+    state snapshots — followed by the *same* pure ``route_decision``, so the
+    explanation cannot drift from the decision.  Nothing here mutates
+    affinity, metrics, or the healthy-since clocks.
+    """
+
+    #: The requested model, or None when the caller asked unfiltered.
+    model: str | None
+    #: The pre-filter candidate list the route resolved to.
+    candidates: tuple[str, ...]
+    #: True when a keyed route entry matched (rather than the default route).
+    keyed_route: bool
+    #: (provider, model) pairs a human has not released, for this model.
+    quarantined: tuple[str, ...]
+    #: The states fed to the decision, by provider name.
+    states: dict[str, ProviderState]
+    #: The decision itself, assessments included.
+    plan: AdmissionPlan
+    #: The per-model provider preference fed to the decision (Plan 026 W3),
+    #: empty when the model has none.  Carried so the explain surface can say
+    #: which position each candidate held without re-reading the model map.
+    preference: tuple[str, ...] = ()
+
+
 @dataclass
 class RoutingMetrics:
     """Per-provider routing counters surfaced in /status.json and /metrics.
@@ -305,7 +343,7 @@ class RoutingMetrics:
     forwarded_per_provider: dict[str, int] = field(default_factory=dict)
     failovers: int = 0
     routing_decisions: int = 0
-    recent_decisions: deque[dict[str, str]] = field(
+    recent_decisions: deque[dict[str, Any]] = field(
         default_factory=lambda: deque(maxlen=_RECENT_DECISIONS_MAX)
     )
     evicted_decisions: int = 0
@@ -329,17 +367,45 @@ class RoutingMetrics:
         self.affinity_evictions_total += 1
 
     def record_decision(
-        self, route_key: str, selected: str, primary: str
+        self,
+        route_key: str,
+        selected: str,
+        primary: str,
+        signals: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
-        """Record a routing decision and whether it was a failover."""
+        """Record a routing decision and whether it was a failover.
+
+        ``primary`` is the **effective** primary — the plan's own
+        ``terminal_fallback``, i.e. the first candidate that survived model-map
+        and quarantine filtering (Plan 026 W2.3). So ``failovers`` counts a move
+        off a provider that could have served this request, and no longer counts
+        a model simply not being offered by the configured primary, which used
+        to inflate the counter on every request for such a model.
+
+        ``signals`` (Plan 026 W1.5) is the decision's per-candidate signal
+        names — ``{provider: ["in_peak", ...]}`` — for the candidates that had
+        any. It is written as an additive ``signals`` key and only when
+        non-empty, so an existing consumer of ``recent_decisions`` sees the
+        same three keys it always did on an unremarkable decision, and the
+        interesting ones become answerable without re-deriving the state that
+        produced them. Bounded by the candidate count, inside a ring already
+        bounded at ``_RECENT_DECISIONS_MAX``.
+        """
         self.routing_decisions += 1
         if len(self.recent_decisions) == self.recent_decisions.maxlen:
             self.evicted_decisions += 1
-        self.recent_decisions.append({
+        entry: dict[str, Any] = {
             "route_key_hash": route_key[:16] + "...",
             "selected": selected,
             "primary": primary,
-        })
+        }
+        if signals:
+            entry["signals"] = {
+                name: list(fired) for name, fired in signals.items() if fired
+            }
+            if not entry["signals"]:
+                del entry["signals"]
+        self.recent_decisions.append(entry)
         if selected != primary:
             self.failovers += 1
 
@@ -540,6 +606,90 @@ class ProxyApp:
         """The config store, where a routing change is persisted."""
         return self._config_store
 
+    def snapshot_route_plan(
+        self, *, model: str | None = None, raw_key: str | None = None
+    ) -> RoutePlanSnapshot:
+        """Explain the routing decision for a hypothetical request. Read-only.
+
+        Backs ``GET /admin/route-plan`` (Plan 026 W1.4): the operator asks "who
+        would serve model X right now, and why", and gets the decision's own
+        per-candidate assessments instead of re-deriving seven signals by hand.
+
+        Deliberately runs the real pipeline rather than a parallel
+        approximation — an explanation that can disagree with the decision is
+        worse than none. It is read-only in the ways that matter:
+
+        * ``affinity=None`` — no pin is read, created, or refreshed, so
+          explaining a route cannot move a live conversation.
+        * metrics are untouched (no ``record_decision``).
+        * the healthy-since clocks are copied, never advanced or cleared.
+
+        ``model=None`` skips model-map filtering and quarantine (both are
+        per-model). ``raw_key=None`` explains the default route.
+        """
+        if raw_key:
+            candidates, hashed_key = self._match_route(raw_key)
+            keyed_route = self._route_table.get_entry(hashed_key) is not None
+        else:
+            # No key = the default route. Resolving through an empty digest
+            # keeps route_decision's own resolution (which re-looks-up the
+            # key) landing on the same list this snapshot reports.
+            hashed_key = ""
+            candidates = self._route_table.default_providers
+            keyed_route = False
+
+        servable_providers: frozenset[str] | None = None
+        model_preference: tuple[str, ...] = ()
+        model_map = self._model_map_mgr.get_model_map()
+        if model and model in model_map:
+            servable_providers = model_map.providers_for(model)
+            model_preference = model_map.preference_for(model)
+
+        quarantined: tuple[str, ...] = ()
+        if self._quarantine is not None and model:
+            blocked = self._quarantine.quarantined_for(model)
+            if blocked:
+                quarantined = blocked
+                base = (
+                    servable_providers
+                    if servable_providers is not None
+                    else frozenset(candidates)
+                )
+                servable_providers = base - frozenset(blocked)
+
+        now_mono = time.monotonic()
+        states: dict[str, ProviderState] = {}
+        for name in candidates:
+            ctx = self._providers.get(name)
+            if ctx is not None:
+                states[name] = snapshot_provider_state(
+                    name, ctx, now=now_mono,
+                    overload_tracker=self._overload_tracker,
+                    budget_tracker=self._budget_tracker,
+                    usage_history_tracker=self._usage_history_tracker,
+                )
+
+        plan = route_decision(
+            states,
+            self._route_table.get_route_table(),
+            hashed_key,
+            self._routing_config,
+            now=now_mono,
+            affinity=None,
+            servable_providers=servable_providers,
+            healthy_since=dict(self._provider_healthy_since),
+            model_preference=model_preference,
+        )
+        return RoutePlanSnapshot(
+            model=model,
+            candidates=tuple(candidates),
+            keyed_route=keyed_route,
+            quarantined=quarantined,
+            states=states,
+            plan=plan,
+            preference=model_preference,
+        )
+
     def update_routing_config(self, config: RoutingConfig) -> None:
         """Swap the routing config at runtime (Plan 020 WI-14).
 
@@ -588,7 +738,7 @@ class ProxyApp:
                     "/admin/config/effective", "/admin/config/reset",
                     "/admin/config/routing",
                     "/admin/model-map", "/admin/providers",
-                    "/admin/preview-path",
+                    "/admin/preview-path", "/admin/route-plan",
                     "/admin/threshold-events", "/admin/usage-history",
                     "/login", "/logout",
                 )
@@ -730,6 +880,20 @@ class ProxyApp:
                 send, self._route_table, self._admin_token,
                 scope, hashed_key, self._cors_allow_origin,
             )
+            return
+
+        # Plan 026 W1.4 — the read-only explain surface. Auth is checked inside
+        # the handler (like /admin/quarantine), and the branch sits ahead of
+        # nothing it could shadow: "/admin/route-plan" is not under
+        # "/admin/routes/".
+        if path == "/admin/route-plan":
+            if method == "GET":
+                await handle_route_plan(
+                    send, scope, self, self._admin_token,
+                    self._cors_allow_origin,
+                )
+                return
+            await send_text(send, 405, "Method not allowed")
             return
 
         if path == "/admin/model-map":
@@ -1148,6 +1312,10 @@ class ProxyApp:
         buffered_body: bytes | None = None
         request_model: str | None = None
         servable_providers: frozenset[str] | None = None
+        # The requested model's per-model provider order (Plan 026 W3), read
+        # from the same snapshot as the servable set and passed to the core the
+        # same way: the shell reads config, the core ranks.
+        model_preference: tuple[str, ...] = ()
 
         # Snapshot the model map once per request so a mid-request admin edit
         # cannot splice two mappings together.  Empty map = feature off.
@@ -1210,6 +1378,7 @@ class ProxyApp:
                 servable_providers = model_map.providers_for(
                     request_model
                 )
+                model_preference = model_map.preference_for(request_model)
 
         # Affinity key: the conversation fingerprint when pinning is opt-in
         # (Plan 019 §6.4), else the API-key hash.  route_key (hashed_key)
@@ -1258,8 +1427,6 @@ class ProxyApp:
                     budget_tracker=self._budget_tracker,
                     usage_history_tracker=self._usage_history_tracker,
                 )
-
-        primary = candidates[0]
 
         # Track a continuous-healthy clock per provider, not just the
         # configured primary: when a model map excludes the original primary,
@@ -1325,7 +1492,18 @@ class ProxyApp:
             affinity=affinity,
             servable_providers=servable_providers,
             healthy_since=dict(self._provider_healthy_since),
+            model_preference=model_preference,
         )
+
+        # The EFFECTIVE primary, computed once by the core and read here — not
+        # re-derived as `candidates[0]` (Plan 026 W2.3). The shell used to keep
+        # its own pre-filter copy while the core derived the post-filter one, so
+        # whenever the model map or quarantine excluded the configured primary,
+        # every single request looked like a failover (metric) and created an
+        # affinity pin (state) against a provider that was never a candidate.
+        # `terminal_fallback` is that effective primary: the first surviving
+        # candidate, and the provider whose gate gives the canonical rejection.
+        primary = plan.terminal_fallback
 
         admitted: tuple[str, ProviderContext] | None = None
         try:
@@ -1410,7 +1588,13 @@ class ProxyApp:
             )
             return
 
-        self._metrics.record_decision(hashed_key, acquired_provider, primary)
+        # The plan's assessments carry why each candidate ranked where it did
+        # (Plan 026 W1.5): recording the signals alongside the outcome is what
+        # makes the decision log debuggable after the fact.
+        self._metrics.record_decision(
+            hashed_key, acquired_provider, primary,
+            {a.name: a.signals for a in plan.assessments if a.signals},
+        )
 
         if acquired_provider != primary:
             select_time = time.monotonic()

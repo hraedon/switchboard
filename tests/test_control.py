@@ -15,6 +15,7 @@ from switchboard.control import (
     RoutingConfig,
     RoutingStrategy,
     SignalFreshness,
+    Tier,
     hash_route_key,
     pace_surplus,
     route_decision,
@@ -1271,29 +1272,34 @@ def test_pin_conversations_releases_when_pinned_provider_drops() -> None:
     assert plan.immediate_candidates[0] == "umans"
 
 
-def test_pin_conversations_on_primary_resists_opportunistic_diversion() -> None:
-    """M1 fix: a conversation pinned to the PRIMARY (pin-on-first-request)
-    must NOT be diverted by opportunistic quota-burn.  Without this guard the
-    pinned primary falls through to the else branch, opportunism fronts a
-    fallback, and the conversation permanently migrates — breaking the
-    pin-stays-until-drop promise."""
+def test_pin_conversations_on_primary_resists_ranking_diversion() -> None:
+    """M1 fix, restated for Plan 026: a conversation pinned to the PRIMARY
+    (pin-on-first-request) must NOT be diverted by the strategy's ranking.
+
+    Originally this pinned the guard against opportunistic quota-burn, the
+    mechanism that used to occupy this branch; W2.2 retired it, and the branch
+    still earns its keep because a *ranking* strategy is now what would front a
+    higher-scoring fallback here. Without the guard the pinned primary falls
+    through, pace fronts the surplus winner, and the conversation permanently
+    migrates — breaking the pin-stays-until-drop promise."""
     config = RoutingConfig(
         pin_conversations=True,
-        opportunistic_enabled=True,
-        opportunistic_min_headroom=0.5,
-        opportunistic_reset_window=21600.0,
+        strategy=RoutingStrategy.PACE,
         dwell_interval=10.0,
         failback_delay=0.0,
     )
     table = RouteTable(entries={}, default_providers=("umans", "ollama"))
     states = {
-        "umans": _state("umans"),
+        "umans": _state(
+            "umans", weekly_remaining_fraction=0.10, weekly_reset_in=86400.0,
+        ),
         "ollama": _state(
-            "ollama", usage_headroom=0.9, quota_resets_in=3600.0,
+            "ollama", weekly_remaining_fraction=0.90, weekly_reset_in=86400.0,
         ),
     }
-    # Pin is on the primary (umans) — the if-block's `!= primary` guard
-    # routes to the else branch, where opportunism would otherwise fire.
+    # Pin is on the primary (umans) — the if-block's `!= primary` guard routes
+    # to the else branch, where the ranking would otherwise decide. umans is
+    # the surplus LOSER, so a diversion would be visible.
     affinity = _affinity("umans", selected_at=0.0)
     plan = route_decision(
         states, table, "k", config, now=100.0, affinity=affinity,
@@ -1596,9 +1602,18 @@ def test_headroom_ranking_ties_break_on_table_order() -> None:
     assert plan.immediate_candidates == ("fallback-a", "fallback-b")
 
 
-# --- Plan 016: opportunistic quota-burn tests ---
+# --- Plan 016 RETIRED by Plan 026 W2.2 -------------------------------------
+#
+# Thirteen tests used to live here, pinning opportunistic quota-burn: the
+# qualifier predicates, the margin deadband, the NaN guard, its subordination
+# to an affinity pin. They are gone with the mechanism, not merely disabled —
+# a test for code that no longer exists is a claim about behaviour nobody can
+# violate. What replaces them is the retirement itself: the config fields still
+# parse (an operator's file outlives the feature), and they change nothing.
+# The end-to-end half of this lives in tests/test_integration_plan016.py, whose
+# name is deliberately kept so the history stays findable.
 
-_OPPORTUNISTIC_CONFIG = RoutingConfig(
+_RETIRED_OPPORTUNISTIC_CONFIG = RoutingConfig(
     opportunistic_enabled=True,
     opportunistic_min_headroom=0.5,
     opportunistic_reset_window=21600.0,
@@ -1606,249 +1621,58 @@ _OPPORTUNISTIC_CONFIG = RoutingConfig(
 )
 
 
-def test_opportunistic_default_disabled_unchanged() -> None:
-    """Default config (opportunistic_enabled=False) keeps primary preference."""
-    table = RouteTable(
-        entries={}, default_providers=("umans", "zai")
-    )
-    states = {
-        "umans": _state("umans"),
-        "zai": _state(
-            "zai",
-            usage_headroom=0.70,
-            quota_resets_in=10800.0,
-        ),
-    }
-    plan = route_decision(states, table, "k", RoutingConfig(), now=0.0)
-    assert plan.immediate_candidates[0] == "umans"
-    assert plan.reason == "primary_available"
+def test_retired_opportunistic_config_does_not_front_a_qualifier() -> None:
+    """The exact shape that used to divert traffic now routes by strategy.
 
-
-def test_opportunistic_qualifier_fronts_target_keeps_primary() -> None:
-    """Healthy primary + qualifying fallback → fallback fronts; primary stays."""
+    zai qualifies on every one of Plan 016's conditions — non-primary, in
+    immediate, session headroom 0.70 above the 0.5 floor, quota resetting in 3 h
+    inside the 6 h window, sole qualifier so no margin to clear. It stays behind
+    the primary, and no reason string reports a mechanism that is gone.
+    """
     table = RouteTable(entries={}, default_providers=("umans", "zai"))
     states = {
         "umans": _state("umans"),
-        "zai": _state(
-            "zai",
-            usage_headroom=0.70,
-            quota_resets_in=10800.0,
-        ),
+        "zai": _state("zai", usage_headroom=0.70, quota_resets_in=10800.0),
     }
-    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
-    assert plan.immediate_candidates[0] == "zai"
-    assert "umans" in plan.immediate_candidates
-    assert plan.terminal_fallback == "umans"
-    assert plan.reason == "opportunistic"
-
-
-def test_opportunistic_below_min_headroom_returns_none() -> None:
-    """Fallback headroom below floor → primary serves."""
-    table = RouteTable(entries={}, default_providers=("umans", "zai"))
-    states = {
-        "umans": _state("umans"),
-        "zai": _state(
-            "zai",
-            usage_headroom=0.30,
-            quota_resets_in=10800.0,
-        ),
-    }
-    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
-    assert plan.immediate_candidates[0] == "umans"
-    assert plan.reason == "primary_available"
-
-
-def test_opportunistic_outside_reset_window_returns_none() -> None:
-    """Reset too far in the future → opportunism does not fire."""
-    table = RouteTable(entries={}, default_providers=("umans", "zai"))
-    states = {
-        "umans": _state("umans"),
-        "zai": _state(
-            "zai",
-            usage_headroom=0.70,
-            quota_resets_in=72000.0,
-        ),
-    }
-    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
-    assert plan.immediate_candidates[0] == "umans"
-    assert plan.reason == "primary_available"
-
-
-def test_opportunistic_quota_resets_in_none_returns_none() -> None:
-    """Unknown reset time (None) never promotes."""
-    table = RouteTable(entries={}, default_providers=("umans", "zai"))
-    states = {
-        "umans": _state("umans"),
-        "zai": _state(
-            "zai",
-            usage_headroom=0.70,
-            quota_resets_in=None,
-        ),
-    }
-    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
-    assert plan.immediate_candidates[0] == "umans"
-    assert plan.reason == "primary_available"
-
-
-def test_opportunistic_headroom_none_returns_none() -> None:
-    """Unknown headroom (None) never promotes."""
-    table = RouteTable(entries={}, default_providers=("umans", "zai"))
-    states = {
-        "umans": _state("umans"),
-        "zai": _state(
-            "zai",
-            usage_headroom=None,
-            quota_resets_in=10800.0,
-        ),
-    }
-    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
-    assert plan.immediate_candidates[0] == "umans"
-    assert plan.reason == "primary_available"
-
-
-def test_opportunistic_nan_headroom_does_not_qualify() -> None:
-    """NaN headroom defeats the < comparison (NaN < x is always False), so
-    without a math.isfinite guard it would qualify for promotion."""
-    table = RouteTable(entries={}, default_providers=("umans", "zai"))
-    states = {
-        "umans": _state("umans"),
-        "zai": _state(
-            "zai",
-            usage_headroom=float("nan"),
-            quota_resets_in=10800.0,
-        ),
-    }
-    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
-    assert plan.immediate_candidates[0] == "umans"
-    assert plan.reason == "primary_available"
-
-
-def test_opportunistic_margin_suppresses_close_qualifiers() -> None:
-    """Best and runner-up within margin → keep primary."""
-    table = RouteTable(
-        entries={}, default_providers=("umans", "zai", "fallback-b")
-    )
-    states = {
-        "umans": _state("umans"),
-        "zai": _state(
-            "zai",
-            usage_headroom=0.70,
-            quota_resets_in=10800.0,
-        ),
-        "fallback-b": _state(
-            "fallback-b",
-            usage_headroom=0.65,
-            quota_resets_in=10800.0,
-        ),
-    }
-    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
-    assert plan.immediate_candidates[0] == "umans"
-    assert plan.reason == "primary_available"
-
-
-def test_opportunistic_single_qualifier_no_margin_needed() -> None:
-    """Only one qualifier: margin rule is moot; it wins."""
-    table = RouteTable(entries={}, default_providers=("umans", "zai"))
-    states = {
-        "umans": _state("umans"),
-        "zai": _state(
-            "zai",
-            usage_headroom=0.51,
-            quota_resets_in=10800.0,
-        ),
-    }
-    plan = route_decision(states, table, "k", _OPPORTUNISTIC_CONFIG, now=0.0)
-    assert plan.immediate_candidates[0] == "zai"
-    assert plan.reason == "opportunistic"
-
-
-def test_opportunistic_affinity_pin_beats_opportunism() -> None:
-    """An active non-primary affinity pin (within dwell) overrides opportunistic selection."""
-    table = RouteTable(
-        entries={}, default_providers=("umans", "fallback-b", "zai")
-    )
-    states = {
-        "umans": _state("umans"),
-        "fallback-b": _state("fallback-b"),
-        "zai": _state(
-            "zai",
-            usage_headroom=0.70,
-            quota_resets_in=10800.0,
-        ),
-    }
-    affinity = _affinity("fallback-b", selected_at=0.0)
     plan = route_decision(
-        states, table, "k", _OPPORTUNISTIC_CONFIG, now=10.0, affinity=affinity
+        states, table, "k", _RETIRED_OPPORTUNISTIC_CONFIG, now=0.0,
     )
-    assert plan.immediate_candidates[0] == "fallback-b"
-    assert plan.reason == "affinity_dwell"
-
-
-def test_opportunistic_target_demoted_by_other_signal_never_qualifies() -> None:
-    """A fallback demoted by headroom_threshold is not in immediate → no opportunism."""
-    config = RoutingConfig(
-        headroom_threshold=0.15,
-        opportunistic_enabled=True,
-        opportunistic_min_headroom=0.5,
-        opportunistic_reset_window=21600.0,
-        opportunistic_margin=0.10,
-    )
-    table = RouteTable(entries={}, default_providers=("umans", "zai"))
-    states = {
-        "umans": _state("umans"),
-        "zai": _state(
-            "zai",
-            usage_headroom=0.10,
-            quota_resets_in=10800.0,
-        ),
-    }
-    plan = route_decision(states, table, "k", config, now=0.0)
-    assert plan.immediate_candidates[0] == "umans"
-    assert "zai" not in plan.immediate_candidates
-    assert plan.queue_candidate == "zai"
-
-
-def test_opportunistic_after_non_primary_affinity_failback() -> None:
-    """After a non-primary affinity pin is released on failback, the next
-    no-pin re-evaluation can select opportunistically."""
-    config = RoutingConfig(
-        dwell_interval=30.0,
-        failback_delay=60.0,
-        opportunistic_enabled=True,
-        opportunistic_min_headroom=0.5,
-        opportunistic_reset_window=21600.0,
-        opportunistic_margin=0.10,
-    )
-    table = RouteTable(
-        entries={}, default_providers=("umans", "fallback-b", "zai")
-    )
-    states = {
-        "umans": _state("umans"),
-        "fallback-b": _state("fallback-b"),
-        "zai": _state(
-            "zai",
-            usage_headroom=0.70,
-            quota_resets_in=10800.0,
-        ),
-    }
-    # Within dwell: non-primary affinity pins front.
-    affinity = _affinity("fallback-b", selected_at=0.0)
-    plan = route_decision(states, table, "k", config, now=10.0, affinity=affinity)
-    assert plan.immediate_candidates[0] == "fallback-b"
-    assert plan.reason == "affinity_dwell"
-
-    # After dwell + failback_delay: primary is fronted.
-    plan = route_decision(
-        states, table, "k", config, now=100.0, affinity=affinity,
-        healthy_since={"umans": 20.0},
-    )
-    assert plan.immediate_candidates[0] == "umans"
+    assert plan.immediate_candidates == ("umans", "zai")
     assert plan.reason == "primary_available"
 
-    # No pin: opportunism can fire.
-    plan = route_decision(states, table, "k", config, now=100.0, affinity=None)
-    assert plan.immediate_candidates[0] == "zai"
-    assert plan.reason == "opportunistic"
+
+def test_retired_opportunistic_fields_change_nothing_under_any_strategy() -> None:
+    """Inertness is the contract, so it is asserted against the whole strategy
+    axis rather than the one strategy the mechanism used to run under."""
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state(
+            "umans",
+            usage_headroom=0.20,
+            weekly_remaining_fraction=0.50,
+            weekly_reset_in=86400.0,
+        ),
+        "zai": _state(
+            "zai",
+            usage_headroom=0.90,
+            quota_resets_in=3600.0,
+            weekly_remaining_fraction=0.50,
+            weekly_reset_in=86400.0,
+        ),
+    }
+    for strategy in RoutingStrategy:
+        inert = RoutingConfig(
+            strategy=strategy,
+            opportunistic_enabled=True,
+            opportunistic_min_headroom=0.5,
+            opportunistic_reset_window=21600.0,
+            opportunistic_margin=0.10,
+        )
+        off = RoutingConfig(strategy=strategy)
+        with_fields = route_decision(states, table, "k", inert, now=0.0)
+        without = route_decision(states, table, "k", off, now=0.0)
+        assert with_fields == without, f"{strategy.value}: fields are not inert"
+        assert with_fields.reason != "opportunistic"
 
 
 # --- Plan 020 Wave 4: pace routing tests (WI-13) ----------------------------
@@ -2134,6 +1958,149 @@ def test_pace_post_dwell_conversation_pin_still_holds() -> None:
     assert plan.reason == "affinity_pinned"
 
 
+# --- Plan 026 W2.1: tier-bounded stickiness, generalized --------------------
+#
+# The rule the three pace tests above discovered, stated once for every
+# strategy that ranks: post-dwell failback and failback hysteresis are
+# `ordered`'s own ranking asserting itself, so they belong to `ordered` alone.
+# `headroom` carried an identical copy of the pace bug until W2.1 — these are
+# the pace tests mirrored onto it, which is the point: the same law, tested the
+# same way, rather than a second bespoke fix.
+
+
+def test_headroom_post_dwell_pin_goes_inert() -> None:
+    """Under HEADROOM an expired pin does not re-front the primary.
+
+    The mirror of test_pace_post_dwell_pin_goes_inert. Before W2.1 every dwell
+    expiry re-fronted the table primary, so a headroom estate leaked one
+    primary request per dwell interval per affinity key — diluting exactly the
+    highest-headroom-first ordering the operator configured.
+    """
+    for config in (
+        RoutingConfig(strategy=RoutingStrategy.HEADROOM, dwell_interval=30.0),
+        # headroom_ranking = True IS headroom (the pre-strategy spelling), so
+        # the rule has to reach it too or the bug survives under its old name.
+        RoutingConfig(headroom_ranking=True, dwell_interval=30.0),
+    ):
+        table = RouteTable(entries={}, default_providers=("umans", "ollama"))
+        states = {
+            "umans": _state("umans", usage_headroom=0.10),
+            "ollama": _state("ollama", usage_headroom=0.90),
+        }
+        # Pin on the headroom winner, dwell long expired.
+        affinity = _affinity("ollama", selected_at=0.0)
+        plan = route_decision(
+            states, table, "k", config, now=100.0, affinity=affinity,
+        )
+        assert plan.immediate_candidates[0] == "ollama"
+        assert "umans" in plan.immediate_candidates  # demoted, never dropped
+        assert plan.reason == "failover"
+
+
+def test_headroom_post_dwell_ignores_failback_hysteresis() -> None:
+    """failback_delay is a failback concept; under HEADROOM there is no
+    failback to gate, so an expired pin must not be held by hysteresis either —
+    the ranking decides. Mirrors the pace case."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.HEADROOM,
+        dwell_interval=30.0,
+        failback_delay=300.0,
+    )
+    table = RouteTable(entries={}, default_providers=("umans", "ollama"))
+    states = {
+        "umans": _state("umans", usage_headroom=0.90),
+        "ollama": _state("ollama", usage_headroom=0.10),
+    }
+    # Pin on the headroom LOSER, dwell expired, and no healthy_since clock for
+    # the primary: hysteresis would have held the pin indefinitely.
+    affinity = _affinity("ollama", selected_at=0.0)
+    plan = route_decision(
+        states, table, "k", config, now=100.0, affinity=affinity,
+        healthy_since=None,
+    )
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+
+def test_ordered_post_dwell_failback_and_hysteresis_unchanged() -> None:
+    """The other half of the rule: `ordered` keeps both behaviours exactly.
+
+    Bounding failback to one strategy is only safe if that strategy still has
+    it — Plan 008's dwell/failback cycle and Plan 014's hysteresis are the
+    default estate's contract, and W2.1 must not have narrowed them into
+    nothing.
+    """
+    table = RouteTable(entries={}, default_providers=("umans", "ollama"))
+    states = {"umans": _state("umans"), "ollama": _state("ollama")}
+    affinity = _affinity("ollama", selected_at=0.0)
+
+    # Post-dwell: the primary is re-fronted (Plan 008 §5).
+    plan = route_decision(
+        states,
+        table,
+        "k",
+        RoutingConfig(dwell_interval=30.0),
+        now=100.0,
+        affinity=affinity,
+    )
+    assert plan.immediate_candidates[0] == "umans"
+    assert plan.reason == "primary_available"
+
+    # Post-dwell with hysteresis: the pin is held while the primary reproves
+    # itself (Plan 014).
+    plan = route_decision(
+        states,
+        table,
+        "k",
+        RoutingConfig(dwell_interval=30.0, failback_delay=300.0),
+        now=100.0,
+        affinity=affinity,
+        healthy_since={"umans": 99.0},
+    )
+    assert plan.immediate_candidates[0] == "ollama"
+    assert plan.reason == "affinity_hysteresis"
+
+
+def test_pin_demoted_into_queue_loses_its_effect_under_every_strategy() -> None:
+    """The one law: stickiness promotes within a tier, never across one.
+
+    A pinned provider that enters its peak window is demoted to QUEUE, and the
+    pin has no way to reach across the boundary and pull it back — not because
+    the peak signal is special-cased in the overlay, but because the overlay
+    only ever reorders the IMMEDIATE tier. That structural fact is what makes
+    every future demotion signal safe by default, so it is asserted against the
+    whole strategy axis and inside dwell, where the pin is at its strongest.
+    """
+    table = RouteTable(entries={}, default_providers=("umans", "ollama"))
+    states = {
+        "umans": _state("umans", weekly_remaining_fraction=0.10,
+                        weekly_reset_in=86400.0, usage_headroom=0.10),
+        # The pinned provider wins on both ranking keys AND is in its peak
+        # window: without the tier boundary it would front on every count.
+        "ollama": _state("ollama", weekly_remaining_fraction=0.90,
+                         weekly_reset_in=86400.0, usage_headroom=0.90,
+                         in_peak=True),
+    }
+    affinity = _affinity("ollama", selected_at=0.0)
+    for strategy in RoutingStrategy:
+        for pin_conversations in (False, True):
+            config = RoutingConfig(
+                strategy=strategy,
+                pin_conversations=pin_conversations,
+                dwell_interval=30.0,
+            )
+            plan = route_decision(
+                states, table, "k", config, now=10.0, affinity=affinity,
+            )
+            label = f"{strategy.value}/pin_conversations={pin_conversations}"
+            assert plan.immediate_candidates == ("umans",), label
+            # Demoted, not dropped: still the queue backstop.
+            assert plan.reason == "primary_available", label
+            by_name = {a.name: a for a in plan.assessments}
+            assert by_name["ollama"].tier is Tier.QUEUE, label
+            assert by_name["ollama"].signals == ("in_peak",), label
+
+
 def test_in_peak_demotes_non_primary() -> None:
     """Plan 025: an in-peak provider is demoted from immediate to the queue
     tier — expensive, not broken, so it stays a backstop."""
@@ -2282,38 +2249,6 @@ def test_pace_hysteresis_still_enforces_scored_first() -> None:
     assert "umans" in plan.immediate_candidates  # still immediate-eligible
 
 
-def test_pace_does_not_fire_opportunism() -> None:
-    """PACE subsumes Plan 016 opportunism: when strategy=pace, the
-    session-window opportunistic target does not fire (pace uses the weekly
-    window instead)."""
-    config = RoutingConfig(
-        strategy=RoutingStrategy.PACE,
-        opportunistic_enabled=True,
-        opportunistic_min_headroom=0.5,
-        opportunistic_reset_window=21600.0,
-        opportunistic_margin=0.10,
-    )
-    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
-    # zai has weekly data (pace will rank it). ollama has session headroom
-    # that would trigger opportunism (headroom=0.9, reset_in=3600 < 21600).
-    states = {
-        "zai": _state(
-            "zai", weekly_remaining_fraction=0.50, weekly_reset_in=86400.0,
-            usage_headroom=0.2,  # low session headroom
-        ),
-        "ollama": _state(
-            "ollama",
-            usage_headroom=0.9,  # high session headroom → opportunistic candidate
-            quota_resets_in=3600.0,  # within opportunistic_reset_window
-        ),
-    }
-    plan = route_decision(states, table, "k", config, now=100.0)
-    # Under PACE, opportunism does NOT fire (would be "opportunistic" reason).
-    # zai is the only scored provider → fronts.
-    assert plan.immediate_candidates[0] == "zai"
-    assert plan.reason != "opportunistic"
-
-
 def test_pace_reason_not_set_when_primary_absent_for_other_reasons() -> None:
     """When the primary is BUSY (not pace-ranked out), the reason should be
     'failover' not 'pace_failover' — pace didn't cause the failover."""
@@ -2407,3 +2342,300 @@ def test_headroom_strategy_equivalent_to_headroom_ranking() -> None:
     plan_enum = route_decision(states, table, "k", config_enum, now=100.0)
     plan_flag = route_decision(states, table, "k", config_flag, now=100.0)
     assert plan_enum.immediate_candidates == plan_flag.immediate_candidates
+
+
+# --- Plan 026 W3.3: per-model provider preference ---------------------------
+#
+# The founding rule the whole feature hangs on: the model map filters and
+# reorders, it NEVER adds a candidate. So every test here either checks the
+# reordering inside the IMMEDIATE tier or checks that a preference had *no*
+# effect where it must have none.
+
+
+def test_preference_reorders_immediate_under_ordered() -> None:
+    """The operator's order outranks table position for this model."""
+    config = RoutingConfig()
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {"umans": _state("umans"), "zai": _state("zai")}
+    plan = route_decision(
+        states, table, "k", config, now=100.0,
+        model_preference=("zai", "umans"),
+    )
+    assert plan.immediate_candidates == ("zai", "umans")
+    # The primary is not demoted: it stays immediate-eligible, the queue
+    # backstop, and the terminal fallback.
+    assert plan.queue_candidate == "umans"
+    assert plan.terminal_fallback == "umans"
+    assert plan.reason == "failover"
+
+
+def test_empty_preference_is_todays_behavior() -> None:
+    """No preference, an empty one, and one naming nothing in the tier are all
+    byte-for-byte the pre-W3 decision."""
+    config = RoutingConfig()
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {"umans": _state("umans"), "zai": _state("zai")}
+    baseline = route_decision(states, table, "k", config, now=100.0)
+    assert route_decision(
+        states, table, "k", config, now=100.0, model_preference=(),
+    ) == baseline
+    assert route_decision(
+        states, table, "k", config, now=100.0,
+        model_preference=("nobody", "also-nobody"),
+    ) == baseline
+
+
+def test_preference_beats_pace_surplus_within_immediate() -> None:
+    """Preference outranks the strategy: the scoring key orders the rest."""
+    config = RoutingConfig(strategy=RoutingStrategy.PACE)
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    # ollama's surplus (+0.26) beats zai's (+0.10), so pace alone fronts ollama.
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.80, weekly_reset_in=5 * 86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.40, weekly_reset_in=86400.0,
+        ),
+    }
+    assert route_decision(
+        states, table, "k", config, now=100.0,
+    ).immediate_candidates[0] == "ollama"
+    plan = route_decision(
+        states, table, "k", config, now=100.0, model_preference=("zai",),
+    )
+    assert plan.immediate_candidates == ("zai", "ollama")
+
+
+def test_preference_orders_unnamed_providers_by_the_strategy() -> None:
+    """Unnamed providers share the rank after all named ones and keep exactly
+    the order the strategy would have given them."""
+    config = RoutingConfig(strategy=RoutingStrategy.PACE)
+    table = RouteTable(
+        entries={}, default_providers=("umans", "zai", "ollama"),
+    )
+    states = {
+        # umans is named; zai and ollama are not, and ollama out-paces zai.
+        "umans": _state("umans"),
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.80, weekly_reset_in=5 * 86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.40, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=100.0, model_preference=("umans",),
+    )
+    assert plan.immediate_candidates == ("umans", "ollama", "zai")
+
+
+def test_preference_never_resurrects_a_filtered_provider() -> None:
+    """A provider the filter stage removed holds no tier, and naming it first
+    cannot bring it back — only stage 2 excludes, and nothing undoes it."""
+    config = RoutingConfig()
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {"umans": _state("umans"), "zai": _state("zai")}
+    plan = route_decision(
+        states, table, "k", config, now=100.0,
+        servable_providers=frozenset({"umans"}),
+        model_preference=("zai", "umans"),
+    )
+    assert plan.immediate_candidates == ("umans",)
+    assert [a.name for a in plan.assessments] == ["umans"]
+
+
+def test_preference_never_lifts_a_demoted_provider_out_of_queue() -> None:
+    """A demoted provider is in QUEUE; a preference reorders IMMEDIATE only."""
+    config = RoutingConfig(usage_24h_threshold=0.8)
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state("zai", usage_24h_utilization=0.95),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=100.0,
+        model_preference=("zai", "umans"),
+    )
+    assert plan.immediate_candidates == ("umans",)
+    tiers = {a.name: a.tier for a in plan.assessments}
+    assert tiers == {"umans": Tier.IMMEDIATE, "zai": Tier.QUEUE}
+
+
+def test_preference_does_not_affect_queue_candidate_selection() -> None:
+    """Queue-candidate preference order is its own contract (§3.5): the
+    primary first, whatever the per-model preference says."""
+    config = RoutingConfig()
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans", availability=Availability.BUSY),
+        "zai": _state("zai", availability=Availability.BUSY),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=100.0, model_preference=("zai",),
+    )
+    assert plan.immediate_candidates == ()
+    assert plan.queue_candidate == "umans"
+    assert plan.reason == "queue_only"
+
+
+def test_preference_does_not_reorder_the_backstop_tier() -> None:
+    """BACKSTOP keeps candidate order — stale never outranks fresh, and a
+    preference is not a licence to reorder last resorts."""
+    config = RoutingConfig()
+    table = RouteTable(
+        entries={}, default_providers=("umans", "zai", "ollama"),
+    )
+    states = {
+        "umans": _state("umans", availability=Availability.BUSY),
+        "zai": _state("zai", signal_freshness=SignalFreshness.DEGRADED),
+        "ollama": _state("ollama", signal_freshness=SignalFreshness.DEGRADED),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=100.0,
+        model_preference=("ollama", "zai"),
+    )
+    backstop = [
+        a.name for a in plan.assessments if a.tier is Tier.BACKSTOP
+    ]
+    assert backstop == ["zai", "ollama"]
+
+
+def test_preference_flap_margin_applies_within_a_group() -> None:
+    """The pace deadband composes with preference by living *inside* a
+    preference group (Plan 026 W3.3).
+
+    Two same-rank providers within the deadband keep table order, exactly as
+    they would with no preference at all — the operator did not distinguish
+    them, so the anti-flap rule still governs.
+    """
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE, pace_flap_margin=0.10,
+    )
+    table = RouteTable(
+        entries={}, default_providers=("umans", "zai", "ollama"),
+    )
+    states = {
+        # umans is named, so it fronts regardless of pace.
+        "umans": _state(
+            "umans", weekly_remaining_fraction=0.05, weekly_reset_in=86400.0,
+        ),
+        # zai +0.06 vs ollama +0.14: advantage 0.08 < 0.10 → table order.
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.20, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.28, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=100.0, model_preference=("umans",),
+    )
+    assert plan.immediate_candidates == ("umans", "zai", "ollama")
+
+
+def test_preference_dominates_the_flap_margin_across_groups() -> None:
+    """Across groups the deadband is silent: a near-tie between a named and an
+    unnamed provider is settled by the operator, not by the margin."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE, pace_flap_margin=0.10,
+    )
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    # zai +0.06, ollama +0.14, advantage 0.08 < 0.10 → without a preference the
+    # deadband keeps table order (zai first).
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.20, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.28, weekly_reset_in=86400.0,
+        ),
+    }
+    assert route_decision(
+        states, table, "k", config, now=100.0,
+    ).immediate_candidates == ("zai", "ollama")
+    plan = route_decision(
+        states, table, "k", config, now=100.0, model_preference=("ollama",),
+    )
+    assert plan.immediate_candidates == ("ollama", "zai")
+
+
+def test_preference_yields_to_an_affinity_pin_within_dwell() -> None:
+    """Stickiness is unchanged: a live pin still outranks the ranking, and a
+    preference is a ranking."""
+    config = RoutingConfig(dwell_interval=30.0)
+    table = RouteTable(entries={}, default_providers=("umans", "zai", "ollama"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state("zai"),
+        "ollama": _state("ollama"),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=110.0,
+        affinity=RouteAffinity(provider="ollama", selected_at=100.0),
+        model_preference=("zai", "umans"),
+    )
+    assert plan.immediate_candidates[0] == "ollama"
+    assert plan.reason == "affinity_dwell"
+    # The preference still orders everything the pin did not front.
+    assert plan.immediate_candidates == ("ollama", "zai", "umans")
+
+
+def test_preference_makes_an_expired_pin_inert_under_ordered() -> None:
+    """Post-dwell failback to the table primary is `ordered`'s own ranking
+    asserting itself (W2.1). With a preference in force there IS a ranking, so
+    the pin goes inert and the preference stands."""
+    config = RoutingConfig(dwell_interval=30.0)
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {"umans": _state("umans"), "zai": _state("zai")}
+    # No preference: dwell expiry fails back to the primary.
+    plan_no_pref = route_decision(
+        states, table, "k", config, now=200.0,
+        affinity=RouteAffinity(provider="zai", selected_at=100.0),
+    )
+    assert plan_no_pref.immediate_candidates[0] == "umans"
+    assert plan_no_pref.reason == "primary_available"
+    # With a preference, the ranking stands instead of re-fronting the primary.
+    plan = route_decision(
+        states, table, "k", config, now=200.0,
+        affinity=RouteAffinity(provider="zai", selected_at=100.0),
+        model_preference=("zai", "umans"),
+    )
+    assert plan.immediate_candidates == ("zai", "umans")
+    assert plan.reason == "failover"
+
+
+def test_preference_naming_only_demoted_providers_is_inert() -> None:
+    """A preference that names nothing in the IMMEDIATE tier changes nothing —
+    including the primary fronting it would otherwise suspend."""
+    config = RoutingConfig(usage_24h_threshold=0.8)
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state("zai", usage_24h_utilization=0.95),
+    }
+    baseline = route_decision(states, table, "k", config, now=100.0)
+    plan = route_decision(
+        states, table, "k", config, now=100.0, model_preference=("zai",),
+    )
+    assert plan == baseline
+    assert plan.reason == "primary_available"
+
+
+def test_preference_assessment_order_follows_the_preference() -> None:
+    """The assessments are the decision's own preference order, so a
+    preference shows up in the explanation without a separate code path."""
+    config = RoutingConfig()
+    table = RouteTable(entries={}, default_providers=("umans", "zai", "ollama"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state("zai"),
+        "ollama": _state("ollama"),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=100.0,
+        model_preference=("ollama", "zai"),
+    )
+    assert [(a.name, a.rank) for a in plan.assessments] == [
+        ("ollama", 0), ("zai", 1), ("umans", 2),
+    ]

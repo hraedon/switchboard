@@ -34,6 +34,8 @@ from switchboard.config_reset import (
 )
 from switchboard.config_store import ConfigStoreManager
 from switchboard.control import MUTABLE_ROUTING_FIELDS as _MUTABLE_ROUTING_FIELDS
+from switchboard.control import RETIRED_ROUTING_FIELDS as _RETIRED_ROUTING_FIELDS
+from switchboard.control import retired_routing_field_message
 from switchboard.session import (
     SESSION_COOKIE,
     LoginThrottle,
@@ -412,10 +414,18 @@ def _build_status_payload(
         }
 
     if model_map_mgr is not None:
+        # `model_map` keeps its {model: {provider: alias}} shape — the dashboard
+        # matrix and every existing consumer read it positionally. Per-model
+        # preference (Plan 026 W3) is a parallel top-level map instead of a
+        # nested value, so adding it cannot break a consumer that iterates the
+        # aliases. Only models that HAVE a preference appear.
         payload["model_map"] = {
             model: dict(aliases)
             for model, aliases in model_map_mgr.list_models()
         }
+        preferences = model_map_mgr.list_preferences()
+        if preferences:
+            payload["model_preferences"] = preferences
 
     return payload
 
@@ -1146,6 +1156,10 @@ async def handle_model_map_list(
     model", so each entry carries ``servable_providers`` (the alias keys) and
     the response includes ``configured_providers`` when known, letting the
     dashboard mark the providers that lack an alias for a model.
+
+    ``preference`` (Plan 026 W3) is the operator's provider order for the model,
+    ``[]`` when unset — always present, so a consumer never has to distinguish
+    "no preference" from "old build".
     """
     models: list[dict[str, Any]] = []
     for model, aliases in model_map_mgr.list_models():
@@ -1153,6 +1167,7 @@ async def handle_model_map_list(
             "model": model,
             "aliases": aliases,
             "servable_providers": sorted(aliases.keys()),
+            "preference": list(model_map_mgr.preference_for(model)),
         })
     body: dict[str, Any] = {"models": models}
     if providers is not None:
@@ -1178,12 +1193,20 @@ async def handle_model_map_set(
 ) -> None:
     """POST /admin/model-map — add or update a model's per-provider aliases.
 
-    Body: ``{"model": "<name>", "aliases": {"umans": "umans-alias", ...}}``.
+    Body: ``{"model": "<name>", "aliases": {"umans": "umans-alias", ...},
+    "preference": ["umans", ...]}``.
 
     Validates that every alias key names a configured provider — a typo here
     silently makes that provider ineligible for the model (the failure mode
     WI-017/012 exists to remove), so it is refused at write time with a message
     naming the offending provider.
+
+    ``preference`` (Plan 026 W3) is optional and ordered: it ranks the named
+    providers ahead of the rest inside the IMMEDIATE tier. Every name must hold
+    an alias in *this* request's ``aliases`` (the model map reorders, it never
+    adds, so a preference for an alias-less provider is dead config) and may
+    appear once. The write replaces the whole entry, so omitting ``preference``
+    — or sending ``null`` or ``[]`` — clears any existing one.
     """
     cors = cors_extra_headers(cors_allow_origin, None)
     if not admin_token:
@@ -1297,10 +1320,70 @@ async def handle_model_map_set(
             return
 
     aliases = {str(k): str(v) for k, v in aliases_raw.items()}
+
+    preference_raw = data.get("preference")
+    preference: list[str] | None = None
+    if preference_raw is not None:
+        if not isinstance(preference_raw, list) or not all(
+            isinstance(p, str) and p for p in preference_raw
+        ):
+            await send_json(
+                send, 400,
+                {
+                    "error": (
+                        "preference must be a list of provider names "
+                        "(non-empty strings)"
+                    )
+                },
+                extra_headers=cors,
+            )
+            return
+        dupes = sorted(
+            {p for p in preference_raw if preference_raw.count(p) > 1}
+        )
+        if dupes:
+            await send_json(
+                send, 400,
+                {
+                    "error": (
+                        "preference repeats provider(s): "
+                        f"{', '.join(dupes)}; each may appear once"
+                    )
+                },
+                extra_headers=cors,
+            )
+            return
+        # Subset of the alias keys, not of the configured providers: a
+        # preference for a provider that cannot serve this model would never
+        # rank anything, and the model map's founding rule is that it filters
+        # and reorders but never adds a candidate.
+        alien = [p for p in preference_raw if p not in aliases]
+        if alien:
+            await send_json(
+                send, 400,
+                {
+                    "error": (
+                        "preference names provider(s) with no alias for "
+                        f"'{model_name}': {', '.join(sorted(alien))}"
+                    )
+                },
+                extra_headers=cors,
+            )
+            return
+        preference = [str(p) for p in preference_raw]
+
     # The store writes DB-first (WI-12b): a failure here means nothing was
     # saved, so answer 500 rather than claim success the store never made.
     try:
-        model_map_mgr.set_model(model_name, aliases)
+        model_map_mgr.set_model(model_name, aliases, preference)
+    except ValueError as exc:
+        # The store validates the same rules this handler just checked; a
+        # disagreement is a bug, not operator error, but answering 400 with the
+        # store's own message beats a 500 with none.
+        await send_json(
+            send, 400, {"error": str(exc)}, extra_headers=cors,
+        )
+        return
     except sqlite3.Error as exc:
         log.error("model-map set failed for %s: %s", model_name, exc)
         await send_json(
@@ -1310,13 +1393,18 @@ async def handle_model_map_set(
         return
 
     log.info(
-        "model-map set: %s -> %d alias(es)",
+        "model-map set: %s -> %d alias(es)%s",
         model_name, len(aliases),
+        f", preference {' > '.join(preference)}" if preference else "",
     )
 
     await send_json(
         send, 200,
-        {"model": model_name, "aliases": aliases},
+        {
+            "model": model_name,
+            "aliases": aliases,
+            "preference": list(model_map_mgr.preference_for(model_name)),
+        },
         extra_headers=cors,
     )
 
@@ -1379,6 +1467,150 @@ async def handle_config_get(
     await send_json(
         send, 200, body,
         extra_headers=cors_extra_headers(cors_allow_origin, None),
+    )
+
+
+async def handle_route_plan(
+    send: Send,
+    scope: Scope,
+    proxy_app: Any,
+    admin_token: str | None,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """GET /admin/route-plan?model=<m> (+ ``x-route-plan-key``) — explain it.
+
+    Plan 026 W1.4. The operator's question is "who would serve model X right
+    now, and why". Before this, answering it meant re-deriving the decision by
+    hand from seven signals; the routing pipeline now carries a
+    :class:`~switchboard.control.CandidateAssessment` per surviving candidate,
+    and this surface hands them over.
+
+    The response's top-level ``preference`` is the model's configured provider
+    order (Plan 026 W3), and each assessment carries its ``preference_rank`` —
+    ``null`` when the provider is not named — so "why is zai in front" is
+    answerable from the explanation instead of by cross-reading the model map.
+
+    Read-only in every sense that matters: no affinity pin is read or written,
+    no metric moves, no healthy-since clock advances (see
+    :meth:`~switchboard.proxy.ProxyApp.snapshot_route_plan`). Both
+    query params are optional — no ``model`` means unfiltered, no ``key`` means
+    the default route.
+
+    The raw key is accepted so an operator can ask about a *specific* client's
+    route. switchboard never echoes, logs, or stores it — the response reports
+    only whether a keyed entry matched.
+
+    Two ways to pass it, and they are not equivalent:
+
+    * ``x-route-plan-key: <raw-key>`` — **preferred.** Request headers are not
+      recorded by uvicorn's access log, so the key does not end up on disk
+      through the one path switchboard does not control.
+    * ``?key=<raw-key>`` — kept for curl convenience, but query strings *are*
+      access-logged, so a deployment with access logging on writes the key to
+      the log. Prefer the header; omit either unless you are actually asking
+      about a keyed route.
+
+    When both are present the header wins — the caller who set a header
+    deliberately chose the non-logging path, and silently preferring the
+    logged value would defeat it.
+
+    The dashboard's Routing Explain card sends neither.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if admin_token and not check_admin_auth(scope, admin_token):
+        await send_json(send, 401, {"error": "unauthorized"}, extra_headers=cors)
+        return
+
+    raw_qs = scope.get("query_string") or b""
+    qs = parse_qs(raw_qs.decode("utf-8", "replace"))
+    model = (qs.get("model") or [""])[0] or None
+    header_key = next(
+        (
+            v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+            if k == b"x-route-plan-key"
+        ),
+        "",
+    )
+    raw_key = header_key or ((qs.get("key") or [""])[0] or None) or None
+
+    try:
+        snap = proxy_app.snapshot_route_plan(model=model, raw_key=raw_key)
+    except ValueError:
+        # route_decision's own guard: the route resolved to an empty candidate
+        # list. Same shape the request path answers with, so the explanation
+        # of a misconfigured estate matches what a client would see.
+        await send_json(
+            send, 503,
+            {"error": "no providers configured", "reason": "no_providers"},
+            extra_headers=cors,
+        )
+        return
+
+    plan = snap.plan
+    # Per-model preference (Plan 026 W3) shows up as a dedicated
+    # ``preference_rank`` field per entry rather than as a synthetic signal:
+    # signals are facts about provider *state* that the classify stage fired,
+    # and a preference is operator config that the rank stage consumed. Null
+    # means "not named" (or no preference at all for this model); the position
+    # is an index into the response's top-level ``preference``.
+    pref_rank = {name: i for i, name in enumerate(snap.preference)}
+    assessments = [
+        {
+            "provider": a.name,
+            "tier": a.tier.value,
+            "signals": list(a.signals),
+            "score": a.score,
+            "rank": a.rank,
+            "preference_rank": pref_rank.get(a.name),
+            "availability": (
+                snap.states[a.name].availability.value
+                if a.name in snap.states else None
+            ),
+            "freshness": (
+                snap.states[a.name].signal_freshness.value
+                if a.name in snap.states else None
+            ),
+        }
+        for a in plan.assessments
+    ]
+
+    # Why a candidate holds no tier at all. Only the filter stage excludes, so
+    # an operator asking "where did provider X go" gets an answer here rather
+    # than from an absence.
+    assessed = {a.name for a in plan.assessments}
+    excluded: list[dict[str, str]] = []
+    for name in snap.candidates:
+        if name in assessed:
+            continue
+        state = snap.states.get(name)
+        if state is None:
+            why = "not_running"
+        elif state.availability.value == "closed":
+            why = "closed"
+        elif state.signal_freshness.value == "unknown":
+            why = "unknown_freshness"
+        else:
+            why = "filtered"
+        excluded.append({"provider": name, "why": why})
+
+    await send_json(
+        send, 200,
+        {
+            "model": snap.model,
+            "keyed_route": snap.keyed_route,
+            "strategy": proxy_app.routing_config.strategy.value,
+            "candidates": list(snap.candidates),
+            "quarantined": list(snap.quarantined),
+            "preference": list(snap.preference),
+            "assessments": assessments,
+            "excluded": excluded,
+            "immediate": list(plan.immediate_candidates),
+            "queue_candidate": plan.queue_candidate,
+            "terminal_fallback": plan.terminal_fallback,
+            "reason": plan.reason,
+        },
+        extra_headers=[*cors, (b"cache-control", b"no-store")],
     )
 
 
@@ -1484,14 +1716,18 @@ async def handle_routing_config_update(
     Mutable fields: ``strategy``, ``pace_burn_rate_per_day``, ``pace_flap_margin``,
     ``dwell_interval``, ``failback_delay``, ``headroom_threshold``,
     ``headroom_ranking``, ``token_budget_threshold``, ``usage_24h_threshold``,
-    ``opportunistic_enabled``, ``opportunistic_min_headroom``,
-    ``opportunistic_reset_window``, ``opportunistic_margin``,
     ``quarantine_threshold``.
 
     NOT mutable: ``affinity_max_entries`` (resizing the live table would evict
     active pins), ``pin_conversations`` (requires a body-buffering restart to
     take effect safely), ``failover_threshold_seconds``/``failover_margin``
     (retained for display only).
+
+    RETIRED (400, with the reason and the replacement): the ``opportunistic_*``
+    fields — Plan 026 removed opportunistic quota burn from the decision. A
+    config file or a stored overlay still parses them, because a retired
+    preference must not cost a boot, but a *write* is refused: this is the
+    surface where the error reaches a human who can stop relying on it.
     """
     from switchboard.control import (
         RoutingConfig,
@@ -1595,9 +1831,14 @@ async def handle_routing_config_update(
             "are mutually exclusive — use strategy alone"
         )
 
-    # Reject immutable / display-only fields and unknown keys
+    # Reject retired, immutable / display-only, and unknown keys. Retired is
+    # checked first and answers with its own message: "not mutable at runtime —
+    # restart to change" would tell an operator to restart into a mechanism that
+    # no longer exists.
     for key in payload:
-        if key not in _MUTABLE_ROUTING_FIELDS:
+        if key in _RETIRED_ROUTING_FIELDS:
+            errors.append(retired_routing_field_message(key))
+        elif key not in _MUTABLE_ROUTING_FIELDS:
             errors.append(
                 f"{key} is not mutable at runtime — restart to change"
             )
