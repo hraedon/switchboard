@@ -958,11 +958,18 @@ def route_decision(
                 immediate.append(name)
             elif state.availability == Availability.BUSY:
                 queue_eligible.append(name)
-        elif state.signal_freshness == SignalFreshness.DEGRADED:
+        elif (
+            state.signal_freshness == SignalFreshness.DEGRADED
+            and state.availability == Availability.AVAILABLE
+        ):
             # Non-primary DEGRADED: never an immediate failover target
             # (fresh-only-for-failover, docs/routing-model.md §2.2), but
             # demoted rather than dropped — it remains a queue backstop
-            # ranked after every fresh candidate.
+            # ranked after every fresh candidate. Only while it has capacity:
+            # a DEGRADED provider whose gate is saturated/zeroed (an
+            # authoritative source failing closed) would make the backstop a
+            # doomed queue wait, turning the pre-fix fast 503 into a slow one
+            # (cross-lineage review, finding N1).
             degraded_backstop.append(name)
         # UNKNOWN: excluded from failover preference (fresh-only-for-failover)
 
