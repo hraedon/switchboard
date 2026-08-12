@@ -148,6 +148,29 @@ check('reports filter-stage exclusions with the reason',
       out.includes('gamma') && out.includes('closed'), out.slice(-500));
 check('warns about quarantined pairs',
       /quarantined for this model: delta/.test(out), out.slice(-300));
+check('omits the model-preference row when the model has none',
+      !out.includes('model preference'), out.slice(0, 400));
+
+// --- 3b. a per-model preference is shown when set (Plan 026 W3) -----------
+planResponse = {
+  ok: true, status: 200,
+  json: async () => ({ ...PLAN, preference: ['beta', 'alpha'] }),
+};
+vm.runInContext('explainPinned = false', sandbox);
+sandbox.renderRoutingExplain(STATUS);
+$('explain-model').value = 'glm-5.2';
+await $('explain-btn').onclick();
+const prefOut = $('explain-results').innerHTML;
+check('renders the model preference order',
+      /model preference/.test(prefOut) && prefOut.includes('beta → alpha'),
+      prefOut.slice(0, 600));
+// Restore the unpreferred plan for the freeze-flag checks below.
+planResponse = { ok: true, status: 200, json: async () => PLAN };
+vm.runInContext('explainPinned = false', sandbox);
+sandbox.renderRoutingExplain(STATUS);
+$('explain-model').value = ' glm-5.2 ';
+await $('explain-btn').onclick();
+out = $('explain-results').innerHTML;
 
 // --- 4. a poll landing while results are shown must not wipe them ---------
 check('sets the freeze flag', getPinned() === true, getPinned());

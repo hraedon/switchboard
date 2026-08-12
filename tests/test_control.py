@@ -2342,3 +2342,300 @@ def test_headroom_strategy_equivalent_to_headroom_ranking() -> None:
     plan_enum = route_decision(states, table, "k", config_enum, now=100.0)
     plan_flag = route_decision(states, table, "k", config_flag, now=100.0)
     assert plan_enum.immediate_candidates == plan_flag.immediate_candidates
+
+
+# --- Plan 026 W3.3: per-model provider preference ---------------------------
+#
+# The founding rule the whole feature hangs on: the model map filters and
+# reorders, it NEVER adds a candidate. So every test here either checks the
+# reordering inside the IMMEDIATE tier or checks that a preference had *no*
+# effect where it must have none.
+
+
+def test_preference_reorders_immediate_under_ordered() -> None:
+    """The operator's order outranks table position for this model."""
+    config = RoutingConfig()
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {"umans": _state("umans"), "zai": _state("zai")}
+    plan = route_decision(
+        states, table, "k", config, now=100.0,
+        model_preference=("zai", "umans"),
+    )
+    assert plan.immediate_candidates == ("zai", "umans")
+    # The primary is not demoted: it stays immediate-eligible, the queue
+    # backstop, and the terminal fallback.
+    assert plan.queue_candidate == "umans"
+    assert plan.terminal_fallback == "umans"
+    assert plan.reason == "failover"
+
+
+def test_empty_preference_is_todays_behavior() -> None:
+    """No preference, an empty one, and one naming nothing in the tier are all
+    byte-for-byte the pre-W3 decision."""
+    config = RoutingConfig()
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {"umans": _state("umans"), "zai": _state("zai")}
+    baseline = route_decision(states, table, "k", config, now=100.0)
+    assert route_decision(
+        states, table, "k", config, now=100.0, model_preference=(),
+    ) == baseline
+    assert route_decision(
+        states, table, "k", config, now=100.0,
+        model_preference=("nobody", "also-nobody"),
+    ) == baseline
+
+
+def test_preference_beats_pace_surplus_within_immediate() -> None:
+    """Preference outranks the strategy: the scoring key orders the rest."""
+    config = RoutingConfig(strategy=RoutingStrategy.PACE)
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    # ollama's surplus (+0.26) beats zai's (+0.10), so pace alone fronts ollama.
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.80, weekly_reset_in=5 * 86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.40, weekly_reset_in=86400.0,
+        ),
+    }
+    assert route_decision(
+        states, table, "k", config, now=100.0,
+    ).immediate_candidates[0] == "ollama"
+    plan = route_decision(
+        states, table, "k", config, now=100.0, model_preference=("zai",),
+    )
+    assert plan.immediate_candidates == ("zai", "ollama")
+
+
+def test_preference_orders_unnamed_providers_by_the_strategy() -> None:
+    """Unnamed providers share the rank after all named ones and keep exactly
+    the order the strategy would have given them."""
+    config = RoutingConfig(strategy=RoutingStrategy.PACE)
+    table = RouteTable(
+        entries={}, default_providers=("umans", "zai", "ollama"),
+    )
+    states = {
+        # umans is named; zai and ollama are not, and ollama out-paces zai.
+        "umans": _state("umans"),
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.80, weekly_reset_in=5 * 86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.40, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=100.0, model_preference=("umans",),
+    )
+    assert plan.immediate_candidates == ("umans", "ollama", "zai")
+
+
+def test_preference_never_resurrects_a_filtered_provider() -> None:
+    """A provider the filter stage removed holds no tier, and naming it first
+    cannot bring it back — only stage 2 excludes, and nothing undoes it."""
+    config = RoutingConfig()
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {"umans": _state("umans"), "zai": _state("zai")}
+    plan = route_decision(
+        states, table, "k", config, now=100.0,
+        servable_providers=frozenset({"umans"}),
+        model_preference=("zai", "umans"),
+    )
+    assert plan.immediate_candidates == ("umans",)
+    assert [a.name for a in plan.assessments] == ["umans"]
+
+
+def test_preference_never_lifts_a_demoted_provider_out_of_queue() -> None:
+    """A demoted provider is in QUEUE; a preference reorders IMMEDIATE only."""
+    config = RoutingConfig(usage_24h_threshold=0.8)
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state("zai", usage_24h_utilization=0.95),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=100.0,
+        model_preference=("zai", "umans"),
+    )
+    assert plan.immediate_candidates == ("umans",)
+    tiers = {a.name: a.tier for a in plan.assessments}
+    assert tiers == {"umans": Tier.IMMEDIATE, "zai": Tier.QUEUE}
+
+
+def test_preference_does_not_affect_queue_candidate_selection() -> None:
+    """Queue-candidate preference order is its own contract (§3.5): the
+    primary first, whatever the per-model preference says."""
+    config = RoutingConfig()
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans", availability=Availability.BUSY),
+        "zai": _state("zai", availability=Availability.BUSY),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=100.0, model_preference=("zai",),
+    )
+    assert plan.immediate_candidates == ()
+    assert plan.queue_candidate == "umans"
+    assert plan.reason == "queue_only"
+
+
+def test_preference_does_not_reorder_the_backstop_tier() -> None:
+    """BACKSTOP keeps candidate order — stale never outranks fresh, and a
+    preference is not a licence to reorder last resorts."""
+    config = RoutingConfig()
+    table = RouteTable(
+        entries={}, default_providers=("umans", "zai", "ollama"),
+    )
+    states = {
+        "umans": _state("umans", availability=Availability.BUSY),
+        "zai": _state("zai", signal_freshness=SignalFreshness.DEGRADED),
+        "ollama": _state("ollama", signal_freshness=SignalFreshness.DEGRADED),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=100.0,
+        model_preference=("ollama", "zai"),
+    )
+    backstop = [
+        a.name for a in plan.assessments if a.tier is Tier.BACKSTOP
+    ]
+    assert backstop == ["zai", "ollama"]
+
+
+def test_preference_flap_margin_applies_within_a_group() -> None:
+    """The pace deadband composes with preference by living *inside* a
+    preference group (Plan 026 W3.3).
+
+    Two same-rank providers within the deadband keep table order, exactly as
+    they would with no preference at all — the operator did not distinguish
+    them, so the anti-flap rule still governs.
+    """
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE, pace_flap_margin=0.10,
+    )
+    table = RouteTable(
+        entries={}, default_providers=("umans", "zai", "ollama"),
+    )
+    states = {
+        # umans is named, so it fronts regardless of pace.
+        "umans": _state(
+            "umans", weekly_remaining_fraction=0.05, weekly_reset_in=86400.0,
+        ),
+        # zai +0.06 vs ollama +0.14: advantage 0.08 < 0.10 → table order.
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.20, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.28, weekly_reset_in=86400.0,
+        ),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=100.0, model_preference=("umans",),
+    )
+    assert plan.immediate_candidates == ("umans", "zai", "ollama")
+
+
+def test_preference_dominates_the_flap_margin_across_groups() -> None:
+    """Across groups the deadband is silent: a near-tie between a named and an
+    unnamed provider is settled by the operator, not by the margin."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE, pace_flap_margin=0.10,
+    )
+    table = RouteTable(entries={}, default_providers=("zai", "ollama"))
+    # zai +0.06, ollama +0.14, advantage 0.08 < 0.10 → without a preference the
+    # deadband keeps table order (zai first).
+    states = {
+        "zai": _state(
+            "zai", weekly_remaining_fraction=0.20, weekly_reset_in=86400.0,
+        ),
+        "ollama": _state(
+            "ollama", weekly_remaining_fraction=0.28, weekly_reset_in=86400.0,
+        ),
+    }
+    assert route_decision(
+        states, table, "k", config, now=100.0,
+    ).immediate_candidates == ("zai", "ollama")
+    plan = route_decision(
+        states, table, "k", config, now=100.0, model_preference=("ollama",),
+    )
+    assert plan.immediate_candidates == ("ollama", "zai")
+
+
+def test_preference_yields_to_an_affinity_pin_within_dwell() -> None:
+    """Stickiness is unchanged: a live pin still outranks the ranking, and a
+    preference is a ranking."""
+    config = RoutingConfig(dwell_interval=30.0)
+    table = RouteTable(entries={}, default_providers=("umans", "zai", "ollama"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state("zai"),
+        "ollama": _state("ollama"),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=110.0,
+        affinity=RouteAffinity(provider="ollama", selected_at=100.0),
+        model_preference=("zai", "umans"),
+    )
+    assert plan.immediate_candidates[0] == "ollama"
+    assert plan.reason == "affinity_dwell"
+    # The preference still orders everything the pin did not front.
+    assert plan.immediate_candidates == ("ollama", "zai", "umans")
+
+
+def test_preference_makes_an_expired_pin_inert_under_ordered() -> None:
+    """Post-dwell failback to the table primary is `ordered`'s own ranking
+    asserting itself (W2.1). With a preference in force there IS a ranking, so
+    the pin goes inert and the preference stands."""
+    config = RoutingConfig(dwell_interval=30.0)
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {"umans": _state("umans"), "zai": _state("zai")}
+    # No preference: dwell expiry fails back to the primary.
+    plan_no_pref = route_decision(
+        states, table, "k", config, now=200.0,
+        affinity=RouteAffinity(provider="zai", selected_at=100.0),
+    )
+    assert plan_no_pref.immediate_candidates[0] == "umans"
+    assert plan_no_pref.reason == "primary_available"
+    # With a preference, the ranking stands instead of re-fronting the primary.
+    plan = route_decision(
+        states, table, "k", config, now=200.0,
+        affinity=RouteAffinity(provider="zai", selected_at=100.0),
+        model_preference=("zai", "umans"),
+    )
+    assert plan.immediate_candidates == ("zai", "umans")
+    assert plan.reason == "failover"
+
+
+def test_preference_naming_only_demoted_providers_is_inert() -> None:
+    """A preference that names nothing in the IMMEDIATE tier changes nothing —
+    including the primary fronting it would otherwise suspend."""
+    config = RoutingConfig(usage_24h_threshold=0.8)
+    table = RouteTable(entries={}, default_providers=("umans", "zai"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state("zai", usage_24h_utilization=0.95),
+    }
+    baseline = route_decision(states, table, "k", config, now=100.0)
+    plan = route_decision(
+        states, table, "k", config, now=100.0, model_preference=("zai",),
+    )
+    assert plan == baseline
+    assert plan.reason == "primary_available"
+
+
+def test_preference_assessment_order_follows_the_preference() -> None:
+    """The assessments are the decision's own preference order, so a
+    preference shows up in the explanation without a separate code path."""
+    config = RoutingConfig()
+    table = RouteTable(entries={}, default_providers=("umans", "zai", "ollama"))
+    states = {
+        "umans": _state("umans"),
+        "zai": _state("zai"),
+        "ollama": _state("ollama"),
+    }
+    plan = route_decision(
+        states, table, "k", config, now=100.0,
+        model_preference=("ollama", "zai"),
+    )
+    assert [(a.name, a.rank) for a in plan.assessments] == [
+        ("ollama", 0), ("zai", 1), ("umans", 2),
+    ]

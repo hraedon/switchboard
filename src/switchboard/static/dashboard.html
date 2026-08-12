@@ -932,8 +932,10 @@ async function _fetchProviderModels(provider) {
 // name (the map key) is locked, alias inputs are pre-filled, and saving
 // POSTs the full replacement alias set — POST /admin/model-map is
 // add-or-update server-side, so clearing an alias removes that provider
-// from the model.
-function renderModelAddForm(knownProviders, editModelName, editAliases) {
+// from the model. `editPreference` (Plan 026 W3) pre-fills the optional
+// preference order; leaving that field blank omits it from the POST, which
+// clears any stored preference for the same add-or-replace reason.
+function renderModelAddForm(knownProviders, editModelName, editAliases, editPreference) {
   const el = document.getElementById('model-add');
   const provs = (knownProviders || []).slice().sort();
   const editing = !!editModelName;
@@ -972,6 +974,14 @@ function renderModelAddForm(knownProviders, editModelName, editAliases) {
         ${editNote}
       </div>
       ${aliasRows || '<p style="color:var(--muted)">No providers configured.</p>'}
+      <div class="form-row">
+        <label for="mf-preference">Preference order (optional)</label>
+        <input id="mf-preference" autocomplete="off"
+               placeholder="comma-separated, e.g. zai, umans">
+        <span style="color:var(--muted);font-size:0.75rem">reorders the
+        immediate tier for this model: named providers first, in this order.
+        Each must have an alias above. Blank = no preference.</span>
+      </div>
       <div id="mf-error" style="color:var(--red);font-size:0.85rem;margin-bottom:0.5rem"></div>
       <button id="mf-save">${editing ? 'Save changes' : 'Save'}</button>
       <button id="mf-cancel" style="background:transparent;border:1px solid var(--border)">Cancel</button>
@@ -983,6 +993,11 @@ function renderModelAddForm(knownProviders, editModelName, editAliases) {
   {
     const nameEl = document.getElementById('mf-model');
     if (nameEl) nameEl.value = editing ? editModelName : '';
+    const prefEl = document.getElementById('mf-preference');
+    if (prefEl) {
+      prefEl.value = (editing && Array.isArray(editPreference))
+        ? editPreference.join(', ') : '';
+    }
     for (const p of provs) {
       const e = document.getElementById(_domId(p) + '-alias');
       if (e) e.value = (editing && editAliases && editAliases[p]) ? editAliases[p] : '';
@@ -1056,12 +1071,27 @@ function renderModelAddForm(knownProviders, editModelName, editAliases) {
       errEl.textContent = 'fill in at least one provider alias';
       return;
     }
+    // Preference: comma-separated, trimmed, blanks dropped. Sent only when
+    // non-empty — the POST replaces the whole entry, so omitting the field is
+    // how a blank input clears a stored preference (and the handler treats an
+    // absent field, null, and [] alike). Names are checked server-side against
+    // this request's aliases; a local pre-check keeps the round trip honest.
+    const prefRaw = ((document.getElementById('mf-preference') || {}).value || '');
+    const preference = prefRaw.split(',').map(s => s.trim()).filter(s => s);
+    const unaliased = preference.filter(p => !aliases[p]);
+    if (unaliased.length) {
+      errEl.textContent = 'preference names provider(s) with no alias: '
+        + unaliased.join(', ');
+      return;
+    }
+    const payload = { model, aliases };
+    if (preference.length) payload.preference = preference;
     try {
       const resp = await fetch('/admin/model-map', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         credentials: 'same-origin',
-        body: JSON.stringify({ model, aliases }),
+        body: JSON.stringify(payload),
       });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) { errEl.textContent = data.error || ('HTTP ' + resp.status); return; }
@@ -1546,6 +1576,12 @@ function _explainHtml(body) {
     + `</span></div>`
     + `<div class="stat"><span class="k">terminal fallback</span>`
     + `<span class="v">${esc(body.terminal_fallback || '?')}</span></div>`;
+  // Per-model preference (Plan 026 W3): shown only when the model has one, so
+  // the card does not grow a permanently empty row.
+  if ((body.preference || []).length) {
+    html += `<div class="stat"><span class="k">model preference</span>`
+      + `<span class="v">${esc(body.preference.join(' → '))}</span></div>`;
+  }
   if (rows) {
     html += '<table style="margin-top:0.5rem"><tr><th>provider</th><th>tier</th>'
       + '<th>signals</th><th>score</th><th>order</th></tr>' + rows + '</table>';
@@ -1791,6 +1827,9 @@ async function load() {
   // matrix shows every configured provider per model, with the alias filled in
   // or a dash where the provider lacks one.
   const mm = data.model_map || {};
+  // Parallel to model_map (Plan 026 W3): { model: [provider, ...] }. Kept
+  // out of model_map's values so the alias matrix's shape is unchanged.
+  const mpref = data.model_preferences || {};
   const mmModels = Object.keys(mm);
   const allProviders = Object.keys(data.providers || {}).sort();
   html += '<h2>Model Map</h2>';
@@ -1804,7 +1843,11 @@ async function load() {
     html += '<th></th></tr></thead><tbody>';
     mmModels.sort().forEach((model, mi) => {
       const aliases = mm[model] || {};
-      html += `<tr><td><code>${esc(model)}</code></td>`;
+      const pref = Array.isArray(mpref[model]) ? mpref[model] : [];
+      const prefNote = pref.length
+        ? `<div style="color:var(--muted);font-size:0.75rem">prefer: ${pref.map(esc).join(' &rarr; ')}</div>`
+        : '';
+      html += `<tr><td><code>${esc(model)}</code>${prefNote}</td>`;
       for (const pn of allProviders) {
         const alias = aliases[pn];
         if (alias != null) {
@@ -1886,7 +1929,10 @@ async function load() {
     if (ebtn) ebtn.onclick = () => {
       scanPinned = false;
       editingModel = true;
-      renderModelAddForm(allProviders, model, mm[model] || {});
+      renderModelAddForm(
+        allProviders, model, mm[model] || {},
+        Array.isArray(mpref[model]) ? mpref[model] : [],
+      );
     };
   });
   // Wire quarantine Release buttons (Plan 023 WI-4).

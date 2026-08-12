@@ -30,6 +30,12 @@ from switchboard.control import ModelMap
 
 log = logging.getLogger("switchboard.model_map")
 
+#: Columns that postdate the table's first ship, as
+#: ``{column: SQLite type}``.  Applied by :meth:`ModelMapManager._migrate_columns`
+#: on every open — ``CREATE TABLE IF NOT EXISTS`` never alters an existing
+#: table, so a pre-026 store file needs this to gain ``preference``.
+_MIGRATION_COLUMNS: dict[str, str] = {"preference": "TEXT"}
+
 
 class ModelMapManager:
     """In-memory model map with CRUD + optional SQLite persistence."""
@@ -41,16 +47,92 @@ class ModelMapManager:
         valid_providers: frozenset[str] | None = None,
     ) -> None:
         self._routes: dict[str, dict[str, str]] = {}
+        self._preferences: dict[str, tuple[str, ...]] = {}
         self._db: sqlite3.Connection | None = db
         self._valid_providers = valid_providers
 
         if db is not None:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS model_map "
-                "(model TEXT PRIMARY KEY, aliases TEXT)"
+                "(model TEXT PRIMARY KEY, aliases TEXT, preference TEXT)"
             )
+            self._migrate_columns()
             db.commit()
             self._load_from_db()
+
+    def _migrate_columns(self) -> None:
+        """Add columns that postdate the table's first ship (Plan 026 W3.1).
+
+        Same idempotent shape as
+        :meth:`~switchboard.config_store.ConfigStoreManager._migrate_columns`:
+        PRAGMA table_info says what exists, each missing column is ADDed as
+        nullable TEXT (which SQLite applies without rewriting rows), and a
+        second boot is a no-op.  Both live stores predate Plan 026, so this runs
+        for real exactly once per store file.
+        """
+        db = self._db
+        if db is None:
+            return
+        present = {r[1] for r in db.execute("PRAGMA table_info(model_map)")}
+        for column, ctype in _MIGRATION_COLUMNS.items():
+            if column not in present:
+                db.execute(
+                    f"ALTER TABLE model_map ADD COLUMN {column} {ctype}"
+                )
+                log.info(
+                    "model map: migrated model_map, added column %s", column
+                )
+
+    def _coerce_preference(
+        self, model: str, raw: Any, aliases: dict[str, str]
+    ) -> tuple[str, ...]:
+        """Interpret a stored preference value, distrusting the store.
+
+        The DB is operator-writable state that outlives config changes, and a
+        preference is only meaningful relative to the aliases that survived
+        loading, so every disagreement resolves to "no preference" (plus a
+        warning) rather than to a crash or to a routing rule nobody wrote:
+
+        - NULL / empty → no preference (the common case: a migrated row).
+        - Not a JSON array of non-empty strings, or with duplicates → dropped
+          whole, because a half-understood order is not an order.
+        - Names without an alias for this model (a provider dropped by
+          ``valid_providers``, or an alias removed by an older build) are
+          dropped individually; an empty remainder is no preference.
+        """
+        if raw is None or raw == "":
+            return ()
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as exc:
+            log.warning(
+                "model-map row %r has corrupt preference JSON, ignoring it: %s",
+                model, exc,
+            )
+            return ()
+        if not isinstance(parsed, list) or not all(
+            isinstance(p, str) and p for p in parsed
+        ):
+            log.warning(
+                "model-map row %r preference is not a list of provider names, "
+                "ignoring it", model,
+            )
+            return ()
+        if len(set(parsed)) != len(parsed):
+            log.warning(
+                "model-map row %r preference repeats a provider, ignoring it",
+                model,
+            )
+            return ()
+        kept = tuple(p for p in parsed if p in aliases)
+        if len(kept) != len(parsed):
+            dropped = sorted(set(parsed) - set(kept))
+            log.warning(
+                "model-map row %r preference names provider(s) %s with no "
+                "alias for the model, dropping them",
+                model, ", ".join(dropped),
+            )
+        return kept
 
     def _load_from_db(self) -> None:
         """Load persisted rows, distrusting the store (WI-12b).
@@ -64,12 +146,14 @@ class ModelMapManager:
           absent from the current config are dropped with a warning — a row
           with no known provider left is skipped entirely.  ``None`` means
           no validation, preserving prior behavior for bare-store callers.
+        - A malformed ``preference`` (Plan 026 W3.1) costs the row nothing: it
+          is treated as unset, with a warning (see :meth:`_coerce_preference`).
         """
         db = self._db
         if db is None:
             return
-        cursor = db.execute("SELECT model, aliases FROM model_map")
-        for model, aliases_json in cursor:
+        cursor = db.execute("SELECT model, aliases, preference FROM model_map")
+        for model, aliases_json, preference_json in cursor:
             try:
                 aliases: dict[str, str] = json.loads(aliases_json)
             except json.JSONDecodeError as exc:
@@ -116,6 +200,11 @@ class ModelMapManager:
                         model, ", ".join(unknown),
                     )
             self._routes[model] = aliases
+            preference = self._coerce_preference(
+                model, preference_json, aliases
+            )
+            if preference:
+                self._preferences[model] = preference
 
     def get_model_map(self) -> ModelMap:
         """Return a frozen ModelMap snapshot for the pure routing function.
@@ -126,20 +215,49 @@ class ModelMapManager:
         if not self._routes:
             return ModelMap()
         return ModelMap(
-            routes={m: dict(a) for m, a in self._routes.items()}
+            routes={m: dict(a) for m, a in self._routes.items()},
+            preferences=dict(self._preferences),
         )
 
     def list_models(self) -> list[tuple[str, dict[str, str]]]:
-        """Return all ``(model, aliases)`` pairs, deep-copied."""
+        """Return all ``(model, aliases)`` pairs, deep-copied.
+
+        Deliberately still a 2-tuple: ``/status.json`` and ``GET
+        /admin/model-map`` both build their payloads from it, and preference is
+        an additive surface (see :meth:`preference_for` /
+        :meth:`list_preferences`) rather than a shape change to those.
+        """
         return [(m, dict(a)) for m, a in self._routes.items()]
 
+    def preference_for(self, model: str) -> tuple[str, ...]:
+        """The stored provider preference for ``model``; ``()`` when unset."""
+        return self._preferences.get(model, ())
+
+    def list_preferences(self) -> dict[str, list[str]]:
+        """Every model that has a preference → its ordered provider names."""
+        return {m: list(p) for m, p in self._preferences.items()}
+
     def set_model(
-        self, model: str, aliases: dict[str, str]
+        self,
+        model: str,
+        aliases: dict[str, str],
+        preference: list[str] | None = None,
     ) -> None:
-        """Add or replace a model's per-provider aliases.
+        """Add or replace a model's per-provider aliases (and preference).
 
         Persists to SQLite if configured.  ``aliases`` maps provider name →
         that provider's model string.
+
+        ``preference`` (Plan 026 W3) is the operator's provider order for this
+        model.  It is validated here, at the one write path every caller shares:
+
+        - every named provider must hold an alias for this model.  A preference
+          for an alias-less provider is dead config at best — the model map
+          reorders, it never adds — so it is refused by name rather than stored
+          and silently ignored at ranking time.
+        - a repeated name is refused: two positions for one provider is not an
+          order, it is a typo.
+        - ``None`` and ``[]`` both mean "no preference", stored as SQL NULL.
 
         DB first, memory second: if the write raises (disk full, locked,
         corrupt store), memory is untouched and the exception propagates so
@@ -148,14 +266,35 @@ class ModelMapManager:
         stored = {str(k): str(v) for k, v in aliases.items() if str(v)}
         if not stored:
             raise ValueError("model map requires at least one non-empty alias")
+        pref: tuple[str, ...] = ()
+        if preference:
+            pref = tuple(str(p) for p in preference)
+            if len(set(pref)) != len(pref):
+                raise ValueError(
+                    "preference repeats a provider; each may appear once"
+                )
+            missing = [p for p in pref if p not in stored]
+            if missing:
+                raise ValueError(
+                    "preference names provider(s) with no alias for "
+                    f"'{model}': {', '.join(missing)}"
+                )
         if self._db is not None:
             self._db.execute(
-                "INSERT OR REPLACE INTO model_map (model, aliases) "
-                "VALUES (?, ?)",
-                (model, json.dumps(stored)),
+                "INSERT OR REPLACE INTO model_map (model, aliases, preference) "
+                "VALUES (?, ?, ?)",
+                (
+                    model,
+                    json.dumps(stored),
+                    json.dumps(list(pref)) if pref else None,
+                ),
             )
             self._db.commit()
         self._routes[model] = stored
+        if pref:
+            self._preferences[model] = pref
+        else:
+            self._preferences.pop(model, None)
 
     def remove_model(self, model: str) -> bool:
         """Remove a model entry. Returns True if found and removed.
@@ -173,6 +312,7 @@ class ModelMapManager:
                 )
                 self._db.commit()
             del self._routes[model]
+            self._preferences.pop(model, None)
         return found
 
     def load_from_config(
@@ -196,6 +336,12 @@ class ModelMapManager:
         When ``overwrite`` is False (the default), config entries seed only
         absent models — persisted runtime entries are preserved (WI-006.7
         shape).  When True, config entries override persisted entries.
+
+        TOML carries aliases only: Plan 026 W3.1 keeps preference a store/GUI
+        concept, so a config overwrite must not silently discard an operator's
+        preference.  Any part of it that still holds an alias under the new
+        entry is carried across (and a part that no longer does could not be
+        honoured anyway).
         """
         model_section = config.get("model", {})
         if not isinstance(model_section, dict):
@@ -212,4 +358,7 @@ class ModelMapManager:
                 continue
             if not overwrite and model_name in self._routes:
                 continue
-            self.set_model(model_name, entry)
+            carried = [
+                p for p in self.preference_for(model_name) if p in entry
+            ]
+            self.set_model(model_name, entry, carried or None)

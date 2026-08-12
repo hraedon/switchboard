@@ -324,6 +324,10 @@ class RoutePlanSnapshot:
     states: dict[str, ProviderState]
     #: The decision itself, assessments included.
     plan: AdmissionPlan
+    #: The per-model provider preference fed to the decision (Plan 026 W3),
+    #: empty when the model has none.  Carried so the explain surface can say
+    #: which position each candidate held without re-reading the model map.
+    preference: tuple[str, ...] = ()
 
 
 @dataclass
@@ -635,9 +639,11 @@ class ProxyApp:
             keyed_route = False
 
         servable_providers: frozenset[str] | None = None
+        model_preference: tuple[str, ...] = ()
         model_map = self._model_map_mgr.get_model_map()
         if model and model in model_map:
             servable_providers = model_map.providers_for(model)
+            model_preference = model_map.preference_for(model)
 
         quarantined: tuple[str, ...] = ()
         if self._quarantine is not None and model:
@@ -672,6 +678,7 @@ class ProxyApp:
             affinity=None,
             servable_providers=servable_providers,
             healthy_since=dict(self._provider_healthy_since),
+            model_preference=model_preference,
         )
         return RoutePlanSnapshot(
             model=model,
@@ -680,6 +687,7 @@ class ProxyApp:
             quarantined=quarantined,
             states=states,
             plan=plan,
+            preference=model_preference,
         )
 
     def update_routing_config(self, config: RoutingConfig) -> None:
@@ -1304,6 +1312,10 @@ class ProxyApp:
         buffered_body: bytes | None = None
         request_model: str | None = None
         servable_providers: frozenset[str] | None = None
+        # The requested model's per-model provider order (Plan 026 W3), read
+        # from the same snapshot as the servable set and passed to the core the
+        # same way: the shell reads config, the core ranks.
+        model_preference: tuple[str, ...] = ()
 
         # Snapshot the model map once per request so a mid-request admin edit
         # cannot splice two mappings together.  Empty map = feature off.
@@ -1366,6 +1378,7 @@ class ProxyApp:
                 servable_providers = model_map.providers_for(
                     request_model
                 )
+                model_preference = model_map.preference_for(request_model)
 
         # Affinity key: the conversation fingerprint when pinning is opt-in
         # (Plan 019 §6.4), else the API-key hash.  route_key (hashed_key)
@@ -1479,6 +1492,7 @@ class ProxyApp:
             affinity=affinity,
             servable_providers=servable_providers,
             healthy_since=dict(self._provider_healthy_since),
+            model_preference=model_preference,
         )
 
         # The EFFECTIVE primary, computed once by the core and read here — not

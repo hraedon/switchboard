@@ -53,6 +53,7 @@ async def _build(
     *,
     routing_config: RoutingConfig | None = None,
     models: dict[str, dict[str, str]] | None = None,
+    preferences: dict[str, list[str]] | None = None,
     quarantine: QuarantineTracker | None = None,
     admin_token: str | None = _TOKEN,
 ) -> ProxyApp:
@@ -69,6 +70,9 @@ async def _build(
             }
         }
     )
+    for model, preference in (preferences or {}).items():
+        model_map.set_model(model, dict(model_map.get_model_map().routes[model]),
+                            preference)
     for ctx in providers.values():
         # Without a tick every provider is UNKNOWN and holds no tier.
         await ctx.reconcile.tick()
@@ -149,6 +153,10 @@ async def test_route_plan_explains_the_default_route() -> None:
         "signals": [],
         "score": None,
         "rank": 0,
+        # Plan 026 W3: null = this provider is not named in a preference (here,
+        # the model has none). The field is always present so a consumer never
+        # distinguishes "unpreferred" from "old build".
+        "preference_rank": None,
         "availability": "available",
         "freshness": "fresh",
     }
@@ -373,3 +381,35 @@ async def test_route_plan_explains_an_estate_with_no_providers() -> None:
     status, body = await _get(app)
     assert status == 503
     assert body["reason"] == "no_providers"
+
+
+@pytest.mark.asyncio
+async def test_route_plan_shows_the_per_model_preference() -> None:
+    """Plan 026 W3: the operator's per-model provider order is visible in the
+    explanation, so "why is beta in front" needs no cross-read of the model
+    map. Reported as a top-level ``preference`` plus a ``preference_rank`` per
+    assessment (null = not named)."""
+    app = await _build(preferences={"shared": ["beta"]})
+    status, body = await _get(app, "model=shared")
+    assert status == 200
+    assert body["preference"] == ["beta"]
+    # And the decision itself honours it: beta fronts alpha, the table primary.
+    assert body["immediate"] == ["beta", "alpha"]
+    assert [
+        (a["provider"], a["preference_rank"]) for a in body["assessments"]
+    ] == [("beta", 0), ("alpha", None)]
+    # The primary keeps its other roles — preference reorders, it never demotes.
+    assert body["terminal_fallback"] == "alpha"
+    assert body["queue_candidate"] == "alpha"
+
+
+@pytest.mark.asyncio
+async def test_route_plan_preference_is_empty_for_an_unpreferred_model() -> None:
+    app = await _build(preferences={"shared": ["beta"]})
+    status, body = await _get(app, "model=alpha-only")
+    assert status == 200
+    assert body["preference"] == []
+    assert all(a["preference_rank"] is None for a in body["assessments"])
+    # Unfiltered (no model) too: a preference is per model.
+    status, body = await _get(app)
+    assert body["preference"] == []

@@ -57,7 +57,8 @@ maps to zero pressure.
 ## 3. The routing decision (the pure function)
 
 `route_decision(states, table, route_key, config, now=now, affinity=None,
-servable_providers=None, healthy_since=None) -> AdmissionPlan`
+servable_providers=None, healthy_since=None, model_preference=())
+-> AdmissionPlan`
 
 The decision is a **staged pipeline with an explicit ranking contract**
 (Plan 026). Before that plan it was a sediment of ten plans' mechanisms
@@ -114,16 +115,61 @@ handles its limits. The two that may are the ones the gate cannot see coming
 
 ### 3.3 Ranking (stage 4)
 
-The strategy is nothing but the choice of scoring key for the IMMEDIATE tier:
+The IMMEDIATE tier's sort key is
+`(model_preference_rank, strategy_score…, table_order)`. The strategy is nothing
+but the choice of that middle term:
 
 | `[routing] strategy` | Key | Notes |
 |---|---|---|
-| `ordered` (default) | table position | the primary fronts unless a pin overrides; post-dwell failback and `failback_delay` hysteresis belong to this strategy alone (§3.4) |
+| `ordered` (default) | table position | the primary fronts unless a pin or a per-model preference overrides; post-dwell failback and `failback_delay` hysteresis belong to this strategy alone (§3.4) |
 | `headroom` | `usage_headroom` desc | Plan 015; `headroom_ranking = true` is the same thing |
 | `pace` | weekly quota surplus desc | Plan 020 D5: `remaining_fraction − burn_rate × days_until_reset`; only FRESH weekly signals are scored, unscored providers follow in table order and are never starved; `pace_flap_margin` is a deadband on the top two, not hysteresis with memory |
 
 `QUEUE` and `BACKSTOP` keep candidate order — stale never outranks fresh, and a
 queue backstop is not a preference contest.
+
+#### 3.3.1 Per-model provider preference (Plan 026 W3)
+
+The workload axis the estate had no way to express: *"for this model, prefer
+these providers, in this order."* A model-map entry carries an optional ordered
+`preference` (`["zai", "umans"]`), stored in the `model_map` table's
+`preference` column and passed to the core as `model_preference` — the shell
+reads config, the core ranks, exactly as `servable_providers` already works.
+
+**It outranks the strategy, and it never adds a candidate.** The model map's
+founding rule is unchanged: it filters and reorders. Concretely the preference
+partitions the IMMEDIATE tier into groups by `preference_rank` — index in the
+tuple, with every unnamed provider sharing the one rank *after* all named ones —
+and the strategy orders each group. So:
+
+- named providers come first, in the operator's order;
+- unnamed providers keep exactly the order the strategy would have given them;
+- a name that is not in the tier (filtered out, demoted to QUEUE, or not a
+  candidate on this route) changes nothing. The stage only permutes the list it
+  is handed, which is why "never resurrect" needs no guard.
+
+What a preference may **not** do: resurrect a filtered candidate, lift a demoted
+provider out of `QUEUE`, reorder `BACKSTOP`, or affect queue-candidate selection
+(§3.5). Every named provider must hold an alias for the model, validated on
+write — a preference for an alias-less provider could only ever be dead config,
+so `POST /admin/model-map` refuses it by name, as it does a repeated name.
+
+**Composition with the pace flap margin.** `pace_flap_margin` is a deadband on
+the top two *scored* candidates (§3.3), and preference is lexicographically
+above the score, so the two compose the only way that keeps both meaningful:
+**preference groups dominate, and the deadband applies within a
+same-preference-rank group.** Across groups it is silent — a near-tie between a
+named and an unnamed provider is settled by the operator, not by an anti-flap
+rule, and a deadband that could override a preference would make the feature
+non-deterministic from the operator's point of view. Within a group the operator
+expressed no order, so the anti-flap rule still governs, unchanged. (Scoring
+itself is per-group too: the "scored before unscored" invariant holds inside each
+group, never across one.)
+
+TOML shape is deliberately unchanged (`[model."glm-5.2"]` still takes aliases
+only): preference is a store/GUI concept first, and a TOML shape can follow if
+wanted. A config overwrite carries across any part of a stored preference that
+still holds an alias.
 
 **Retired: opportunistic quota burn (Plan 016, removed by Plan 026 W2.2).** An
 opt-in signal used to front a fallback that had session headroom to spare and a
@@ -171,6 +217,18 @@ One asymmetry remains deliberately: with **no pin at all**, `headroom` still
 fronts the primary, because Plan 015 ranks the *fallbacks* by headroom and
 leaves the primary in front. So under `headroom` the ranking decides where
 traffic goes once the primary is unavailable — or once a pin has expired.
+
+**A per-model preference counts as a ranking** (Plan 026 W3.3). Pins are
+untouched: a live pin still outranks the ranking, preference included. But the
+two places where this stage would otherwise front the *table primary* on its own
+initiative — post-dwell failback, and the no-pin default — stand down when a
+preference names a member of the tier, exactly as they already do under `pace`.
+Without that, a preference would be silently inert under the default `ordered`
+strategy: stage 4 would order the tier and stage 5 would immediately undo it,
+which is the dead-config outcome W3's write-time validation exists to prevent.
+`_ranks_immediate_tier` states the rule once for strategies and preference
+alike. The primary is not demoted by this — it keeps immediate eligibility, the
+queue backstop, and the terminal fallback.
 
 ### 3.5 Queue-candidate selection (stage 5)
 
@@ -237,6 +295,13 @@ Two consumers read the assessments:
   can disagree with the decision is worse than none — and touches no pin, no
   metric, and no healthy-since clock. The dashboard's Routing Explain card
   renders the response and sends no key.
+
+  Per-model preference (§3.3.1) appears as a top-level `preference` array plus a
+  `preference_rank` on each assessment entry — `null` when the provider is not
+  named. A dedicated field rather than a synthetic signal, deliberately:
+  `signals` are facts about provider *state* that the classify stage fired, and a
+  preference is operator config the rank stage consumed. The card shows the
+  order as one more stat line, and only when the model has one.
 
   To ask about a **specific client's** route, pass that client's raw key. The
   raw key is only hashed to a digest and is never echoed, logged, or stored by

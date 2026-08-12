@@ -188,9 +188,17 @@ class ModelMap:
     A model absent from ``routes`` is not filtered or rewritten — switchboard
     behaves exactly as today (forward original bytes).  Empty ``routes`` = the
     whole feature is off.
+
+    ``preferences`` (Plan 026 W3) adds a third, optional use: an operator's
+    per-model provider order ("for glm-5.2, prefer zai then umans").  It
+    **reorders and never adds** — the model map's founding rule.  Every name in
+    a preference must hold an alias for that model (validated on write in the
+    shell), so a preference can only ever permute what ``providers_for``
+    already allows.  A model with no preference behaves exactly as before.
     """
 
     routes: dict[str, dict[str, str]] = field(default_factory=dict)
+    preferences: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     def __contains__(self, model: str) -> bool:
         return model in self.routes
@@ -204,6 +212,15 @@ class ModelMap:
         """The model string ``provider`` expects for ``model``, or None."""
         entry = self.routes.get(model)
         return entry.get(provider) if entry else None
+
+    def preference_for(self, model: str) -> tuple[str, ...]:
+        """The operator's provider order for ``model``; ``()`` when unset.
+
+        An empty tuple is the "no preference" answer for an unmapped model, a
+        mapped model with no preference, and a preference the store rejected as
+        malformed alike — every caller then behaves as it did before Plan 026.
+        """
+        return self.preferences.get(model, ())
 
 
 @dataclass(frozen=True)
@@ -1075,11 +1092,50 @@ def _stage_classify(
     )
 
 
+def _apply_strategy_order(
+    group: list[str],
+    states: dict[str, ProviderState],
+    candidates: tuple[str, ...],
+    config: RoutingConfig,
+) -> bool:
+    """Order one ranking group in place by the strategy's scoring key.
+
+    Factored out of :func:`_stage_rank` so the same key can order the whole
+    IMMEDIATE tier (no preference) or each preference group separately
+    (Plan 026 W3.3) — the deadband and the scored-first invariant then apply
+    *within* a group, which is what keeps a preference from being diluted by a
+    near-tie between providers the operator ranked differently.
+
+    Returns pace's ``changed`` flag (always False for the other strategies,
+    which do not distinguish ``pace_failover``).
+    """
+    if len(group) < 2:
+        return False
+    use_headroom = (
+        config.strategy == RoutingStrategy.HEADROOM or config.headroom_ranking
+    )
+    if use_headroom:
+        order = {name: i for i, name in enumerate(candidates)}
+
+        def _rank_key(name: str) -> tuple[int, float, int]:
+            st = states.get(name)
+            h = st.usage_headroom if st else None
+            # data-bearing first (headroom desc), then table order
+            return (0 if h is not None else 1, -(h or 0.0), order[name])
+
+        group.sort(key=_rank_key)
+        return False
+    if config.strategy == RoutingStrategy.PACE:
+        return pace_rank(group, states, candidates, config)
+    return False
+
+
 def _stage_rank(
     immediate: list[str],
     states: dict[str, ProviderState],
     candidates: tuple[str, ...],
     config: RoutingConfig,
+    preference: tuple[str, ...] = (),
 ) -> tuple[bool, dict[str, float | None]]:
     """Stage 4 — order the IMMEDIATE tier by the strategy's scoring key.
 
@@ -1090,29 +1146,52 @@ def _stage_rank(
     QUEUE and BACKSTOP keep candidate order — stale never outranks fresh, and
     a queue backstop is not a preference contest.
 
+    ``preference`` is the requested model's per-model provider order (Plan 026
+    W3.3), and it **outranks the strategy**: the sort key is
+    ``(preference_rank, strategy_score…, table_order)``, where
+    ``preference_rank`` is the index in ``preference`` and every unnamed
+    provider shares the one rank *after* all named ones.  Concretely the tier
+    is partitioned into preference groups and the strategy orders each group,
+    so unnamed providers keep exactly the order the strategy would have given
+    them.  A preference is a **reordering only** — it names providers, it never
+    introduces one: a name absent from ``immediate`` (filtered out, demoted to
+    QUEUE, or simply not a candidate) is silently skipped, because this stage
+    only ever permutes the list it is handed.
+
+    An empty preference, or one that names nothing in the tier, takes the
+    pre-W3 path unchanged.
+
     Mutates ``immediate`` in place.  Returns ``(pace_changed, scores)``:
     ``pace_changed`` is what distinguishes the ``pace_failover`` reason from a
     plain failover, and ``scores`` is the per-candidate ranking key for the
     explanation (``None`` where the strategy does not score, or the provider
     is unscored).
     """
-    pace_changed = False
+    pref_rank = {name: i for i, name in enumerate(preference)}
+    if any(name in pref_rank for name in immediate):
+        # Preference groups dominate; the strategy (and, for pace, its flap
+        # deadband) orders within a group only.  Grouping is stable, so an
+        # unnamed group arrives in table order exactly as before.
+        unnamed = len(preference)
+        groups: dict[int, list[str]] = {}
+        for name in immediate:
+            groups.setdefault(pref_rank.get(name, unnamed), []).append(name)
+        ordered: list[str] = []
+        pace_changed = False
+        for key in sorted(groups):
+            group = groups[key]
+            if _apply_strategy_order(group, states, candidates, config):
+                pace_changed = True
+            ordered.extend(group)
+        immediate[:] = ordered
+    else:
+        pace_changed = _apply_strategy_order(
+            immediate, states, candidates, config
+        )
+
     use_headroom = (
         config.strategy == RoutingStrategy.HEADROOM or config.headroom_ranking
     )
-    if use_headroom and len(immediate) > 1:
-        order = {name: i for i, name in enumerate(candidates)}
-
-        def _rank_key(name: str) -> tuple[int, float, int]:
-            st = states.get(name)
-            h = st.usage_headroom if st else None
-            # data-bearing first (headroom desc), then table order
-            return (0 if h is not None else 1, -(h or 0.0), order[name])
-
-        immediate.sort(key=_rank_key)
-    elif config.strategy == RoutingStrategy.PACE and len(immediate) > 1:
-        pace_changed = pace_rank(immediate, states, candidates, config)
-
     scores: dict[str, float | None] = {}
     for name in immediate:
         st = states.get(name)
@@ -1127,8 +1206,10 @@ def _stage_rank(
     return pace_changed, scores
 
 
-def _ranks_immediate_tier(config: RoutingConfig) -> bool:
-    """Does the configured strategy impose its own IMMEDIATE-tier ranking?
+def _ranks_immediate_tier(
+    config: RoutingConfig, preference_applies: bool = False
+) -> bool:
+    """Does anything impose a ranking on the IMMEDIATE tier?
 
     True for ``headroom`` and ``pace`` (and for the legacy
     ``headroom_ranking = True``, which *is* ``headroom``); False for
@@ -1143,8 +1224,19 @@ def _ranks_immediate_tier(config: RoutingConfig) -> bool:
     exists to end: the same rule discovered separately for each strategy, as
     happened when the leak was fixed for ``pace`` alone on 2026-08-11 and left
     ``headroom`` carrying an identical copy of it.
+
+    ``preference_applies`` (Plan 026 W3.3) is the per-model provider preference
+    naming at least one member of the tier.  It counts as a ranking for exactly
+    the same reason: the operator stated an order for this model, so re-fronting
+    the table primary when a pin expires would overwrite it.  Stating it here,
+    rather than as a fourth strategy-specific branch, is the point of the
+    predicate.
     """
-    return config.strategy != RoutingStrategy.ORDERED or config.headroom_ranking
+    return (
+        preference_applies
+        or config.strategy != RoutingStrategy.ORDERED
+        or config.headroom_ranking
+    )
 
 
 def _stage_stickiness(
@@ -1156,6 +1248,7 @@ def _stage_stickiness(
     affinity: RouteAffinity | None,
     healthy_since: dict[str, float] | None,
     now: float,
+    preference_applies: bool = False,
 ) -> str:
     """Stage 5 — the stickiness overlay: dwell, failback, conversation pins.
 
@@ -1170,6 +1263,16 @@ def _stage_stickiness(
     holds a pin under every strategy, but what happens when dwell expires
     depends on whether the strategy has a ranking of its own — see
     :func:`_ranks_immediate_tier`.
+
+    ``preference_applies`` says a per-model preference named a member of this
+    tier (Plan 026 W3.3).  A pin still outranks it — stickiness is unchanged in
+    the load-bearing sense — but the two places where this stage would
+    otherwise re-front the *table primary* on its own (post-dwell failback, and
+    the no-pin default) stand down, exactly as they already do under ``pace``.
+    Without that, an operator's preference would be silently inert under the
+    default ``ordered`` strategy: stage 4 would order the tier and this stage
+    would immediately undo it.  The primary is not demoted by this — it keeps
+    immediate eligibility, the queue backstop, and the terminal fallback.
 
     Mutates ``immediate`` in place; returns the affinity reason code (``""``
     when nothing overrode the ranking).
@@ -1193,7 +1296,7 @@ def _stage_stickiness(
             immediate.insert(0, affinity.provider)
             affinity_reason = "affinity_dwell"
         elif (
-            _ranks_immediate_tier(config)
+            _ranks_immediate_tier(config, preference_applies)
             and not config.pin_conversations
         ):
             # Under a RANKING strategy (pace / headroom), once dwell expires
@@ -1248,12 +1351,20 @@ def _stage_stickiness(
             immediate.remove(affinity.provider)
             immediate.insert(0, affinity.provider)
             affinity_reason = "affinity_pinned"
-        elif config.strategy != RoutingStrategy.PACE and primary in immediate:
+        elif (
+            config.strategy != RoutingStrategy.PACE
+            and not preference_applies
+            and primary in immediate
+        ):
             # With no pin to honour, ORDERED fronts the primary because table
             # position IS its ranking, and HEADROOM does too: Plan 015 ranks
             # the *fallbacks* by headroom and leaves the primary in front
             # (docs/routing-model.md §3.3), so headroom ranking decides where
             # traffic goes only once the primary is unavailable.
+            #
+            # A per-model preference (Plan 026 W3.3) suspends that fronting for
+            # the same reason PACE does: the operator named an order for this
+            # model, and it is stage 4's output that expresses it.
             #
             # PACE deliberately skips it. _stage_rank has already ordered
             # `immediate` by weekly quota surplus — Plan 016's use-it-or-lose-it
@@ -1340,6 +1451,7 @@ def route_decision(
     affinity: RouteAffinity | None = None,
     servable_providers: frozenset[str] | None = None,
     healthy_since: dict[str, float] | None = None,
+    model_preference: tuple[str, ...] = (),
 ) -> AdmissionPlan:
     """Pure routing decision. Returns an :class:`AdmissionPlan`.
 
@@ -1364,6 +1476,13 @@ def route_decision(
     6. **Emit** — :func:`_stage_assess` attaches the per-candidate
        assessments and ``reason`` is derived from the outcome.
 
+    ``model_preference`` is the requested model's per-model provider order
+    (Plan 026 W3), computed in the shell from the model map exactly as
+    ``servable_providers`` is.  It reorders the IMMEDIATE tier and nothing else:
+    it never adds a candidate, never resurrects one the filter removed, never
+    lifts a provider out of QUEUE or BACKSTOP, and never touches
+    queue-candidate selection.  ``()`` — the default — is pre-W3 behaviour.
+
     ``healthy_since`` maps provider name → the monotonic instant that provider
     first became continuously FRESH+AVAILABLE.  It is consulted by name for the
     *effective* primary (post-filtering), so a model map that excludes the
@@ -1385,6 +1504,9 @@ def route_decision(
       eligible.
     * **Capability filtering** — providers whose declared surfaces don't
       include all required surfaces are excluded before admission ranking.
+    * **Per-model preference reorders, never adds** — ``model_preference``
+      outranks the strategy inside the IMMEDIATE tier and has no other effect;
+      unnamed providers keep the strategy's order among themselves.
     * **Bounded stickiness** — after failover, the routing core prefers the
       affinity provider for at least ``dwell_interval`` seconds before
       considering failback to the primary.
@@ -1426,13 +1548,21 @@ def route_decision(
     classified = _stage_classify(candidates, states, config, primary)
     immediate = classified.immediate
 
-    pace_changed, scores = _stage_rank(immediate, states, candidates, config)
+    # A preference "applies" only when it names a member of the IMMEDIATE tier.
+    # A preference naming only demoted or filtered providers changes nothing —
+    # that is the never-resurrect rule, expressed as an absence of effect.
+    preference_applies = any(name in immediate for name in model_preference)
+
+    pace_changed, scores = _stage_rank(
+        immediate, states, candidates, config, model_preference
+    )
 
     affinity_reason = _stage_stickiness(
         immediate, states, primary, config,
         affinity=affinity,
         healthy_since=healthy_since,
         now=now,
+        preference_applies=preference_applies,
     )
 
     queue_candidate = _stage_queue_candidate(primary, classified)

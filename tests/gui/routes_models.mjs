@@ -126,6 +126,38 @@ check('model save sends only filled aliases',
       mcall && mcall.opts.body);
 check('model save clears editingModel on success', getEditingModel() === false);
 
+// --- 6b. preference order round-trips on add (Plan 026 W3.4) --------------
+vm.runInContext('editingModel = true', sandbox);
+sandbox.renderModelAddForm(['umans', 'ollama-cloud']);
+check('model form has a preference field',
+      $('model-add').innerHTML.includes('id="mf-preference"'));
+$('mf-model').value = 'glm-5.2';
+$('mf-umans-alias').value = 'umans-glm-5.2';
+$('mf-ollama-cloud-alias').value = 'glm-5.2';
+$('mf-preference').value = ' ollama-cloud , umans ,, ';
+fetchCalls = [];
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await $('mf-save').onclick();
+const prefCall = fetchCalls.find(c => c.url === '/admin/model-map');
+check('preference is sent as a trimmed ordered list',
+      prefCall && JSON.stringify(JSON.parse(prefCall.opts.body).preference) ===
+        JSON.stringify(['ollama-cloud', 'umans']),
+      prefCall && prefCall.opts.body);
+
+// A preference naming a provider with no alias never reaches the server.
+vm.runInContext('editingModel = true', sandbox);
+sandbox.renderModelAddForm(['umans', 'ollama-cloud']);
+$('mf-model').value = 'glm-5.2';
+$('mf-umans-alias').value = 'umans-glm-5.2';
+$('mf-ollama-cloud-alias').value = '';
+$('mf-preference').value = 'ollama-cloud';
+fetchCalls = [];
+await $('mf-save').onclick();
+check('preference for an alias-less provider does not POST',
+      !fetchCalls.some(c => c.url === '/admin/model-map'));
+check('preference for an alias-less provider explains itself',
+      /no alias/.test($('mf-error').textContent), $('mf-error').textContent);
+
 // --- 7. model save validates ----------------------------------------------
 vm.runInContext('editingModel = true', sandbox);
 sandbox.renderModelAddForm(['umans']);
@@ -152,13 +184,18 @@ fetchCalls = [];
 nextResponse = {
   ok: true, status: 200,
   json: async () => ({
-    providers: { umans: {} },
+    providers: { umans: {}, 'ollama-cloud': {} },
     route_table: { default: ['umans'], k1: ['umans'] },
-    model_map: { 'glm-5.2': { umans: 'umans-glm-5.2' } },
+    model_map: {
+      'glm-5.2': { umans: 'umans-glm-5.2', 'ollama-cloud': 'glm-5.2' },
+    },
+    model_preferences: { 'glm-5.2': ['ollama-cloud', 'umans'] },
   }),
 };
 await sandbox.load();
 check('keyed-route table has a delete button', !!$('del-route-0'));
+check('model-map table shows the preference order',
+      /prefer:\s*ollama-cloud/.test($('app').innerHTML), $('app').innerHTML);
 check('model-map table has a delete button', !!$('del-model-0'));
 // The handler was wired post-render and points at the right key.
 nextResponse = { ok: true, status: 200, json: async () => ({}) };
@@ -176,6 +213,9 @@ check('edit form locks the model name (map key)',
       /id="mf-model"[^>]*disabled/.test($('model-add').innerHTML));
 check('edit form pre-fills the existing alias',
       $('mf-umans-alias').value === 'umans-glm-5.2', $('mf-umans-alias').value);
+check('edit form pre-fills the preference order',
+      $('mf-preference').value === 'ollama-cloud, umans',
+      $('mf-preference').value);
 $('mf-umans-alias').value = 'umans-glm-5.2-tuned';
 fetchCalls = [];
 nextResponse = { ok: true, status: 200, json: async () => ({}) };
@@ -183,12 +223,27 @@ await $('mf-save').onclick();
 const editCall = fetchCalls.find(
   c => c.url === '/admin/model-map' && c.opts && c.opts.method === 'POST');
 check('edit save POSTs the updated alias set', !!editCall);
-check('edit save sends model name + edited alias',
+check('edit save sends model name + edited alias + kept preference',
       editCall && JSON.stringify(JSON.parse(editCall.opts.body)) ===
         JSON.stringify({ model: 'glm-5.2',
-                         aliases: { umans: 'umans-glm-5.2-tuned' } }),
+                         aliases: { 'ollama-cloud': 'glm-5.2',
+                                    umans: 'umans-glm-5.2-tuned' },
+                         preference: ['ollama-cloud', 'umans'] }),
       editCall && editCall.opts.body);
 check('edit save clears editingModel', getEditingModel() === false);
+
+// --- 9c. blanking the preference field clears it (omitted from the POST) ---
+await sandbox.load();
+$('edit-model-0').onclick();
+$('mf-preference').value = '   ';
+fetchCalls = [];
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await $('mf-save').onclick();
+const clearCall = fetchCalls.find(
+  c => c.url === '/admin/model-map' && c.opts && c.opts.method === 'POST');
+check('blank preference omits the field, clearing it server-side',
+      clearCall && !('preference' in JSON.parse(clearCall.opts.body)),
+      clearCall && clearCall.opts.body);
 
 // --- 10. XSS: route/model content is escaped in the tables ----------------
 nextResponse = {
