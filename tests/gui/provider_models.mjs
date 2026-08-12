@@ -241,6 +241,70 @@ check('scan with no models does not probe',
 check('scan with no models shows a message',
       /add a model mapping first/.test($('scan-match-results').innerHTML));
 
+// --- 8. show-models renders a visible click-to-fill list -------------------
+// The datalist alone only surfaces once the operator types, which read as
+// "the button did nothing"; the visible list is the fix.
+vm.runInContext('editingModel = true', sandbox);
+sandbox.renderModelAddForm(['umans', 'ollama-cloud']);
+modelsResponse = {
+  ok: true, status: 200,
+  json: async () => ({ ok: true, models: ['glm-5.2', 'kimi-k3'], detail: '' }),
+};
+vm.runInContext('modelEnums = {}', sandbox);
+await $('mf-umans-show').onclick();
+check('visible list renders the model names',
+      $('mf-umans-list').innerHTML.includes('glm-5.2') &&
+      $('mf-umans-list').innerHTML.includes('kimi-k3'));
+check('status invites the click-to-fill',
+      /click one to fill/.test($('mf-umans-status').textContent));
+$('mf-umans-alias').value = '';
+$('mf-umans-pick-0').onclick();
+check('clicking a listed model fills the alias input',
+      $('mf-umans-alias').value === 'glm-5.2',
+      $('mf-umans-alias').value);
+check('model-name datalist gets the union of enumerated models',
+      $('mf-model-known').innerHTML.includes('glm-5.2') &&
+      $('mf-model-known').innerHTML.includes('kimi-k3'));
+
+// --- 9. scan results are pinned against the poll and dismissible -----------
+vm.runInContext('editingModel = false', sandbox);
+sandbox.renderModelAdd({
+  providers: { umans: {}, 'ollama-cloud': {} },
+  model_map: { 'glm-5.2': { umans: 'umans-glm-5.2' } },
+});
+modelsResponse = {
+  ok: true, status: 200,
+  json: async () => ({ ok: true, models: ['glm-5.2'], detail: '' }),
+};
+vm.runInContext('modelEnums = {}', sandbox);
+await sandbox.runAutoMatchScan(
+  ['ollama-cloud'], ['glm-5.2'], { 'glm-5.2': { umans: 'umans-glm-5.2' } });
+check('scan pins the Model Map card',
+      vm.runInContext('scanPinned', sandbox) === true);
+check('scan renders a dismiss button',
+      /Dismiss/.test($('scan-match-results').innerHTML) &&
+      typeof $('scan-dismiss').onclick === 'function');
+// A poll landing now must not rebuild the card (which would wipe results).
+$('model-add').innerHTML = '';
+sandbox.renderModelAdd({ providers: { umans: {} }, model_map: {} });
+check('poll does not clobber pinned scan results',
+      $('model-add').innerHTML === '');
+
+// --- 9b. applying an offer marks it in place, panel stays pinned -----------
+modelMapResponse = {
+  ok: true, status: 200,
+  json: async () => ({ models: [{ model: 'glm-5.2', aliases: { umans: 'umans-glm-5.2' } }] }),
+};
+fetchCalls = [];
+await $('mf-am-0').onclick();
+check('applied offer is marked added in place',
+      /added/.test($('mf-am-0').textContent), $('mf-am-0').textContent);
+check('panel stays pinned after applying an offer',
+      vm.runInContext('scanPinned', sandbox) === true);
+await $('scan-dismiss').onclick();
+check('dismiss unpins the card',
+      vm.runInContext('scanPinned', sandbox) === false);
+
 // --- report ---------------------------------------------------------------
 let failed = 0;
 for (const r of results) {

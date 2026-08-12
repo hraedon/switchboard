@@ -419,6 +419,96 @@ def test_build_provider_contexts_from_config_zai_dashboard_truth_source() -> Non
     assert ctx.truth_source._provider_name == "zai"
 
 
+def test_build_provider_contexts_parses_peak_windows() -> None:
+    """`peak_windows` specs parse at construction (Plan 025)."""
+    config = {
+        "provider": {
+            "zai": {
+                "upstream": "https://api.z.ai/api/coding/paas/v4",
+                "type": "generic",
+                "target": 2,
+                "peak_windows": ["mon-fri 14:00-18:00 +08:00"],
+            },
+        }
+    }
+    contexts = build_provider_contexts_from_config(config)
+    (w,) = contexts["zai"].peak_windows
+    assert w.spec == "mon-fri 14:00-18:00 +08:00"
+    assert w.utc_offset_minutes == 480
+
+
+def test_build_provider_contexts_rejects_bad_peak_window() -> None:
+    """A bad spec fails construction naming the provider — a window that
+    silently didn't parse would mean expensive burn with no sign why."""
+    config = {
+        "provider": {
+            "zai": {
+                "upstream": "https://api.z.ai/api/coding/paas/v4",
+                "type": "generic",
+                "target": 2,
+                "peak_windows": ["whenever it's cheap"],
+            },
+        }
+    }
+    with pytest.raises(ValueError, match="zai"):
+        build_provider_contexts_from_config(config)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_in_peak_from_windows() -> None:
+    """snapshot_provider_state evaluates the context's windows against the
+    wall clock; a daily 00:00-23:59 Z window is (all but one minute) always
+    active, an always-empty window set never is."""
+    import dataclasses
+
+    from switchboard.peak import parse_peak_windows
+
+    ctx = _make_ready_ctx("zai")
+    state = snapshot_provider_state("zai", ctx, now=0.0)
+    assert state.in_peak is False  # no windows configured
+
+    # Two complementary cross-midnight halves cover every instant, so the
+    # assertion cannot flake on when the suite runs.
+    always = dataclasses.replace(
+        ctx,
+        peak_windows=parse_peak_windows(
+            ["daily 00:00-12:00 Z", "daily 12:00-00:00 Z"]
+        ),
+    )
+    state = snapshot_provider_state("zai", always, now=0.0)
+    assert state.in_peak is True
+    await ctx.http_client.aclose()
+
+
+def test_build_provider_contexts_dashboard_provider_mapping() -> None:
+    """`dashboard_provider` maps a switchboard provider name to the
+    dashboard's provider id. The dashboard emits its own ids ("opencode",
+    "ollama", "zai"); switchboard route keys ("opencode-go", ...) rarely
+    match, and an unmapped lookup silently never finds a reading."""
+    config = {
+        "provider": {
+            "opencode-go": {
+                "upstream": "https://opencode.ai/zen/go/v1",
+                "type": "generic",
+                "target": 4,
+                "dashboard_url": "http://usage-dashboard.example.com",
+                "dashboard_token_env": "USAGE_DASHBOARD_TOKEN",
+                "dashboard_provider": "opencode",
+            },
+        }
+    }
+    import os
+    os.environ["USAGE_DASHBOARD_TOKEN"] = "dashboard-secret"
+    try:
+        contexts = build_provider_contexts_from_config(config)
+    finally:
+        del os.environ["USAGE_DASHBOARD_TOKEN"]
+
+    ctx = contexts["opencode-go"]
+    assert isinstance(ctx.truth_source, DashboardTruthSource)
+    assert ctx.truth_source._provider_name == "opencode"
+
+
 # --- Plan 016: quota_resets_in derivation ---
 
 
@@ -554,3 +644,31 @@ def test_safe_filename_is_collision_resistant() -> None:
     # intentional hash separator and is safe).
     for c in ("/", "\\", "\0", " "):
         assert c not in _safe_filename(f"weird{c}name")
+
+
+def test_dashboard_token_empty_falls_back_to_null_source(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An EMPTY dashboard token env behaves like an absent one: a dashboard
+    source with an empty bearer can never fetch, and since the advisory
+    boot fail-closed fix that would mean a permanently closed gate — the
+    provider must lose the (advisory) signal, not its capacity."""
+    import logging as _logging
+
+    monkeypatch.setenv("EMPTY_DASH_TOKEN", "")
+    config = {
+        "provider": {
+            "zai": {
+                "upstream": "https://api.z.ai/api/coding/paas/v4",
+                "type": "generic",
+                "target": 2,
+                "dashboard_url": "https://usage.example.com",
+                "dashboard_token_env": "EMPTY_DASH_TOKEN",
+            },
+        }
+    }
+    with caplog.at_level(_logging.WARNING):
+        contexts = build_provider_contexts_from_config(config)
+    assert isinstance(contexts["zai"].truth_source, NullTruthSource)
+    assert any("EMPTY_DASH_TOKEN" in r.message for r in caplog.records)

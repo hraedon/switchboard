@@ -102,3 +102,21 @@ zai-coding-plan = "glm-5.2"
 #   [provider.ollama-cloud]
 #   dashboard_url = "https://usage.internal.example"
 #   dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"
+#   dashboard_provider = "ollama"
+#
+# dashboard_provider maps this provider to the dashboard's own id when the
+# names differ — the dashboard emits "zai" / "ollama" / "opencode" / "codex"
+# / "claude", while switchboard route keys are usually longer
+# ("zai-coding-plan", "ollama-cloud", "opencode-go"). Without the mapping the
+# lookup never matches and the provider silently gets no pressure signal.
+#
+# ── peak-pricing windows (Plan 025) ──────────────────────────────────────
+#
+# A provider inside a peak window is DEMOTED in routing (never excluded):
+# it serves only when nothing cheaper can take the request, and it never
+# enters the pace surplus race. One spec per line: "<days> HH:MM-HH:MM
+# <utcoffset>", days = daily | mon | mon-fri | mon,wed,fri; end <= start
+# crosses midnight; fixed UTC offsets only.
+#
+#   [provider.zai-coding-plan]
+#   peak_windows = ["mon-fri 14:00-18:00 +08:00"]   # GLM Coding Plan peak

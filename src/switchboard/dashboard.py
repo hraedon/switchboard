@@ -123,6 +123,10 @@ class DashboardTruthSource:
     but uncertain" (not closed, not preferred for failover target).
     """
 
+    # Advisory: dashboard readings optimise routing; a dashboard outage must
+    # not close the gate (Plan 022 containment — see ReconciliationLoop).
+    advisory = True
+
     def __init__(
         self,
         *,

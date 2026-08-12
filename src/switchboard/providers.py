@@ -12,6 +12,7 @@ these from a provider type and optional TOML config;
 
 from __future__ import annotations
 
+import logging
 import os
 import time as _time
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ from switchboard.control import Availability, ProviderState, SignalFreshness
 from switchboard.dashboard import DashboardTruthSource
 from switchboard.gate import PermitGate
 from switchboard.limit import BreakerConfig
+from switchboard.peak import PeakWindow, parse_peak_windows
+from switchboard.peak import in_peak as _peak_in_peak
 from switchboard.reconcile import ReconciliationLoop
 from switchboard.truth import (
     Provider,
@@ -68,7 +71,13 @@ class ProviderContext:
     #: Prefix applied to the credential — "Bearer " for authorization,
     #: usually empty for x-api-key.
     auth_prefix: str = "Bearer "
+    #: Parsed peak-pricing windows (Plan 025). Empty = no peak pricing.
+    #: snapshot_provider_state evaluates these against the wall clock to set
+    #: ProviderState.in_peak; the routing core never reads a clock.
+    peak_windows: tuple[PeakWindow, ...] = ()
 
+
+log = logging.getLogger("switchboard.providers")
 
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
 
@@ -85,6 +94,7 @@ def build_provider_context(
     poll_interval: float = 5.0,
     dashboard_url: str | None = None,
     dashboard_token: str | None = None,
+    dashboard_provider: str | None = None,
     dashboard_poll_interval: float = 30.0,
     dashboard_stale_ttl: float = 900.0,
     poll_interval_idle: float | None = None,
@@ -98,6 +108,7 @@ def build_provider_context(
     direct_usage_cookie: str = "",
     direct_usage_stale_ttl: float = 900.0,
     direct_usage_poll_interval: float = 30.0,
+    peak_windows: tuple[PeakWindow, ...] = (),
 ) -> ProviderContext:
     """Construct a :class:`ProviderContext` from the vendored building blocks.
 
@@ -154,10 +165,15 @@ def build_provider_context(
         and dashboard_url is not None
         and dashboard_token is not None
     ):
+        # The dashboard names providers by its own ids ("zai", "ollama",
+        # "opencode", ...), which rarely match switchboard's route keys
+        # ("zai-coding-plan", "ollama-cloud", "opencode-go"). Without the
+        # dashboard_provider mapping, the lookup silently never matched and
+        # the truth source served the fail-safe forever.
         truth_source = DashboardTruthSource(
             dashboard_url=dashboard_url,
             bearer_token=dashboard_token,
-            provider_name=name,
+            provider_name=dashboard_provider or name,
             stale_ttl=dashboard_stale_ttl,
         )
         poll_interval = dashboard_poll_interval
@@ -215,6 +231,7 @@ def build_provider_context(
             if auth_prefix is not None
             else ("Bearer " if auth_header_name.lower() == "authorization" else "")
         ),
+        peak_windows=peak_windows,
     )
 
 
@@ -279,11 +296,27 @@ def build_provider_contexts_from_config(
             usage_key = os.environ.get(usage_key_env, "")
 
         dashboard_url = _optional_str(provider_cfg, "dashboard_url")
+        # Optional mapping to the dashboard's provider id when it differs
+        # from this provider's name (e.g. "opencode-go" reads the dashboard's
+        # "opencode" reading). Defaults to the provider name.
+        dashboard_provider = _optional_str(provider_cfg, "dashboard_provider")
 
         dashboard_token: str | None = None
         dashboard_token_env = _optional_str(provider_cfg, "dashboard_token_env")
         if dashboard_token_env is not None:
-            dashboard_token = os.environ.get(dashboard_token_env)
+            # Empty behaves like absent: a dashboard source built with an
+            # empty bearer can never fetch successfully, and since the
+            # advisory boot fail-closed fix that means a permanently closed
+            # gate — worse than simply losing the (advisory) signal. Warn
+            # and fall through to the provider-type default instead.
+            dashboard_token = os.environ.get(dashboard_token_env) or None
+            if dashboard_token is None:
+                log.warning(
+                    "provider '%s': dashboard_token_env=%r is not set or "
+                    "empty; skipping the dashboard truth source (the "
+                    "provider loses its usage signal, not its boot)",
+                    name, dashboard_token_env,
+                )
 
         dashboard_stale_ttl = _float_or(
             provider_cfg, "dashboard_stale_ttl", 900.0
@@ -325,6 +358,24 @@ def build_provider_contexts_from_config(
 
         poll_interval_idle = _optional_float(provider_cfg, "poll_interval_idle")
 
+        # Peak-pricing windows (Plan 025). A bad spec fails construction with
+        # the provider and spec named — a window that silently didn't parse
+        # would mean burning quota at the expensive rate with no sign why.
+        peak_windows: tuple[PeakWindow, ...] = ()
+        raw_windows = provider_cfg.get("peak_windows")
+        if raw_windows is not None:
+            if not isinstance(raw_windows, list) or not all(
+                isinstance(w, str) for w in raw_windows
+            ):
+                raise ValueError(
+                    f"provider '{name}': peak_windows must be a list of "
+                    "window strings, e.g. [\"mon-fri 14:00-18:00 +08:00\"]"
+                )
+            try:
+                peak_windows = parse_peak_windows(raw_windows)
+            except ValueError as exc:
+                raise ValueError(f"provider '{name}': {exc}") from None
+
         history_store: HistoryStore | None = None
         history: History | None = None
         if history_store_path:
@@ -348,6 +399,7 @@ def build_provider_contexts_from_config(
             usage_key=usage_key,
             dashboard_url=dashboard_url,
             dashboard_token=dashboard_token,
+            dashboard_provider=dashboard_provider,
             dashboard_stale_ttl=dashboard_stale_ttl,
             dashboard_poll_interval=dashboard_poll_interval,
             poll_interval_idle=poll_interval_idle,
@@ -361,6 +413,7 @@ def build_provider_contexts_from_config(
             direct_usage_cookie=direct_usage_cookie,
             direct_usage_stale_ttl=direct_usage_stale_ttl,
             direct_usage_poll_interval=direct_usage_poll_interval,
+            peak_windows=peak_windows,
         )
 
     return contexts
@@ -495,6 +548,17 @@ def snapshot_provider_state(
     if usage_history_tracker is not None:
         usage_24h_utilization = usage_history_tracker.utilization(name)
 
+    # Peak-pricing window (Plan 025). The wall-clock read lives HERE, in the
+    # shell — the routing core receives the boolean and stays clock-free.
+    # Deliberately _time.time(), not the `now` argument: `now` is a MONOTONIC
+    # instant (the overload/budget trackers' clock) and peak windows are
+    # civil time — reusing it (review B-5's suggestion) would compare a
+    # process-uptime float against wall-clock windows. Same pattern as the
+    # weekly/quota reset fields above.
+    provider_in_peak = bool(ctx.peak_windows) and _peak_in_peak(
+        ctx.peak_windows, _time.time()
+    )
+
     return ProviderState(
         name=name,
         availability=availability,
@@ -509,6 +573,7 @@ def snapshot_provider_state(
         usage_24h_utilization=usage_24h_utilization,
         weekly_remaining_fraction=weekly_remaining_fraction,
         weekly_reset_in=weekly_reset_in,
+        in_peak=provider_in_peak,
     )
 
 

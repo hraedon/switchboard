@@ -20,6 +20,7 @@ from switchboard import __version__
 from switchboard.config_reset import ResetError, parse_sections, reset_sections
 from switchboard.control import (
     MUTABLE_ROUTING_FIELDS,
+    RETIRED_ROUTING_FIELDS,
     ROUTING_BOOL_FIELDS,
     ROUTING_FIELD_BOUNDS,
     ROUTING_STRATEGIES,
@@ -144,6 +145,31 @@ def _validate_provider_config(
     direct_usage = cfg.get("direct_usage")
     if direct_usage is not None and not isinstance(direct_usage, bool):
         errors.append(f"provider '{name}': direct_usage must be a boolean")
+
+    dashboard_provider = cfg.get("dashboard_provider")
+    if dashboard_provider is not None and (
+        not isinstance(dashboard_provider, str) or not dashboard_provider.strip()
+    ):
+        errors.append(
+            f"provider '{name}': dashboard_provider must be a non-empty string"
+        )
+
+    peak_windows = cfg.get("peak_windows")
+    if peak_windows is not None:
+        if not isinstance(peak_windows, list) or not all(
+            isinstance(w, str) for w in peak_windows
+        ):
+            errors.append(
+                f"provider '{name}': peak_windows must be a list of window "
+                'strings, e.g. ["mon-fri 14:00-18:00 +08:00"]'
+            )
+        else:
+            from switchboard.peak import parse_peak_windows
+
+            try:
+                parse_peak_windows(peak_windows)
+            except ValueError as exc:
+                errors.append(f"provider '{name}': {exc}")
 
     for key in ("direct_usage_stale_ttl", "direct_usage_poll_interval"):
         val = cfg.get(key)
@@ -968,21 +994,42 @@ def _build_serve_app(
     if stored_overlay:
         overlay_kwargs = dict(rc_kwargs) if isinstance(routing_section, dict) else {}
         applied: list[str] = []
+        retired: list[str] = []
         for name, value in stored_overlay.items():
-            if name not in MUTABLE_ROUTING_FIELDS:
+            # A retired field is still loaded, not skipped: it was written by an
+            # admin PUT back when the mechanism existed, and dropping it here
+            # would make the boot log's retirement warning depend on which door
+            # the value came through (Plan 026 W2.2).  It has no effect either
+            # way — nothing in the decision reads it.
+            if name not in MUTABLE_ROUTING_FIELDS + RETIRED_ROUTING_FIELDS:
                 continue
             message = validate_routing_field(name, value)
             if message is not None:
                 log.warning("ignoring persisted routing.%s: %s", name, message)
                 continue
             overlay_kwargs[name] = coerce_routing_value(name, value)
-            applied.append(name)
-        if applied:
+            (retired if name in RETIRED_ROUTING_FIELDS else applied).append(name)
+        if applied or retired:
             routing_config = RoutingConfig(**overlay_kwargs)
+        if applied:
             log.info(
                 "  routing overlay:   %s (from the config store)",
                 ", ".join(sorted(applied)),
             )
+
+    # One warning, at the seam where TOML and the stored overlay have both been
+    # folded in, so an operator hears about a retired knob exactly once however
+    # they set it (Plan 026 W2.2).  Warn only when the flag resolves TRUE: the
+    # inert defaults are what every config that never used Plan 016 carries, and
+    # a warning that fires for everyone is a warning nobody reads.
+    if routing_config.opportunistic_enabled:
+        log.warning(
+            "  opportunistic:     RETIRED and ignored — opportunistic quota "
+            "burn (Plan 016) was removed from the routing decision by "
+            'Plan 026. Use strategy = "pace", which ranks on the weekly quota '
+            "surplus rather than a session-window reset heuristic; the "
+            "opportunistic_* fields still parse but do nothing."
+        )
 
     # Quarantine (Plan 023). Persisted through the config store so a restart
     # cannot silently un-quarantine a pair no human has looked at.
@@ -1307,13 +1354,6 @@ def _build_serve_app(
         )
     if routing_config.headroom_ranking:
         log.info("  headroom_ranking:  enabled")
-    if routing_config.opportunistic_enabled:
-        log.info(
-            "  opportunistic:     min_headroom=%.2f reset_window=%.1fs margin=%.2f",
-            routing_config.opportunistic_min_headroom,
-            routing_config.opportunistic_reset_window,
-            routing_config.opportunistic_margin,
-        )
     if quarantine.entries():
         log.warning(
             "  quarantine:        %d pair(s) still quarantined from a "

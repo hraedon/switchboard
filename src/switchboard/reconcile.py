@@ -141,6 +141,13 @@ class ReconciliationLoop:
         history_ttl: float = _DEFAULT_HISTORY_TTL,
     ) -> None:
         self._truth = truth_source
+        # Advisory truth sources (usage scrapes, the usage-dashboard poller,
+        # the null source) exist to *optimise* routing; their failure must
+        # never cost availability (Plan 022's containment contract). Header
+        # sources are authoritative rate-limit data from real responses and
+        # keep the fail-closed policy. Default False: an unknown source is
+        # treated as authoritative (fail-safe).
+        self._advisory = bool(getattr(truth_source, "advisory", False))
         self._gate = gate
         self._max_concurrency = max_concurrency
         self._boot_max_concurrency = max_concurrency
@@ -574,11 +581,27 @@ class ReconciliationLoop:
         """Compute gate capacity for header-driven providers.
 
         Static capacity = max_concurrency, but tighten to 0 on:
-        (a) stale headers (ok=False), (b) zero requests_remaining AND
-        zero tokens_remaining, (c) recent rate-limit 429s with stale data.
+        (a) stale headers (ok=False) — authoritative sources only,
+        (b) zero requests_remaining AND zero tokens_remaining, (c) recent
+        rate-limit 429s with stale data (the min(permits, 1) clamp in tick()).
         This replaces AIMD with a fail-safe static policy (review finding 10).
+
+        Advisory truth sources (usage scrapes / dashboard polls) are exempt
+        from (a) ONCE a successful poll has happened: a failed fetch must
+        cost the routing optimisation, never availability (Plan 022). The
+        reading served on ok=False is then the last-known-good, so the
+        data-driven zero checks below still apply — a provider whose last
+        real reading said "exhausted" stays closed until a successful poll
+        says otherwise.
+
+        Before the first successful poll there IS no last-known-good — the
+        source serves a synthetic failsafe whose remaining fields are None,
+        so the data-driven zeroes cannot fire. Opening the gate there would
+        be fail-open on zero evidence (cross-lineage review, blocking
+        finding B1), so the boot case stays fail-closed for advisory
+        sources too, mirroring the polled path's boot-closed construction.
         """
-        if not ok:
+        if not ok and (not self._advisory or not self._first_poll_ok):
             return 0
 
         r = reading.reading

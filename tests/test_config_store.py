@@ -486,3 +486,143 @@ def test_usage_key_env_round_trips_and_reaches_section(tmp_path) -> None:
     reloaded = ConfigStoreManager(sqlite_path=str(tmp_path / "cfg.sqlite"))
     assert reloaded.get("umans-a")["usage_key_env"] == "UMANS_USAGE_KEY"
     reloaded.close()
+
+
+# ---------------------------------------------------------------------------
+# Plan 025: dashboard_provider + peak_windows columns
+# ---------------------------------------------------------------------------
+
+
+def test_plan025_fields_round_trip(tmp_path: Path) -> None:
+    """dashboard_provider and peak_windows persist and re-load."""
+    path = str(tmp_path / "store.sqlite")
+    mgr = ConfigStoreManager(sqlite_path=path)
+    mgr.upsert("zai", _stored_fields(
+        dashboard_provider="zai",
+        peak_windows=["mon-fri 14:00-18:00 +08:00"],
+    ))
+    mgr.close()
+
+    reloaded = ConfigStoreManager(sqlite_path=path)
+    masked = reloaded.get("zai")
+    assert masked is not None
+    assert masked["dashboard_provider"] == "zai"
+    assert masked["peak_windows"] == ["mon-fri 14:00-18:00 +08:00"]
+    section = reloaded.to_provider_section("zai")
+    assert section["dashboard_provider"] == "zai"
+    assert section["peak_windows"] == ["mon-fri 14:00-18:00 +08:00"]
+    reloaded.close()
+
+
+def test_plan025_migration_adds_columns_to_pre025_db(tmp_path: Path) -> None:
+    """A store file created before Plan 025 gains the new columns on open,
+    keeping its existing rows intact."""
+    path = str(tmp_path / "old-store.sqlite")
+    db = sqlite3.connect(path)
+    db.execute(
+        """
+        CREATE TABLE provider_config (
+            name TEXT PRIMARY KEY,
+            account TEXT NOT NULL DEFAULT 'default',
+            upstream TEXT NOT NULL,
+            provider_type TEXT NOT NULL,
+            target INTEGER NOT NULL,
+            key_mode TEXT NOT NULL
+                CHECK(key_mode IN ('env','stored','passthrough')),
+            api_key_env TEXT,
+            api_key_stored TEXT,
+            auth_header TEXT,
+            auth_prefix TEXT,
+            dashboard_url TEXT,
+            dashboard_token_env TEXT,
+            usage_key_env TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    db.execute(
+        "INSERT INTO provider_config (name, account, upstream, provider_type,"
+        " target, key_mode, api_key_stored, enabled, created_at, updated_at)"
+        " VALUES ('old', 'default', 'https://api.example.com', 'generic',"
+        " 2, 'stored', ?, 1, 1.0, 1.0)",
+        (SENTINEL,),
+    )
+    db.commit()
+    db.close()
+
+    mgr = ConfigStoreManager(sqlite_path=path)
+    masked = mgr.get("old")
+    assert masked is not None
+    assert masked["target"] == 2
+    assert masked["api_key_set"] is True
+    assert masked["dashboard_provider"] is None
+    assert masked["peak_windows"] == []
+    # And the migrated file accepts the new fields on the next write.
+    mgr.upsert("old", _stored_fields(
+        target=2, peak_windows=["daily 08:00-22:00 +08:00"],
+    ))
+    assert mgr.get("old")["peak_windows"] == ["daily 08:00-22:00 +08:00"]  # type: ignore[index]
+    mgr.close()
+
+
+def test_plan025_bad_peak_window_rejected() -> None:
+    mgr = ConfigStoreManager()
+    with pytest.raises(ValueError, match="peak window"):
+        mgr.upsert("p", _stored_fields(peak_windows=["whenever"]))
+    with pytest.raises(ValueError, match="peak_windows"):
+        mgr.upsert("p", _stored_fields(peak_windows="mon-fri"))
+    assert mgr.get("p") is None
+
+
+def test_plan025_empty_peak_windows_clears() -> None:
+    """An empty list means "no windows": the section omits the key."""
+    mgr = ConfigStoreManager()
+    mgr.upsert("p", _stored_fields(peak_windows=["daily 01:00-02:00 Z"]))
+    mgr.upsert("p", _stored_fields(peak_windows=[]))
+    assert mgr.get("p")["peak_windows"] == []  # type: ignore[index]
+    assert "peak_windows" not in mgr.to_provider_section("p")
+
+
+def test_plan025_section_builds_context_with_windows() -> None:
+    """A store row with peak_windows builds a context whose ctx.peak_windows
+    are parsed — the store→boot path is complete."""
+    mgr = ConfigStoreManager()
+    mgr.upsert("zai", _stored_fields(
+        dashboard_provider="zai",
+        peak_windows=["mon-fri 14:00-18:00 +08:00"],
+    ))
+    contexts = build_provider_contexts_from_config(
+        {"provider": {"zai": mgr.to_provider_section("zai")}}
+    )
+    (w,) = contexts["zai"].peak_windows
+    assert w.utc_offset_minutes == 480
+
+
+def test_plan025_tampered_peak_windows_row_is_skipped_on_load(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A DB row whose peak_windows cell holds malformed JSON is refused on
+    load (row skipped with a warning), not silently accepted as "no
+    windows" — silently dropping a peak guard means expensive burn with no
+    sign why (cross-lineage review, finding 1)."""
+    path = str(tmp_path / "store.sqlite")
+    mgr = ConfigStoreManager(sqlite_path=path)
+    mgr.upsert("zai", _stored_fields(
+        peak_windows=["mon-fri 14:00-18:00 +08:00"],
+    ))
+    mgr.close()
+
+    db = sqlite3.connect(path)
+    db.execute(
+        "UPDATE provider_config SET peak_windows = '{oops' WHERE name='zai'"
+    )
+    db.commit()
+    db.close()
+
+    with caplog.at_level(logging.WARNING):
+        reloaded = ConfigStoreManager(sqlite_path=path)
+    assert reloaded.get("zai") is None
+    assert any("skipping malformed" in r.message for r in caplog.records)
+    reloaded.close()

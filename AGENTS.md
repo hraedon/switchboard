@@ -74,14 +74,19 @@ gates and decides which upstream provider receives each request.
    trailing-24h usage signal (Plan 013): the provider's heavy-usage penalty
    keys off trailing-day volume, which the gate cannot see coming, so
    `[routing] usage_24h_threshold` MAY demote the primary to queue-eligible.
-   (2) `[routing] opportunistic_enabled` (Plan 016): an opt-in
-   use-it-or-lose-it signal — a quota-bearing fallback with measured session
-   headroom ≥ `opportunistic_min_headroom` and
-   `quota_resets_in ≤ opportunistic_reset_window` — MAY take front-of-immediate
-   preference over a healthy primary. De-preference only: the primary stays
-   immediate-eligible, queue backstop, and terminal 503 fallback; the
-   selection is pinned by affinity (Plan 014) so conversations do not flap
-   between providers. Stale or unmeasured quota data never promotes.
+   (2) The peak-window signal (Plan 025): a provider inside a configured
+   peak-pricing window is expensive rather than broken, and price is not
+   something its gate can see, so `[routing] peak_windows` MAY demote the
+   primary to queue-eligible. Both are de-preference only: the primary stays
+   queue backstop and terminal 503 fallback.
+   Separately, a **ranking strategy** (`[routing] strategy = "pace"`) MAY cost
+   the primary front-of-immediate on score alone. That is not a demotion — the
+   primary stays immediate-eligible, queue backstop, and terminal fallback —
+   and stale or unmeasured quota data is never scored, so it never promotes.
+   *(Plan 016's `opportunistic_enabled` used to be exception (2) here. Plan 026
+   W2.2 retired it: pace supersedes it, and its session-window reset heuristic
+   systematically favoured the most expensive provider in this estate. The
+   fields still parse and do nothing.)*
 2. **The routing core is pure.** No clock, no randomness, no I/O inside
    `switchboard.control`. Pass time and observations in as arguments so
    decisions are reproducible and testable.

@@ -50,6 +50,11 @@ class TruthSource(Protocol):
 class PolledTruthSource:
     """Wraps umans ``/v1/usage`` polling with LKG caching."""
 
+    # Authoritative: the umans permit computation never consults this flag
+    # (it has its own polled path), but the classification contract is that
+    # every TruthSource carries the right value.
+    advisory = False
+
     def __init__(
         self,
         *,
@@ -130,6 +135,10 @@ class PolledTruthSource:
 class HeaderTruthSource:
     """Holds the latest LimitState built from response ratelimit headers."""
 
+    # Authoritative: the headers ARE the provider's rate-limit truth, so a
+    # stale reading fails the gate closed (see ReconciliationLoop).
+    advisory = False
+
     def __init__(
         self, *, provider: str = "anthropic", fresh_ttl: float = 15.0
     ) -> None:
@@ -185,6 +194,9 @@ class HeaderTruthSource:
 
 class NullTruthSource:
     """No external truth — generic provider."""
+
+    # No signal at all; nothing to fail closed on (fetch always returns ok).
+    advisory = True
 
     def __init__(self, *, provider: str = "generic") -> None:
         self._provider = provider

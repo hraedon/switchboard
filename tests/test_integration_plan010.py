@@ -340,3 +340,116 @@ async def test_no_model_map_full_passthrough() -> None:
     assert umans_bodies[0] == body
 
     await umans_ctx.http_client.aclose()
+
+
+# ── Plan 026 W2.3: the effective primary, computed once ────────────────────
+#
+# The shell used to keep its own pre-filter copy of the primary
+# (`candidates[0]`) while the core derived the effective, post-filter one.
+# Model-map filtering is the case that pulls them apart: with a model the
+# configured primary cannot serve, the shell compared the serving provider
+# against a provider that was never a candidate, so *every* request looked like
+# a failover and left an affinity pin behind. Both are now read from the plan.
+
+
+def _ollama_only_map() -> ModelMapManager:
+    """A model only the fallback serves — so the primary is filtered out."""
+    mgr = ModelMapManager()
+    mgr.set_model("ollama-only", {"ollama-cloud": "ollama-only"})
+    return mgr
+
+
+def _ollama_only_app(
+    routing_config: RoutingConfig | None = None,
+) -> ProxyApp:
+    def umans_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("umans cannot serve this model")
+
+    def ollama_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="ok")
+
+    return ProxyApp(
+        providers={
+            "umans": _make_mocked_ctx("umans", umans_handler),
+            "ollama-cloud": _make_mocked_ctx("ollama-cloud", ollama_handler),
+        },
+        route_table=RouteTableManager(
+            default_providers=("umans", "ollama-cloud")
+        ),
+        routing_config=routing_config or RoutingConfig(),
+        model_map_mgr=_ollama_only_map(),
+    )
+
+
+async def _send_ollama_only(app: ProxyApp) -> None:
+    body = json.dumps({"model": "ollama-only", "messages": []}).encode()
+    scope = _make_scope(body=body)
+    messages, send = _make_send()
+    await app(scope, _MockReceive(body=body), send)
+    status, _ = _parse_response(messages)
+    assert status == 200
+
+
+async def _close(app: ProxyApp) -> None:
+    for ctx in app._providers.values():
+        await ctx.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_model_filtered_primary_is_not_a_failover() -> None:
+    """A model the configured primary does not serve is routing working, not
+    routing degrading.
+
+    Counting it inflated `failovers` on every request for such a model, which
+    is the metric an operator reads to decide whether the estate is healthy —
+    so the one signal that says "your primary is struggling" fired hardest for
+    a model the primary was never asked to serve.
+    """
+    app = _ollama_only_app()
+    await _send_ollama_only(app)
+    assert app.metrics.failovers == 0
+    assert app.metrics.routing_decisions == 1
+    # The decision log agrees: the effective primary IS who served.
+    entry = next(iter(app.metrics.recent_decisions))
+    assert entry["selected"] == "ollama-cloud"
+    assert entry["primary"] == "ollama-cloud"
+    await _close(app)
+
+
+@pytest.mark.asyncio
+async def test_model_filtered_primary_creates_no_affinity_pin() -> None:
+    """The state half of the same bug, and the worse half.
+
+    A pin is a promise to keep a conversation somewhere for `dwell_interval`.
+    Pinning the only provider that can serve the model promises nothing and
+    costs an entry in a bounded LRU table — one per conversation, evicting the
+    pins that were doing real work.
+    """
+    app = _ollama_only_app()
+    await _send_ollama_only(app)
+    assert list(app._affinity.values()) == []
+    assert app.metrics.affinity_pins_total == 0
+    await _close(app)
+
+
+@pytest.mark.asyncio
+async def test_effective_primary_still_pops_a_pin_naming_someone_else() -> None:
+    """The behaviour that must survive the fix: serving the primary releases a
+    pin, and that now means the *effective* primary.
+
+    The pin here names umans — the configured primary, which cannot serve this
+    model at all. Clearing it is the failback it always was: the conversation is
+    back on the provider the route prefers for this request.
+    """
+    app = _ollama_only_app()
+    from switchboard.control import RouteAffinity, hash_route_key
+
+    key = hash_route_key("test-key")
+    app._affinity[key] = RouteAffinity(provider="umans", selected_at=0.0)
+
+    await _send_ollama_only(app)
+    assert list(app._affinity.values()) == []
+    assert app.metrics.affinity_failbacks_total == 1
+    assert app.metrics.failovers == 0
+    await _close(app)
+

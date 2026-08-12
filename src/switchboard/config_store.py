@@ -65,11 +65,21 @@ CREATE TABLE IF NOT EXISTS provider_config (
     dashboard_url TEXT,
     dashboard_token_env TEXT,
     usage_key_env TEXT,
+    dashboard_provider TEXT,
+    peak_windows TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 )
 """
+
+# Columns added after the table first shipped (Plan 025). Applied by an
+# idempotent boot-time migration: both live instances have pre-025 store
+# files, and CREATE TABLE IF NOT EXISTS never touches an existing table.
+_MIGRATION_COLUMNS: dict[str, str] = {
+    "dashboard_provider": "TEXT",
+    "peak_windows": "TEXT",
+}
 
 # The routing overlay (Plan 020 WI-14): the routing knobs an operator changed
 # through the admin API, stored as a single JSON row. It is an *overlay*, not a
@@ -110,6 +120,8 @@ _COLUMNS = (
     "dashboard_url",
     "dashboard_token_env",
     "usage_key_env",
+    "dashboard_provider",
+    "peak_windows",
     "enabled",
     "created_at",
     "updated_at",
@@ -137,6 +149,9 @@ class _ProviderRow:
     dashboard_url: str | None = None
     dashboard_token_env: str | None = None
     usage_key_env: str | None = None
+    dashboard_provider: str | None = None
+    #: JSON array of peak-window spec strings (Plan 025), or None.
+    peak_windows: str | None = None
     enabled: int = 1
     created_at: float = 0.0
     updated_at: float = 0.0
@@ -183,6 +198,7 @@ class ConfigStoreManager:
                 self._db.execute(_SCHEMA)
                 self._db.execute(_ROUTING_SCHEMA)
                 self._db.execute(_QUARANTINE_SCHEMA)
+                self._migrate_columns()
                 self._db.commit()
             except sqlite3.Error:
                 # Boot must not crash on a bad store file; later writes will
@@ -194,6 +210,31 @@ class ConfigStoreManager:
                 )
             else:
                 self._load_from_db()
+
+    def _migrate_columns(self) -> None:
+        """Add columns that postdate the table's first ship (Plan 025).
+
+        Idempotent: PRAGMA table_info tells us what exists; each missing
+        column is ADDed as nullable TEXT, which SQLite applies without
+        rewriting rows. CREATE TABLE IF NOT EXISTS never alters an existing
+        table, so pre-025 store files need this on every boot (a no-op once
+        applied).
+        """
+        db = self._db
+        if db is None:
+            return
+        present = {
+            r[1] for r in db.execute("PRAGMA table_info(provider_config)")
+        }
+        for column, ctype in _MIGRATION_COLUMNS.items():
+            if column not in present:
+                db.execute(
+                    f"ALTER TABLE provider_config ADD COLUMN {column} {ctype}"
+                )
+                log.info(
+                    "config store: migrated provider_config, added column %s",
+                    column,
+                )
 
     # -- loading ----------------------------------------------------------
 
@@ -232,9 +273,11 @@ class ConfigStoreManager:
                     dashboard_url=_opt_str(raw[10]),
                     dashboard_token_env=_opt_str(raw[11]),
                     usage_key_env=_opt_str(raw[12]),
-                    enabled=1 if raw[13] else 0,
-                    created_at=float(raw[14]),
-                    updated_at=float(raw[15]),
+                    dashboard_provider=_opt_str(raw[13]),
+                    peak_windows=_opt_str(raw[14]),
+                    enabled=1 if raw[15] else 0,
+                    created_at=float(raw[16]),
+                    updated_at=float(raw[17]),
                 )
                 _validate_row(row)
             except (ValueError, TypeError, IndexError):
@@ -257,6 +300,13 @@ class ConfigStoreManager:
         KEEPS the already-stored key. Keys are write-only through the API, so
         the GUI never round-trips them; absence on edit means "unchanged",
         not "clear".
+
+        Whole-row semantics cut both ways: a PUT built from a stale form
+        (e.g. a cached pre-025 GUI page that never heard of ``peak_windows``
+        or ``dashboard_provider``) silently resets those fields to NULL.
+        The shipped GUI always round-trips every managed field; any OTHER
+        admin client must do the same or it will strip config it does not
+        know about (cross-lineage review, finding 2).
 
         Raises :class:`ValueError` with an admin-surfaceable message on
         validation failure. DB-first: the row is committed before memory is
@@ -293,6 +343,8 @@ class ConfigStoreManager:
                     row.dashboard_url,
                     row.dashboard_token_env,
                     row.usage_key_env,
+                    row.dashboard_provider,
+                    row.peak_windows,
                     row.enabled,
                     row.created_at,
                     row.updated_at,
@@ -343,6 +395,8 @@ class ConfigStoreManager:
             dashboard_url=_opt_str_field(fields, "dashboard_url"),
             dashboard_token_env=_opt_str_field(fields, "dashboard_token_env"),
             usage_key_env=_opt_str_field(fields, "usage_key_env"),
+            dashboard_provider=_opt_str_field(fields, "dashboard_provider"),
+            peak_windows=_normalize_peak_windows(fields.get("peak_windows")),
             enabled=1 if enabled_raw else 0,
             created_at=existing.created_at if existing is not None else now,
             updated_at=now,
@@ -441,6 +495,11 @@ class ConfigStoreManager:
             section["dashboard_token_env"] = row.dashboard_token_env
         if row.usage_key_env is not None:
             section["usage_key_env"] = row.usage_key_env
+        if row.dashboard_provider is not None:
+            section["dashboard_provider"] = row.dashboard_provider
+        peak_list = _peak_windows_list(row.peak_windows)
+        if peak_list:
+            section["peak_windows"] = peak_list
         return section
 
     def effective_providers(
@@ -610,6 +669,8 @@ def _masked(row: _ProviderRow) -> dict[str, object]:
         "dashboard_url": row.dashboard_url,
         "dashboard_token_env": row.dashboard_token_env,
         "usage_key_env": row.usage_key_env,
+        "dashboard_provider": row.dashboard_provider,
+        "peak_windows": _peak_windows_list(row.peak_windows),
         "enabled": bool(row.enabled),
         "created_at": row.created_at,
         "updated_at": row.updated_at,
@@ -646,6 +707,76 @@ def _validate_row(row: _ProviderRow) -> None:
             f"provider {row.name!r}: key_mode='stored' requires "
             "'api_key_stored' (the credential) on first write"
         )
+    if row.peak_windows is not None:
+        # Validate the specs here (not only at build time) so a bad row —
+        # whether from an upsert or loaded from the DB — is refused with the
+        # spec named, instead of failing provider construction later.
+        # STRICT decode, not _peak_windows_list: the lenient helper swallows
+        # malformed JSON as "no windows", which would silently drop a peak
+        # guard and burn quota at the expensive rate with no sign why
+        # (cross-lineage review, finding 1).
+        from switchboard.peak import parse_peak_windows
+
+        try:
+            loaded = json.loads(row.peak_windows)
+        except json.JSONDecodeError:
+            raise ValueError(
+                f"provider {row.name!r}: peak_windows cell is not valid JSON"
+            ) from None
+        if not isinstance(loaded, list) or not all(
+            isinstance(w, str) for w in loaded
+        ):
+            raise ValueError(
+                f"provider {row.name!r}: peak_windows must be a JSON array "
+                "of window strings"
+            )
+        try:
+            parse_peak_windows(loaded)
+        except ValueError as exc:
+            raise ValueError(f"provider {row.name!r}: {exc}") from None
+
+
+def _normalize_peak_windows(value: object) -> str | None:
+    """Normalize a peak_windows field to compact JSON, or None.
+
+    Accepts a list of spec strings (the admin body / TOML shape) or an
+    already-JSON string (a round-tripped row). An empty list means "no
+    windows" and normalizes to None so the section builder omits the key.
+    Spec validity is checked in _validate_row, which also covers rows
+    loaded from the DB.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            raise ValueError(
+                "field 'peak_windows' must be a list of window strings"
+            ) from None
+    if not isinstance(value, list) or not all(
+        isinstance(w, str) for w in value
+    ):
+        raise ValueError(
+            "field 'peak_windows' must be a list of window strings, "
+            'e.g. ["mon-fri 14:00-18:00 +08:00"]'
+        )
+    if not value:
+        return None
+    return json.dumps(value)
+
+
+def _peak_windows_list(row_value: str | None) -> list[str]:
+    """Decode a row's JSON peak_windows to a list (empty when unset)."""
+    if not row_value:
+        return []
+    try:
+        loaded = json.loads(row_value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(loaded, list):
+        return []
+    return [w for w in loaded if isinstance(w, str)]
 
 
 def _req_str(fields: dict[str, object], key: str) -> str:

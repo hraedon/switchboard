@@ -612,6 +612,167 @@ async def test_handle_model_map_set_no_body_limit_returns_409() -> None:
     assert "kimi" not in mgr.get_model_map()
 
 
+# --- Per-model provider preference (Plan 026 W3.4) -------------------------
+
+
+async def _post_model_map(
+    mgr: ModelMapManager, payload: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    providers = {
+        "umans": _make_provider_context("umans"),
+        "zai": _make_provider_context("zai"),
+    }
+    messages, send = _make_send()
+    await handle_model_map_set(
+        send, _make_receive(json.dumps(payload).encode()), mgr,
+        "admin-secret", _authed_scope(), None, providers,
+        max_request_body_bytes=1048576,
+    )
+    status, body = _parse_response(messages)
+    return status, json.loads(body)
+
+
+@pytest.mark.asyncio
+async def test_model_map_preference_round_trips() -> None:
+    mgr = ModelMapManager()
+    status, data = await _post_model_map(
+        mgr,
+        {
+            "model": "glm-5.2",
+            "aliases": {"umans": "u", "zai": "z"},
+            "preference": ["zai", "umans"],
+        },
+    )
+    assert status == 200
+    assert data["preference"] == ["zai", "umans"]
+    assert mgr.preference_for("glm-5.2") == ("zai", "umans")
+
+    # GET surfaces it per entry.
+    messages, send = _make_send()
+    await handle_model_map_list(send, mgr, None, None)
+    _, body = _parse_response(messages)
+    entry = json.loads(body)["models"][0]
+    assert entry["preference"] == ["zai", "umans"]
+
+
+@pytest.mark.asyncio
+async def test_model_map_preference_defaults_to_empty_list() -> None:
+    mgr = ModelMapManager()
+    status, data = await _post_model_map(
+        mgr, {"model": "glm-5.2", "aliases": {"umans": "u"}},
+    )
+    assert status == 200
+    assert data["preference"] == []
+    messages, send = _make_send()
+    await handle_model_map_list(send, mgr, None, None)
+    _, body = _parse_response(messages)
+    assert json.loads(body)["models"][0]["preference"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleared", [None, []])
+async def test_model_map_preference_is_cleared_by_a_replacement(
+    cleared: list[str] | None,
+) -> None:
+    """The POST replaces the whole entry, so an omitted/null/empty preference
+    clears a stored one — which is what the GUI's blank field relies on."""
+    mgr = ModelMapManager()
+    await _post_model_map(
+        mgr,
+        {
+            "model": "glm-5.2",
+            "aliases": {"umans": "u", "zai": "z"},
+            "preference": ["zai"],
+        },
+    )
+    payload: dict[str, Any] = {
+        "model": "glm-5.2", "aliases": {"umans": "u", "zai": "z"},
+    }
+    if cleared is not None:
+        payload["preference"] = cleared
+    status, data = await _post_model_map(mgr, payload)
+    assert status == 200
+    assert data["preference"] == []
+    assert mgr.preference_for("glm-5.2") == ()
+
+
+@pytest.mark.asyncio
+async def test_model_map_preference_rejects_an_alias_less_provider() -> None:
+    mgr = ModelMapManager()
+    status, data = await _post_model_map(
+        mgr,
+        {
+            "model": "glm-5.2",
+            "aliases": {"umans": "u"},
+            "preference": ["zai", "umans"],
+        },
+    )
+    assert status == 400
+    assert "zai" in data["error"]
+    assert "glm-5.2" not in mgr.get_model_map()
+
+
+@pytest.mark.asyncio
+async def test_model_map_preference_rejects_duplicates() -> None:
+    mgr = ModelMapManager()
+    status, data = await _post_model_map(
+        mgr,
+        {
+            "model": "glm-5.2",
+            "aliases": {"umans": "u", "zai": "z"},
+            "preference": ["zai", "zai"],
+        },
+    )
+    assert status == 400
+    assert "zai" in data["error"]
+    assert "glm-5.2" not in mgr.get_model_map()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["zai", {"zai": 1}, ["zai", ""], ["zai", 7]])
+async def test_model_map_preference_rejects_a_bad_shape(bad: Any) -> None:
+    mgr = ModelMapManager()
+    status, data = await _post_model_map(
+        mgr,
+        {
+            "model": "glm-5.2",
+            "aliases": {"umans": "u", "zai": "z"},
+            "preference": bad,
+        },
+    )
+    assert status == 400
+    assert "provider names" in data["error"]
+    assert "glm-5.2" not in mgr.get_model_map()
+
+
+@pytest.mark.asyncio
+async def test_status_payload_carries_model_preferences_in_parallel() -> None:
+    """status.json's model_map keeps its {model: {provider: alias}} shape for
+    existing consumers; preference rides alongside it (Plan 026 W3.4)."""
+    mgr = ModelMapManager()
+    mgr.set_model("glm-5.2", {"umans": "u", "zai": "z"}, ["zai"])
+    mgr.set_model("plain", {"umans": "u"})
+    payload = _build_status_payload(
+        {}, RouteTableManager(default_providers=("umans",)),
+        RoutingMetrics(), model_map_mgr=mgr,
+    )
+    assert payload["model_map"] == {
+        "glm-5.2": {"umans": "u", "zai": "z"}, "plain": {"umans": "u"},
+    }
+    assert payload["model_preferences"] == {"glm-5.2": ["zai"]}
+
+
+@pytest.mark.asyncio
+async def test_status_payload_omits_model_preferences_when_none_set() -> None:
+    mgr = ModelMapManager()
+    mgr.set_model("plain", {"umans": "u"})
+    payload = _build_status_payload(
+        {}, RouteTableManager(default_providers=("umans",)),
+        RoutingMetrics(), model_map_mgr=mgr,
+    )
+    assert "model_preferences" not in payload
+
+
 @pytest.mark.asyncio
 async def test_handle_model_map_delete_store_failure_returns_500_json() -> None:
     db = sqlite3.connect(":memory:")

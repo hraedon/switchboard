@@ -103,6 +103,7 @@ button {
 <div id="route-add"></div>
 <div id="model-add"></div>
 <div id="routing-config-editor"></div>
+<div id="routing-explain"></div>
 <div id="app">Loading...</div>
 <script>
 // The default route is the only control on this page that WRITES, so it lives
@@ -278,6 +279,54 @@ async function _loadRegistry() {
   return registryCache || [];
 }
 
+// One credential mode's inputs, rendered inline on form open and rewritten
+// into #pf-cred-block when the operator switches modes. `existing` is the
+// masked row in edit mode, null in add mode.
+function _credBlockHtml(mode, existing, tomlStored, isLocked, lockNote, lockAttr) {
+  if (mode === 'stored') {
+    const wasStored = !!existing && existing.key_mode === 'stored';
+    const hint = wasStored && existing.api_key_hint
+      ? 'stored (ending ' + esc(existing.api_key_hint) + ') — write-only'
+      : (wasStored ? 'stored — write-only' : '');
+    let keyLabel;
+    if (!existing || !wasStored) {
+      keyLabel = 'API key (sent once; stored server-side, never shown again)';
+    } else if (tomlStored) {
+      keyLabel = 'API key (required — re-enter; the store has no copy of this TOML key)';
+    } else {
+      keyLabel = 'New API key (leave blank to keep current)';
+    }
+    return `
+      ${hint ? `<div class="form-row"><label>API key</label>
+        <span style="color:var(--muted);font-size:0.85rem">${hint}</span></div>` : ''}
+      <div class="form-row">
+        <label for="pf-key-new">${esc(keyLabel)}</label>
+        <input id="pf-key-new" type="password" autocomplete="off">
+      </div>`;
+  }
+  if (mode === 'passthrough') {
+    const eraseWarn = existing && existing.key_mode === 'stored'
+      ? `<div class="form-row"><span style="color:var(--red);font-size:0.85rem">
+         &#9888; saving in passthrough mode ERASES this provider&apos;s stored API key
+         from the config store — switching back later means re-entering it</span></div>`
+      : '';
+    return `
+      <div class="form-row">
+        <label>API key</label>
+        <span style="color:var(--muted);font-size:0.85rem">passthrough — no credential;
+        the client&apos;s key is forwarded verbatim to this upstream</span>
+      </div>${eraseWarn}`;
+  }
+  const envVal = existing ? esc(existing.api_key_env || '') : '';
+  return `
+      <div class="form-row">
+        <label for="pf-key-env">API key env var (name only — value stays server-side)</label>
+        <input id="pf-key-env" autocomplete="off" placeholder="e.g. SWITCHBOARD_OLLAMA_KEY"
+          value="${envVal}"${lockAttr('api_key_env')}>
+        ${isLocked('api_key_env') ? lockNote : ''}
+      </div>`;
+}
+
 function renderProviderForm(existing) {
   const el = document.getElementById('add-provider');
   const editing = !!existing;
@@ -307,44 +356,23 @@ function renderProviderForm(existing) {
   // that so the credential block and save validation are honest about it.
   const tomlStored = editing && existing.source === 'toml' && (existing.key_mode === 'stored');
 
-  // Credential block differs by key_mode in edit mode. In add mode the form
-  // only offers the env path (the recommended mode); edit mode must also
-  // represent stored keys (write-only: leave blank to keep) and passthrough.
-  let credBlock;
-  const km = editing ? (existing.key_mode || 'passthrough') : null;
-  if (editing && km === 'stored') {
-    const hint = existing.api_key_hint ? 'ending ' + esc(existing.api_key_hint) : 'set';
-    // A TOML-only stored provider has no store row: blank-on-save cannot
-    // keep (the store has no credential to retain), so the operator must
-    // re-enter the full key. Store-source providers keep-on-blank as normal.
-    const keyLabel = tomlStored
-      ? 'API key (required — re-enter; the store has no copy of this TOML key)'
-      : 'New API key (leave blank to keep current)';
-    credBlock = `
+  // Credential handling (Plan 025): every form gets a mode selector — env
+  // var (recommended), stored (paste the key once; write-only and masked
+  // thereafter), passthrough (explicit downgrade: the client's key is
+  // forwarded). The server has supported all three on create/update since
+  // Plan 020 Wave 1; the Add form just never offered stored, which made
+  // "add a provider with its API key from the browser" impossible.
+  const km = editing ? (existing.key_mode || 'passthrough') : 'env';
+  const credBlock = `
       <div class="form-row">
-        <label>API key</label>
-        <span style="color:var(--muted);font-size:0.85rem">stored (${hint}) — write-only</span>
+        <label for="pf-key-mode">Credential mode</label>
+        <select id="pf-key-mode">
+          <option value="env"${km === 'env' ? ' selected' : ''}>server env var (recommended)</option>
+          <option value="stored"${km === 'stored' ? ' selected' : ''}>paste API key (stored server-side, write-only)</option>
+          <option value="passthrough"${km === 'passthrough' ? ' selected' : ''}>passthrough (forward the client&apos;s key)</option>
+        </select>
       </div>
-      <div class="form-row">
-        <label for="pf-key-new">${esc(keyLabel)}</label>
-        <input id="pf-key-new" type="password" autocomplete="off">
-      </div>`;
-  } else if (editing && km === 'passthrough') {
-    credBlock = `
-      <div class="form-row">
-        <label>API key</label>
-        <span style="color:var(--muted);font-size:0.85rem">passthrough — no credential; the client&apos;s key is forwarded</span>
-      </div>`;
-  } else {
-    const envVal = editing ? esc(existing.api_key_env || '') : '';
-    credBlock = `
-      <div class="form-row">
-        <label for="pf-key-env">API key env var (name only — value stays server-side)</label>
-        <input id="pf-key-env" autocomplete="off" placeholder="e.g. SWITCHBOARD_OLLAMA_KEY"
-          value="${envVal}"${lockAttr('api_key_env')}>
-        ${isLocked('api_key_env') ? lockNote : ''}
-      </div>`;
-  }
+      <div id="pf-cred-block">${_credBlockHtml(km, editing ? existing : null, tomlStored, isLocked, lockNote, lockAttr)}</div>`;
 
   // Edit-only fields. The quick-add form relies on server defaults for these;
   // editing is where an operator tunes the full row (Plan 020 WI-6).
@@ -371,6 +399,18 @@ function renderProviderForm(existing) {
         <input id="pf-dashboard-token-env" autocomplete="off"
           value="${esc(existing.dashboard_token_env || '')}"${lockAttr('dashboard_token_env')}>
         ${isLocked('dashboard_token_env') ? lockNote : ''}
+      </div>
+      <div class="form-row">
+        <label for="pf-dashboard-provider">Dashboard provider id (when the dashboard names this provider differently, e.g. "opencode" for opencode-go)</label>
+        <input id="pf-dashboard-provider" autocomplete="off" placeholder="e.g. zai"
+          value="${esc(existing.dashboard_provider || '')}"${lockAttr('dashboard_provider')}>
+        ${isLocked('dashboard_provider') ? lockNote : ''}
+      </div>
+      <div class="form-row">
+        <label for="pf-peak-windows">Peak-pricing windows, one per line (provider is demoted while inside one; blank = none)</label>
+        <textarea id="pf-peak-windows" rows="2" autocomplete="off"
+          placeholder="mon-fri 14:00-18:00 +08:00"
+          style="width:100%;padding:0.4rem;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:inherit"></textarea>
       </div>
       <div class="form-row">
         <label for="pf-usage-key-env">Usage key env var (optional)</label>
@@ -453,6 +493,26 @@ function renderProviderForm(existing) {
   };
   document.getElementById('pf-test').onclick = _runDiscover;
   document.getElementById('pf-save').onclick = _saveProvider;
+  // Credential mode switch rewrites only the cred block; the rest of the
+  // form (and anything already typed in it) stays put.
+  {
+    const modeSel = document.getElementById('pf-key-mode');
+    if (modeSel) {
+      modeSel.value = km;
+      modeSel.onchange = () => {
+        const block = document.getElementById('pf-cred-block');
+        if (block) {
+          block.innerHTML = _credBlockHtml(
+            modeSel.value, editing ? existing : null, tomlStored,
+            isLocked, lockNote, lockAttr);
+        }
+        if (modeSel.value === 'env' && editing) {
+          const e = document.getElementById('pf-key-env');
+          if (e && existing.api_key_env) e.value = existing.api_key_env;
+        }
+      };
+    }
+  }
 
   if (!editing) {
     // Populate the registry picker, then seed defaults from "generic".
@@ -488,6 +548,9 @@ function renderProviderForm(existing) {
     setv('pf-dashboard-url', existing.dashboard_url);
     setv('pf-dashboard-token-env', existing.dashboard_token_env);
     setv('pf-usage-key-env', existing.usage_key_env);
+    setv('pf-dashboard-provider', existing.dashboard_provider);
+    const pwEl = document.getElementById('pf-peak-windows');
+    if (pwEl) pwEl.value = (existing.peak_windows || []).join('\n');
     if (km === 'env') setv('pf-key-env', existing.api_key_env);
     const enEl = document.getElementById('pf-enabled');
     if (enEl) enEl.checked = existing.enabled !== false;
@@ -557,9 +620,19 @@ async function _saveProvider() {
   const target = parseInt((document.getElementById('pf-target') || {}).value, 10) || 1;
   const auth_header = (document.getElementById('pf-auth-header') || {}).value.trim() || 'authorization';
   const apiKeyEnvEl = document.getElementById('pf-key-env');
-  // pf-key-env only exists in add mode and the env-key edit branch; absent in
-  // stored/passthrough edit mode, so guard against a missing element.
+  // pf-key-env only exists while the env credential mode is rendered; guard
+  // against a missing element in stored/passthrough modes.
   const api_key_env = apiKeyEnvEl ? (apiKeyEnvEl.value || '').trim() : '';
+  // Credential mode: the selector wins; an unset selector (a fresh element
+  // in the test harness, or a half-rendered form) infers from what was
+  // typed, falling back to the row's existing mode in edit mode.
+  const keyNewEl = document.getElementById('pf-key-new');
+  const keyNew = keyNewEl ? (keyNewEl.value || '').trim() : '';
+  const modeSelEl = document.getElementById('pf-key-mode');
+  let key_mode = modeSelEl && modeSelEl.value ? modeSelEl.value : '';
+  if (!key_mode) {
+    key_mode = keyNew ? 'stored' : (api_key_env ? 'env' : (editingKeyMode || ''));
+  }
   const errEl = document.getElementById('pf-error');
   errEl.textContent = '';
   // Name is read-only in edit mode but still required; check both paths.
@@ -582,6 +655,11 @@ async function _saveProvider() {
     const dashboard_url = (document.getElementById('pf-dashboard-url') || {}).value.trim();
     const dashboard_token_env = (document.getElementById('pf-dashboard-token-env') || {}).value.trim();
     const usage_key_env = (document.getElementById('pf-usage-key-env') || {}).value.trim();
+    const dashboard_provider = (document.getElementById('pf-dashboard-provider') || {}).value.trim();
+    // One window spec per line; always sent, so emptying the field clears
+    // the row's windows (the store treats [] as "none").
+    const pwRaw = (document.getElementById('pf-peak-windows') || {}).value || '';
+    const peak_windows = pwRaw.split('\n').map(s => s.trim()).filter(s => s);
     const enabledEl = document.getElementById('pf-enabled');
     const enabled = enabledEl ? !!enabledEl.checked : true;
     // Round-trip `account` so a non-default account is not silently reset to
@@ -590,23 +668,27 @@ async function _saveProvider() {
     body = {
       provider_type, upstream, target, auth_header,
       dashboard_url, dashboard_token_env, usage_key_env, enabled,
+      peak_windows,
     };
     if (editingAccount != null) body.account = editingAccount;
     if (auth_prefix) body.auth_prefix = auth_prefix;
-    // Credential handling follows the existing mode (the form does not switch
-    // modes). Write-only for stored: api_key_stored is sent only when the
-    // operator typed a new key, otherwise the store keeps it — UNLESS this is
-    // a TOML-only stored provider (no store row yet), where keep is
-    // impossible and the operator must re-enter the key.
-    if (editingKeyMode === 'env') {
+    if (dashboard_provider) body.dashboard_provider = dashboard_provider;
+    // Credential handling follows the selector (Plan 025: modes are
+    // switchable on edit). Write-only for stored: api_key_stored is sent
+    // only when the operator typed one; blank keeps the existing stored key
+    // — UNLESS the row has no stored copy to keep (a mode switch onto
+    // stored, or a TOML-only stored provider with no store row), where the
+    // key is required.
+    if (key_mode === 'env') {
       body.key_mode = 'env';
       body.api_key_env = api_key_env;
-    } else if (editingKeyMode === 'stored') {
+    } else if (key_mode === 'stored') {
       body.key_mode = 'stored';
-      const keyNewEl = document.getElementById('pf-key-new');
-      const keyNew = keyNewEl ? (keyNewEl.value || '').trim() : '';
-      if (!keyNew && editingTomlStored) {
-        errEl.textContent = 'enter the API key — this TOML provider has no stored copy to keep';
+      const hasKeptKey = editingKeyMode === 'stored' && !editingTomlStored;
+      if (!keyNew && !hasKeptKey) {
+        errEl.textContent = editingTomlStored
+          ? 'enter the API key — this TOML provider has no stored copy to keep'
+          : 'enter the API key — switching to stored mode needs the credential';
         return;
       }
       if (keyNew) body.api_key_stored = keyNew;
@@ -616,9 +698,25 @@ async function _saveProvider() {
     url = '/admin/providers/' + encodeURIComponent(editingProviderName);
     method = 'PUT';
   } else {
-    // Add mode: only the env credential path is offered (recommended mode).
+    // Add mode (Plan 025): all three credential modes. There is NO server
+    // default for key_mode (the store requires it), so a quick-add with the
+    // env field left blank is sent as explicit passthrough — same semantics
+    // a bare TOML provider gets — rather than 400ing on a missing field
+    // (cross-lineage review, finding 3).
     body = { name, upstream, provider_type: 'generic', target, auth_header };
-    if (api_key_env) { body.key_mode = 'env'; body.api_key_env = api_key_env; }
+    if (key_mode === 'stored') {
+      if (!keyNew) {
+        errEl.textContent = 'enter the API key to store for this provider';
+        return;
+      }
+      body.key_mode = 'stored';
+      body.api_key_stored = keyNew;
+    } else if (key_mode === 'env' && api_key_env) {
+      body.key_mode = 'env';
+      body.api_key_env = api_key_env;
+    } else {
+      body.key_mode = 'passthrough';
+    }
     url = '/admin/providers';
     method = 'POST';
   }
@@ -768,9 +866,15 @@ async function deleteRoute(key) {
 
 // ── Model-map management (Plan 020 WI-7) ──────────────────────────────────
 let editingModel = false;
+// Pins the Model Map card while auto-match scan results are on screen. The
+// 5 s poll rebuilds this section via renderModelAdd; without the pin, scan
+// results are wiped within a poll interval — and a scan that finishes after
+// a poll writes into detached nodes, so the operator sees nothing at all.
+// Cleared by the Dismiss button or by opening the model form.
+let scanPinned = false;
 
 function renderModelAdd(data) {
-  if (editingModel) return;
+  if (editingModel || scanPinned) return;
   const known = Object.keys((data && data.providers) || {}).sort();
   const mm = (data && data.model_map) || {};
   const definedModels = Object.keys(mm);
@@ -788,7 +892,11 @@ function renderModelAdd(data) {
       <div id="scan-match-results" style="margin-top:0.6rem"></div>
     </div>`;
   const btn = document.getElementById('add-model-btn');
-  if (btn) btn.onclick = () => { editingModel = true; renderModelAddForm(known); };
+  if (btn) btn.onclick = () => {
+    scanPinned = false;
+    editingModel = true;
+    renderModelAddForm(known);
+  };
   const scanBtn = document.getElementById('scan-match-btn');
   if (scanBtn) scanBtn.onclick = () => runAutoMatchScan(known, definedModels, mm);
 }
@@ -827,9 +935,18 @@ async function _fetchProviderModels(provider) {
   return promise;
 }
 
-function renderModelAddForm(knownProviders) {
+// Add/edit a model mapping. With only `knownProviders`, renders the add
+// form; `editModelName` + `editAliases` switch it to edit mode: the model
+// name (the map key) is locked, alias inputs are pre-filled, and saving
+// POSTs the full replacement alias set — POST /admin/model-map is
+// add-or-update server-side, so clearing an alias removes that provider
+// from the model. `editPreference` (Plan 026 W3) pre-fills the optional
+// preference order; leaving that field blank omits it from the POST, which
+// clears any stored preference for the same add-or-replace reason.
+function renderModelAddForm(knownProviders, editModelName, editAliases, editPreference) {
   const el = document.getElementById('model-add');
   const provs = (knownProviders || []).slice().sort();
+  const editing = !!editModelName;
   // Finding #4 fix: provider names have no character validation (only
   // _RESERVED_PROVIDER_NAMES is checked), so a name containing &<>"' would
   // render an id attribute that getElementById — which expects the raw
@@ -848,28 +965,65 @@ function renderModelAddForm(knownProviders) {
       <button type="button" id="${idp}-show" class="mini-btn"
               style="margin-left:0.4rem">show models</button>
       <span id="${idp}-status" style="margin-left:0.4rem;font-size:0.8rem;color:var(--muted)"></span>
+      <div id="${idp}-list" style="max-height:9rem;overflow-y:auto;margin-top:0.3rem"></div>
     </div>`;
   }).join('');
+  const editNote = editing
+    ? '<span style="color:var(--muted);font-size:0.75rem">the model name is the map key; rename via delete + add. Clearing an alias removes that provider from the model.</span>'
+    : '';
   el.innerHTML = `
-    <h2>Add Model Mapping</h2>
+    <h2>${editing ? 'Edit Model Mapping' : 'Add Model Mapping'}</h2>
     <div class="card">
       <div class="form-row">
         <label for="mf-model">Model name (as the client sends it)</label>
-        <input id="mf-model" list="mf-model-known" autocomplete="off" placeholder="e.g. glm-5.2">
+        <input id="mf-model" list="mf-model-known" autocomplete="off"
+               placeholder="e.g. glm-5.2"${editing ? ' disabled' : ''}>
         <datalist id="mf-model-known"></datalist>
+        ${editNote}
       </div>
       ${aliasRows || '<p style="color:var(--muted)">No providers configured.</p>'}
+      <div class="form-row">
+        <label for="mf-preference">Preference order (optional)</label>
+        <input id="mf-preference" autocomplete="off"
+               placeholder="comma-separated, e.g. zai, umans">
+        <span style="color:var(--muted);font-size:0.75rem">reorders the
+        immediate tier for this model: named providers first, in this order.
+        Each must have an alias above. Blank = no preference.</span>
+      </div>
       <div id="mf-error" style="color:var(--red);font-size:0.85rem;margin-bottom:0.5rem"></div>
-      <button id="mf-save">Save</button>
+      <button id="mf-save">${editing ? 'Save changes' : 'Save'}</button>
       <button id="mf-cancel" style="background:transparent;border:1px solid var(--border)">Cancel</button>
     </div>`;
+  // Populate values explicitly rather than via value="" attributes: fresh
+  // innerHTML gives a real browser empty inputs, but the GUI test harness's
+  // fake DOM keeps elements across renders, and edit-mode prefill needs the
+  // assignment path anyway (same pattern as the provider form).
+  {
+    const nameEl = document.getElementById('mf-model');
+    if (nameEl) nameEl.value = editing ? editModelName : '';
+    const prefEl = document.getElementById('mf-preference');
+    if (prefEl) {
+      prefEl.value = (editing && Array.isArray(editPreference))
+        ? editPreference.join(', ') : '';
+    }
+    for (const p of provs) {
+      const e = document.getElementById(_domId(p) + '-alias');
+      if (e) e.value = (editing && editAliases && editAliases[p]) ? editAliases[p] : '';
+    }
+  }
   document.getElementById('mf-cancel').onclick = () => { editingModel = false; load(); };
   // Fresh form open → fresh probe cache. A prior form open's enumerated
   // models may be stale (provider changed, or a provider was just added);
   // clearing on open keeps "one probe per provider per form open" honest.
   modelEnums = {};
-  // Per-provider "show models" → populate the alias input's datalist. One
-  // upstream call per provider per form-open (cached in modelEnums).
+  // Union of every enumeration fetched this form-open; feeds the model-name
+  // datalist so the operator can pick the client-facing name from what the
+  // providers actually serve (before this, mf-model-known was never filled).
+  const modelNameUnion = new Set();
+  // Per-provider "show models" → populate the alias input's datalist AND a
+  // visible click-to-fill list. The datalist alone only surfaces once the
+  // operator types into the input, which read as "the button did nothing".
+  // One upstream call per provider per form-open (cached in modelEnums).
   provs.forEach(p => {
     const idp = _domId(p);
     const btn = document.getElementById(idp + '-show');
@@ -877,11 +1031,34 @@ function renderModelAddForm(knownProviders) {
       const statusEl = document.getElementById(idp + '-status');
       if (statusEl) statusEl.textContent = 'probing\u2026';
       const res = await _fetchProviderModels(p);
+      const models = res.models || [];
       const dl = document.getElementById(idp + '-models');
-      if (dl) dl.innerHTML = (res.models || []).map(m => `<option value="${esc(m)}">`).join('');
+      if (dl) dl.innerHTML = models.map(m => `<option value="${esc(m)}">`).join('');
+      const listEl = document.getElementById(idp + '-list');
+      if (listEl) {
+        listEl.innerHTML = models.map((m, i) =>
+          `<button type="button" id="${idp}-pick-${i}" class="mini-btn"
+                   style="margin:0.1rem 0.2rem 0.1rem 0">${esc(m)}</button>`).join('');
+        models.forEach((m, i) => {
+          const pickBtn = document.getElementById(idp + '-pick-' + i);
+          if (pickBtn) pickBtn.onclick = () => {
+            const aliasEl = document.getElementById(idp + '-alias');
+            if (aliasEl) aliasEl.value = m;
+          };
+        });
+      }
+      if (models.length) {
+        models.forEach(m => modelNameUnion.add(m));
+        const knownDl = document.getElementById('mf-model-known');
+        if (knownDl) {
+          knownDl.innerHTML = Array.from(modelNameUnion).sort()
+            .map(m => `<option value="${esc(m)}">`).join('');
+        }
+      }
       if (statusEl) {
-        if (res.ok && (res.models || []).length) {
-          statusEl.textContent = `${res.models.length} model${res.models.length === 1 ? '' : 's'}`;
+        if (res.ok && models.length) {
+          statusEl.textContent = `${models.length} model${models.length === 1 ? '' : 's'}`
+            + ' — click one to fill the alias';
         } else {
           statusEl.textContent = res.detail || 'no models';
         }
@@ -902,12 +1079,38 @@ function renderModelAddForm(knownProviders) {
       errEl.textContent = 'fill in at least one provider alias';
       return;
     }
+    // Preference: comma-separated, trimmed, blanks dropped. Sent only when
+    // non-empty — the POST replaces the whole entry, so omitting the field is
+    // how a blank input clears a stored preference (and the handler treats an
+    // absent field, null, and [] alike). Names are checked server-side against
+    // this request's aliases; a local pre-check keeps the round trip honest.
+    const prefRaw = ((document.getElementById('mf-preference') || {}).value || '');
+    const preference = prefRaw.split(',').map(s => s.trim()).filter(s => s);
+    const unaliased = preference.filter(p => !aliases[p]);
+    if (unaliased.length) {
+      errEl.textContent = 'preference names provider(s) with no alias: '
+        + unaliased.join(', ');
+      return;
+    }
+    // Editing: clearing an alias removes that provider from the model
+    // (the POST replaces the whole set) — destructive with no undo, so it
+    // gets the same confirm() as the sibling delete actions.
+    if (editing && editAliases) {
+      const removed = Object.keys(editAliases).filter(p => !(p in aliases));
+      if (removed.length && !confirm(
+            'Remove ' + removed.join(', ') + ' from ' + editModelName + '? '
+            + 'Cleared aliases are deleted from the mapping.')) {
+        return;
+      }
+    }
+    const payload = { model, aliases };
+    if (preference.length) payload.preference = preference;
     try {
       const resp = await fetch('/admin/model-map', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         credentials: 'same-origin',
-        body: JSON.stringify({ model, aliases }),
+        body: JSON.stringify(payload),
       });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) { errEl.textContent = data.error || ('HTTP ' + resp.status); return; }
@@ -921,12 +1124,20 @@ function renderModelAddForm(knownProviders) {
 // provider offers an exact string match that the model map does not already
 // wire. Matches become one-click "Add" offers; no write happens without the
 // click. A provider that fails to answer is listed, not aborting the scan.
+// The scan renders into the Model Map card, which the 5 s poll rebuilds.
+// scanPinned freezes that card from scan start (before the first await —
+// a poll landing mid-scan would detach statusEl/outEl and the results
+// would render into nodes no longer on the page) until the operator
+// dismisses the results.
 async function runAutoMatchScan(providers, definedModels, currentMap) {
   const statusEl = document.getElementById('scan-match-status');
   const outEl = document.getElementById('scan-match-results');
   if (!outEl) return;
+  scanPinned = true;
   if (!definedModels.length) {
-    outEl.innerHTML = '<p style="color:var(--muted)">No models defined yet — add a model mapping first.</p>';
+    outEl.innerHTML = '<p style="color:var(--muted)">No models defined yet — add a model mapping first.</p>'
+      + _scanDismissHtml();
+    _wireScanDismiss();
     return;
   }
   outEl.innerHTML = '';
@@ -968,14 +1179,24 @@ async function runAutoMatchScan(providers, definedModels, currentMap) {
       </div>`;
     }
   }
-  outEl.innerHTML = html;
+  outEl.innerHTML = html + _scanDismissHtml();
   offers.forEach((o, i) => {
     const b = document.getElementById('mf-am-' + i);
-    if (b) b.onclick = () => applyAutoMatch(o, currentMap);
+    if (b) b.onclick = () => applyAutoMatch(o, currentMap, 'mf-am-' + i);
   });
+  _wireScanDismiss();
 }
 
-async function applyAutoMatch(offer, currentMap) {
+function _scanDismissHtml() {
+  return '<div style="margin-top:0.4rem"><button id="scan-dismiss" class="mini-btn">Dismiss results</button></div>';
+}
+
+function _wireScanDismiss() {
+  const d = document.getElementById('scan-dismiss');
+  if (d) d.onclick = () => { scanPinned = false; load(); };
+}
+
+async function applyAutoMatch(offer, currentMap, btnId) {
   // Finding #2 fix: re-read the CURRENT model-map state before merging, so an
   // alias added between the last load() and this click is not silently dropped.
   // The model-map POST replaces the whole alias set, so a stale snapshot would
@@ -1004,6 +1225,12 @@ async function applyAutoMatch(offer, currentMap) {
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) { alert(data.error || ('HTTP ' + resp.status)); return; }
+    // Mark the offer applied in place — the scan results stay pinned, so the
+    // remaining offers survive this click instead of vanishing on reload.
+    if (btnId) {
+      const b = document.getElementById(btnId);
+      if (b) { b.textContent = 'added ✓'; b.disabled = true; b.onclick = null; }
+    }
     load();
   } catch (e) { alert(String(e)); }
 }
@@ -1150,7 +1377,7 @@ function renderRoutingConfigEditor(data) {
       scored.forEach((s, i) => {
         const cls = s.surplus > 0 ? 'token-warn' : 'token-crit';
         surplusHtml += `<div class="stat"><span class="k">${i+1}. ${esc(s.name)}</span>`
-          + `<span class="v ${cls}">+${s.surplus.toFixed(3)}</span></div>`;
+          + `<span class="v ${cls}">${s.surplus >= 0 ? '+' : ''}${s.surplus.toFixed(3)}</span></div>`;
       });
       // Show unscored providers
       const unscored = provNames.filter(n => !scored.find(s => s.name === n));
@@ -1270,6 +1497,149 @@ function renderRoutingConfigForm(rc) {
     }
   };
 }
+// ── Routing Explain (Plan 026 W1.6) ──────────────────────────────────────
+// "Who would serve model X right now, and why." The routing pipeline carries
+// a per-candidate assessment (tier, signals, score, rank); this card asks
+// /admin/route-plan for them so the answer is the decision's own, not a
+// re-derivation. Lives outside #app, and `explainPinned` freezes the card
+// while results are shown — same shape as scanPinned, because a 5 s poll
+// wiping the answer the operator is reading is the failure mode here.
+let explainPinned = false;
+
+const _TIER_STYLE = {
+  immediate: 'open', queue: 'saturated', backstop: 'unknown',
+};
+
+function renderRoutingExplain(data) {
+  if (explainPinned) return;
+  const el = document.getElementById('routing-explain');
+  const models = Object.keys(data.model_map || {}).sort();
+  el.innerHTML = `
+    <h2>Routing Explain</h2>
+    <div class="card">
+      <p style="margin:0 0 0.6rem;color:var(--muted);font-size:0.85rem">
+        Ask where a model would go right now, and why. Read-only: it never
+        moves a pin, a metric, or a live conversation. Leave the model blank
+        to explain the default route unfiltered.
+      </p>
+      <div class="form-row">
+        <label for="explain-model">Model</label>
+        <input id="explain-model" list="explain-model-known" autocomplete="off"
+               placeholder="${models.length ? esc(models[0]) : 'e.g. glm-5.2'}">
+        <datalist id="explain-model-known">
+          ${models.map(m => `<option value="${esc(m)}">`).join('')}
+        </datalist>
+      </div>
+      <button id="explain-btn">Explain</button>
+      <div id="explain-results" style="margin-top:0.6rem"></div>
+    </div>`;
+  const btn = document.getElementById('explain-btn');
+  if (btn) btn.onclick = runRouteExplain;
+}
+
+async function runRouteExplain() {
+  // Pin BEFORE the first await: a poll landing during the fetch would
+  // otherwise re-render the card and drop the results into a dead element.
+  explainPinned = true;
+  const model = document.getElementById('explain-model').value.trim();
+  const out = document.getElementById('explain-results');
+  out.innerHTML = '<span style="color:var(--muted)">explaining…</span>';
+  let body;
+  try {
+    const url = '/admin/route-plan'
+      + (model ? '?model=' + encodeURIComponent(model) : '');
+    const resp = await fetch(url, { credentials: 'same-origin' });
+    body = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      out.innerHTML = `<div style="color:var(--red);font-size:0.85rem">`
+        + `${esc(body.error || 'request failed (' + resp.status + ')')}</div>`
+        + _explainDismissHtml();
+      _wireExplainDismiss();
+      return;
+    }
+  } catch (e) {
+    out.innerHTML = `<div style="color:var(--red);font-size:0.85rem">${esc(e)}</div>`
+      + _explainDismissHtml();
+    _wireExplainDismiss();
+    return;
+  }
+  out.innerHTML = _explainHtml(body) + _explainDismissHtml();
+  _wireExplainDismiss();
+}
+
+function _explainHtml(body) {
+  const rows = (body.assessments || []).map(a => {
+    const selected = a.tier === 'immediate' && a.rank === 0;
+    const tierCls = _TIER_STYLE[a.tier] || 'unknown';
+    const score = (a.score === null || a.score === undefined)
+      ? '<span style="color:var(--muted)">—</span>'
+      : Number(a.score).toFixed(3);
+    let sig = (a.signals || []).length
+      ? a.signals.map(s => `<code>${esc(s)}</code>`).join(' ')
+      : '<span style="color:var(--muted)">—</span>';
+    // Per-assessment preference marker (cross-lineage review, N3): the API
+    // exposes preference_rank; render it so "why is this one in front" is
+    // answerable from the card, not only from curl.
+    if (a.preference_rank !== null && a.preference_rank !== undefined) {
+      sig = `<code>pref#${Number(a.preference_rank)}</code> ` + sig;
+    }
+    return `<tr${selected ? ' style="font-weight:600"' : ''}>`
+      + `<td>${esc(a.provider)}${selected ? ' &larr; selected' : ''}</td>`
+      + `<td><span class="badge ${tierCls}">${esc(a.tier)}</span></td>`
+      + `<td>${sig}</td><td>${score}</td><td>${a.rank + 1}</td></tr>`;
+  }).join('');
+  let html = `<div class="stat"><span class="k">reason</span>`
+    + `<span class="v"><code>${esc(body.reason || '?')}</code></span></div>`
+    + `<div class="stat"><span class="k">strategy</span>`
+    + `<span class="v">${esc(body.strategy || '?')}</span></div>`
+    + `<div class="stat"><span class="k">immediate order</span><span class="v">`
+    + `${(body.immediate || []).length
+        ? esc((body.immediate || []).join(' → '))
+        : '<em>none</em>'}</span></div>`
+    + `<div class="stat"><span class="k">queue candidate</span><span class="v">`
+    + `${body.queue_candidate ? esc(body.queue_candidate) : '<em>none</em>'}`
+    + `</span></div>`
+    + `<div class="stat"><span class="k">terminal fallback</span>`
+    + `<span class="v">${esc(body.terminal_fallback || '?')}</span></div>`;
+  // Per-model preference (Plan 026 W3): shown only when the model has one, so
+  // the card does not grow a permanently empty row.
+  if ((body.preference || []).length) {
+    html += `<div class="stat"><span class="k">model preference</span>`
+      + `<span class="v">${esc(body.preference.join(' → '))}</span></div>`;
+  }
+  if (rows) {
+    html += '<table style="margin-top:0.5rem"><tr><th>provider</th><th>tier</th>'
+      + '<th>signals</th><th>score</th><th>order</th></tr>' + rows + '</table>';
+  } else {
+    html += '<p style="color:var(--muted);font-size:0.85rem">'
+      + 'No candidate holds a tier — every one was filtered out.</p>';
+  }
+  const excluded = body.excluded || [];
+  if (excluded.length) {
+    html += '<p style="margin:0.5rem 0 0.2rem;color:var(--muted);font-size:0.8rem">'
+      + 'Excluded by the filter stage (no tier):</p>';
+    html += excluded.map(e =>
+      `<div class="stat"><span class="k">${esc(e.provider)}</span>`
+      + `<span class="v" style="color:var(--muted)">${esc(e.why)}</span></div>`
+    ).join('');
+  }
+  if ((body.quarantined || []).length) {
+    html += `<p style="margin:0.4rem 0 0;color:var(--amber);font-size:0.8rem">`
+      + `quarantined for this model: ${esc(body.quarantined.join(', '))}</p>`;
+  }
+  return html;
+}
+
+function _explainDismissHtml() {
+  return '<div style="margin-top:0.5rem">'
+    + '<button id="explain-dismiss" class="mini-btn">Dismiss</button></div>';
+}
+
+function _wireExplainDismiss() {
+  const d = document.getElementById('explain-dismiss');
+  if (d) d.onclick = () => { explainPinned = false; load(); };
+}
+
 async function load() {
   const resp = await fetch('/status.json');
   if (!resp.ok) {
@@ -1284,6 +1654,7 @@ async function load() {
   renderRouteAdd(data);
   renderModelAdd(data);
   renderRoutingConfigEditor(data);
+  renderRoutingExplain(data);
 
   // Separate surface from status.json, and optional: a dashboard served
   // without an admin token still renders everything else rather than failing
@@ -1304,8 +1675,11 @@ async function load() {
     const p = data.providers[name];
     const reason = p.gate_closed_reason || 'open';
     const badgeCls = reason === 'open' ? 'open' : reason;
+    const peakBadge = (p.peak && p.peak.in_peak)
+      ? ' <span class="badge saturated" title="inside a peak-pricing window — demoted in routing">peak</span>'
+      : '';
     html += `<div class="card">
-      <h3>${esc(name)} <span class="badge ${badgeCls}">${reason}</span></h3>
+      <h3>${esc(name)} <span class="badge ${badgeCls}">${reason}</span>${peakBadge}</h3>
       <div style="margin:-0.3rem 0 0.6rem">
         <button id="edit-prov-${provIdx}" class="mini-btn">Edit</button>
       </div>
@@ -1403,6 +1777,21 @@ async function load() {
       }
     }
 
+    // Peak-pricing window (Plan 025) — present only when windows are
+    // configured. In-peak means the provider is demoted in routing.
+    if (p.peak) {
+      html += `<div class="section-title">Peak Pricing</div>`;
+      const stCls = p.peak.in_peak ? 'token-crit' : '';
+      html += `<div class="stat"><span class="k">state</span><span class="v ${stCls}">${p.peak.in_peak ? 'in peak (demoted)' : 'off-peak'}</span></div>`;
+      if (p.peak.boundary_epoch != null) {
+        const secs = Math.max(0, Math.floor(p.peak.boundary_epoch - Date.now()/1000));
+        html += `<div class="stat"><span class="k">${p.peak.in_peak ? 'ends_in' : 'peak_in'}</span><span class="v">${fmtDuration(secs)}</span></div>`;
+      }
+      for (const w of (p.peak.windows || [])) {
+        html += `<div class="stat"><span class="k">window</span><span class="v" style="font-size:0.8rem">${esc(w)}</span></div>`;
+      }
+    }
+
     // Per-provider speed (Plan 020 Wave 3)
     if (p.speed) {
       const sp = p.speed;
@@ -1453,7 +1842,7 @@ async function load() {
     html += '<table><thead><tr><th>Key (truncated)</th><th>Providers</th><th></th></tr></thead><tbody>';
     keyedRoutes.forEach(([key, providers], i) => {
       html += `<tr><td><code>${esc(key.substring(0, 16))}...</code></td>`
-           +  `<td>${providers.join(' &rarr; ')}</td>`
+           +  `<td>${providers.map(esc).join(' &rarr; ')}</td>`
            +  `<td><button id="del-route-${i}" class="mini-btn">Delete</button></td></tr>`;
     });
     html += '</tbody></table>';
@@ -1463,6 +1852,9 @@ async function load() {
   // matrix shows every configured provider per model, with the alias filled in
   // or a dash where the provider lacks one.
   const mm = data.model_map || {};
+  // Parallel to model_map (Plan 026 W3): { model: [provider, ...] }. Kept
+  // out of model_map's values so the alias matrix's shape is unchanged.
+  const mpref = data.model_preferences || {};
   const mmModels = Object.keys(mm);
   const allProviders = Object.keys(data.providers || {}).sort();
   html += '<h2>Model Map</h2>';
@@ -1476,7 +1868,11 @@ async function load() {
     html += '<th></th></tr></thead><tbody>';
     mmModels.sort().forEach((model, mi) => {
       const aliases = mm[model] || {};
-      html += `<tr><td><code>${esc(model)}</code></td>`;
+      const pref = Array.isArray(mpref[model]) ? mpref[model] : [];
+      const prefNote = pref.length
+        ? `<div style="color:var(--muted);font-size:0.75rem">prefer: ${pref.map(esc).join(' &rarr; ')}</div>`
+        : '';
+      html += `<tr><td><code>${esc(model)}</code>${prefNote}</td>`;
       for (const pn of allProviders) {
         const alias = aliases[pn];
         if (alias != null) {
@@ -1485,7 +1881,8 @@ async function load() {
           html += `<td style="color:var(--muted)">&mdash;</td>`;
         }
       }
-      html += `<td><button id="del-model-${mi}" class="mini-btn">Delete</button></td></tr>`;
+      html += `<td><button id="edit-model-${mi}" class="mini-btn">Edit</button>
+        <button id="del-model-${mi}" class="mini-btn">Delete</button></td></tr>`;
     });
     html += '</tbody></table>';
   }
@@ -1553,6 +1950,15 @@ async function load() {
   mmModels.slice().sort().forEach((model, mi) => {
     const btn = document.getElementById('del-model-' + mi);
     if (btn) btn.onclick = () => deleteModel(model);
+    const ebtn = document.getElementById('edit-model-' + mi);
+    if (ebtn) ebtn.onclick = () => {
+      scanPinned = false;
+      editingModel = true;
+      renderModelAddForm(
+        allProviders, model, mm[model] || {},
+        Array.isArray(mpref[model]) ? mpref[model] : [],
+      );
+    };
   });
   // Wire quarantine Release buttons (Plan 023 WI-4).
   if (q && q.entries) {
