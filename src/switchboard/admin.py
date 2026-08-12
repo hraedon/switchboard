@@ -1770,6 +1770,8 @@ _PROVIDER_BODY_FIELDS = (
     "dashboard_url",
     "dashboard_token_env",
     "usage_key_env",
+    "dashboard_provider",
+    "peak_windows",
     "enabled",
 )
 
@@ -1829,6 +1831,8 @@ _TOML_SECTION_SAFE_KEYS = (
     "dashboard_url",
     "dashboard_token_env",
     "usage_key_env",
+    "dashboard_provider",
+    "peak_windows",
     "poll_interval_idle",
     "dashboard_poll_interval",
     "dashboard_stale_ttl",
@@ -1900,6 +1904,8 @@ def _restore_fields(
         "dashboard_url",
         "dashboard_token_env",
         "usage_key_env",
+        "dashboard_provider",
+        "peak_windows",
     ):
         if key in section:
             fields[key] = section[key]
@@ -1929,6 +1935,8 @@ def _tombstone_fields_from_masked(
         "dashboard_url",
         "dashboard_token_env",
         "usage_key_env",
+        "dashboard_provider",
+        "peak_windows",
     ):
         value = masked.get(key)
         if value is not None:
@@ -1976,10 +1984,16 @@ def _tombstone_fields_from_toml(
         "dashboard_url",
         "dashboard_token_env",
         "usage_key_env",
+        "dashboard_provider",
     ):
         value = section.get(key)
         if isinstance(value, str):
             fields[key] = value
+    # peak_windows is a list of strings, not a scalar; the store's
+    # normalizer validates the shape.
+    pw = section.get("peak_windows")
+    if isinstance(pw, list):
+        fields["peak_windows"] = pw
     return fields
 
 
