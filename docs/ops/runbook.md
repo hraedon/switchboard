@@ -660,3 +660,56 @@ already quarantined. Only the DELETE above does that.
 **Quarantine survives a restart.** It is persisted to the config store, so a
 pod restart cannot silently un-quarantine a pair no one has looked at. If you
 want it gone, release it.
+
+## 13. Peak-pricing windows (Plan 025)
+
+Some plans price by time of day (z.ai GLM Coding Plan: Mon–Fri 14:00–18:00
+Singapore time). Declare the windows on the provider and switchboard demotes
+it while inside one — it serves only when nothing cheaper can, and it never
+enters the pace surplus race:
+
+```toml
+[provider.zai-coding-plan]
+peak_windows = ["mon-fri 14:00-18:00 +08:00"]   # one spec per line in the GUI
+```
+
+Spec: `<days> HH:MM-HH:MM <fixed-utc-offset>`; days = `daily` | `mon` |
+`mon-fri` | `mon,wed,fri`; end ≤ start crosses midnight (day constraint
+applies to the window's start day). A bad spec fails startup / the admin
+write with the spec named. Demotion never excludes: the provider stays the
+queue backstop and terminal fallback. The provider card shows a red `peak`
+badge and an ends-in/peak-in countdown; the windows are editable per
+provider in the GUI's Edit form.
+
+## 14. Explaining a routing decision (Plan 026)
+
+`GET /admin/route-plan?model=<m>` (admin token; optionally
+`x-route-plan-key: <raw key>` to resolve a keyed route — prefer the header
+over `?key=`, which lands in the access log) runs the real decision
+read-only and returns per-candidate tier / signals / score / rank, the
+immediate order, queue candidate, and why anything was excluded. The
+dashboard's **Routing Explain** card is the same call with a model input.
+This is the first place to look when a request went somewhere surprising;
+`recent_decisions` in `/status.json` additionally carries a `signals` map
+per logged decision.
+
+## 15. Wiring the usage-dashboard truth source
+
+Per provider, all three keys (plus the Secret entry):
+
+```toml
+dashboard_url = "https://usage.k8s.hraedon.com"
+dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"
+dashboard_provider = "zai"        # the DASHBOARD's id, not the route key
+dashboard_stale_ttl = 2700        # dashboard refetch cadence stretches ~30 min
+```
+
+`dashboard_provider` maps the route key to the dashboard's own provider id
+(`zai` / `ollama` / `opencode` / `codex` / `claude`); without it the lookup
+matches only when the names happen to be identical. The signal is advisory:
+a dashboard outage or a missing/empty token costs the weekly signal (and
+therefore pace scoring), never availability or boot. Exception: before the
+FIRST successful poll the gate stays closed (no evidence yet), so a
+provider that never reaches the dashboard AND has no other truth source
+will sit unready — the per-provider `stale` flag and `ready` in
+`/status.json` are the tell.

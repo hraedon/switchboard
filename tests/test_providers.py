@@ -644,3 +644,31 @@ def test_safe_filename_is_collision_resistant() -> None:
     # intentional hash separator and is safe).
     for c in ("/", "\\", "\0", " "):
         assert c not in _safe_filename(f"weird{c}name")
+
+
+def test_dashboard_token_empty_falls_back_to_null_source(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An EMPTY dashboard token env behaves like an absent one: a dashboard
+    source with an empty bearer can never fetch, and since the advisory
+    boot fail-closed fix that would mean a permanently closed gate — the
+    provider must lose the (advisory) signal, not its capacity."""
+    import logging as _logging
+
+    monkeypatch.setenv("EMPTY_DASH_TOKEN", "")
+    config = {
+        "provider": {
+            "zai": {
+                "upstream": "https://api.z.ai/api/coding/paas/v4",
+                "type": "generic",
+                "target": 2,
+                "dashboard_url": "https://usage.example.com",
+                "dashboard_token_env": "EMPTY_DASH_TOKEN",
+            },
+        }
+    }
+    with caplog.at_level(_logging.WARNING):
+        contexts = build_provider_contexts_from_config(config)
+    assert isinstance(contexts["zai"].truth_source, NullTruthSource)
+    assert any("EMPTY_DASH_TOKEN" in r.message for r in caplog.records)

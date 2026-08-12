@@ -57,23 +57,54 @@ data:
     #
     # A base with NO version segment keeps the client's — so a bare host is
     # also valid, and the client's /v1 passes through to the upstream.
+    # Usage truth: each provider polls the lab usage-dashboard's /readings
+    # (internal ingress; the URL is deliberately committed — see the header
+    # note) with dashboard_provider mapping switchboard's route key to the
+    # dashboard's own id. The signal is ADVISORY: a dashboard outage costs
+    # the routing optimisation, never availability. Requires the
+    # SWITCHBOARD_DASHBOARD_TOKEN key in the switchboard-provider-keys
+    # Secret (refresh it from secrets.env per docs/ops/runbook.md) —
+    # if the token is absent the truth source falls back to the null
+    # source and providers simply lose the weekly signal.
+    # dashboard_stale_ttl 2700: the dashboard's refetch cadence stretches
+    # to ~30 min; the 900 s default flags normal-cadence readings stale.
+
     [provider.opencode-go]
     upstream = "https://opencode.ai/zen/go/v1"
     type = "generic"
     target = 4
     api_key_env = "SWITCHBOARD_OPENCODE_GO_KEY"
+    dashboard_url = "https://usage.k8s.hraedon.com"
+    dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"
+    dashboard_provider = "opencode"
+    dashboard_stale_ttl = 2700
 
     [provider.ollama-cloud]
     upstream = "https://ollama.com/v1"
     type = "generic"
     target = 4
     api_key_env = "SWITCHBOARD_OLLAMA_CLOUD_KEY"
+    dashboard_url = "https://usage.k8s.hraedon.com"
+    dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"
+    dashboard_provider = "ollama"
+    dashboard_stale_ttl = 2700
 
     [provider.zai]
     upstream = "https://api.z.ai/api/coding/paas/v4"
     type = "generic"
     target = 2
     api_key_env = "SWITCHBOARD_ZAI_KEY"
+    dashboard_url = "https://usage.k8s.hraedon.com"
+    dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"
+    dashboard_provider = "zai"
+    dashboard_stale_ttl = 2700
+    # GLM Coding Plan peak (Mon-Fri 14:00-18:00 Singapore time): demoted in
+    # routing while inside the window — serves only when nothing cheaper can.
+    peak_windows = ["mon-fri 14:00-18:00 +08:00"]
+
+    # Strategy stays the default (ordered) here — flip to pace in the GUI
+    # once the weekly signal is confirmed flowing on this instance, exactly
+    # as was done on the mvmcc03 pilot.
 
     # ── routing ──────────────────────────────────────────────────────────────
     #

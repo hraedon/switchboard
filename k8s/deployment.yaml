@@ -95,6 +95,15 @@ spec:
                 secretKeyRef:
                   name: switchboard-provider-keys
                   key: SWITCHBOARD_ZAI_KEY
+            # usage-dashboard /readings bearer (Plan 025 wiring). `optional`
+            # on purpose: the truth signal is advisory — a missing key means
+            # the providers lose the weekly signal, not the boot.
+            - name: SWITCHBOARD_DASHBOARD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: switchboard-provider-keys
+                  key: SWITCHBOARD_DASHBOARD_TOKEN
+                  optional: true
           volumeMounts:
             - name: config
               mountPath: /etc/switchboard/switchboard.toml

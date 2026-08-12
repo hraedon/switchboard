@@ -12,6 +12,7 @@ these from a provider type and optional TOML config;
 
 from __future__ import annotations
 
+import logging
 import os
 import time as _time
 from dataclasses import dataclass
@@ -75,6 +76,8 @@ class ProviderContext:
     #: ProviderState.in_peak; the routing core never reads a clock.
     peak_windows: tuple[PeakWindow, ...] = ()
 
+
+log = logging.getLogger("switchboard.providers")
 
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
 
@@ -301,7 +304,19 @@ def build_provider_contexts_from_config(
         dashboard_token: str | None = None
         dashboard_token_env = _optional_str(provider_cfg, "dashboard_token_env")
         if dashboard_token_env is not None:
-            dashboard_token = os.environ.get(dashboard_token_env)
+            # Empty behaves like absent: a dashboard source built with an
+            # empty bearer can never fetch successfully, and since the
+            # advisory boot fail-closed fix that means a permanently closed
+            # gate — worse than simply losing the (advisory) signal. Warn
+            # and fall through to the provider-type default instead.
+            dashboard_token = os.environ.get(dashboard_token_env) or None
+            if dashboard_token is None:
+                log.warning(
+                    "provider '%s': dashboard_token_env=%r is not set or "
+                    "empty; skipping the dashboard truth source (the "
+                    "provider loses its usage signal, not its boot)",
+                    name, dashboard_token_env,
+                )
 
         dashboard_stale_ttl = _float_or(
             provider_cfg, "dashboard_stale_ttl", 900.0
@@ -535,6 +550,11 @@ def snapshot_provider_state(
 
     # Peak-pricing window (Plan 025). The wall-clock read lives HERE, in the
     # shell — the routing core receives the boolean and stays clock-free.
+    # Deliberately _time.time(), not the `now` argument: `now` is a MONOTONIC
+    # instant (the overload/budget trackers' clock) and peak windows are
+    # civil time — reusing it (review B-5's suggestion) would compare a
+    # process-uptime float against wall-clock windows. Same pattern as the
+    # weekly/quota reset fields above.
     provider_in_peak = bool(ctx.peak_windows) and _peak_in_peak(
         ctx.peak_windows, _time.time()
     )
