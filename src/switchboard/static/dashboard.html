@@ -768,9 +768,15 @@ async function deleteRoute(key) {
 
 // ── Model-map management (Plan 020 WI-7) ──────────────────────────────────
 let editingModel = false;
+// Pins the Model Map card while auto-match scan results are on screen. The
+// 5 s poll rebuilds this section via renderModelAdd; without the pin, scan
+// results are wiped within a poll interval — and a scan that finishes after
+// a poll writes into detached nodes, so the operator sees nothing at all.
+// Cleared by the Dismiss button or by opening the model form.
+let scanPinned = false;
 
 function renderModelAdd(data) {
-  if (editingModel) return;
+  if (editingModel || scanPinned) return;
   const known = Object.keys((data && data.providers) || {}).sort();
   const mm = (data && data.model_map) || {};
   const definedModels = Object.keys(mm);
@@ -788,7 +794,11 @@ function renderModelAdd(data) {
       <div id="scan-match-results" style="margin-top:0.6rem"></div>
     </div>`;
   const btn = document.getElementById('add-model-btn');
-  if (btn) btn.onclick = () => { editingModel = true; renderModelAddForm(known); };
+  if (btn) btn.onclick = () => {
+    scanPinned = false;
+    editingModel = true;
+    renderModelAddForm(known);
+  };
   const scanBtn = document.getElementById('scan-match-btn');
   if (scanBtn) scanBtn.onclick = () => runAutoMatchScan(known, definedModels, mm);
 }
@@ -827,9 +837,16 @@ async function _fetchProviderModels(provider) {
   return promise;
 }
 
-function renderModelAddForm(knownProviders) {
+// Add/edit a model mapping. With only `knownProviders`, renders the add
+// form; `editModelName` + `editAliases` switch it to edit mode: the model
+// name (the map key) is locked, alias inputs are pre-filled, and saving
+// POSTs the full replacement alias set — POST /admin/model-map is
+// add-or-update server-side, so clearing an alias removes that provider
+// from the model.
+function renderModelAddForm(knownProviders, editModelName, editAliases) {
   const el = document.getElementById('model-add');
   const provs = (knownProviders || []).slice().sort();
+  const editing = !!editModelName;
   // Finding #4 fix: provider names have no character validation (only
   // _RESERVED_PROVIDER_NAMES is checked), so a name containing &<>"' would
   // render an id attribute that getElementById — which expects the raw
@@ -848,28 +865,52 @@ function renderModelAddForm(knownProviders) {
       <button type="button" id="${idp}-show" class="mini-btn"
               style="margin-left:0.4rem">show models</button>
       <span id="${idp}-status" style="margin-left:0.4rem;font-size:0.8rem;color:var(--muted)"></span>
+      <div id="${idp}-list" style="max-height:9rem;overflow-y:auto;margin-top:0.3rem"></div>
     </div>`;
   }).join('');
+  const editNote = editing
+    ? '<span style="color:var(--muted);font-size:0.75rem">the model name is the map key; rename via delete + add. Clearing an alias removes that provider from the model.</span>'
+    : '';
   el.innerHTML = `
-    <h2>Add Model Mapping</h2>
+    <h2>${editing ? 'Edit Model Mapping' : 'Add Model Mapping'}</h2>
     <div class="card">
       <div class="form-row">
         <label for="mf-model">Model name (as the client sends it)</label>
-        <input id="mf-model" list="mf-model-known" autocomplete="off" placeholder="e.g. glm-5.2">
+        <input id="mf-model" list="mf-model-known" autocomplete="off"
+               placeholder="e.g. glm-5.2"${editing ? ' disabled' : ''}>
         <datalist id="mf-model-known"></datalist>
+        ${editNote}
       </div>
       ${aliasRows || '<p style="color:var(--muted)">No providers configured.</p>'}
       <div id="mf-error" style="color:var(--red);font-size:0.85rem;margin-bottom:0.5rem"></div>
-      <button id="mf-save">Save</button>
+      <button id="mf-save">${editing ? 'Save changes' : 'Save'}</button>
       <button id="mf-cancel" style="background:transparent;border:1px solid var(--border)">Cancel</button>
     </div>`;
+  // Populate values explicitly rather than via value="" attributes: fresh
+  // innerHTML gives a real browser empty inputs, but the GUI test harness's
+  // fake DOM keeps elements across renders, and edit-mode prefill needs the
+  // assignment path anyway (same pattern as the provider form).
+  {
+    const nameEl = document.getElementById('mf-model');
+    if (nameEl) nameEl.value = editing ? editModelName : '';
+    for (const p of provs) {
+      const e = document.getElementById(_domId(p) + '-alias');
+      if (e) e.value = (editing && editAliases && editAliases[p]) ? editAliases[p] : '';
+    }
+  }
   document.getElementById('mf-cancel').onclick = () => { editingModel = false; load(); };
   // Fresh form open → fresh probe cache. A prior form open's enumerated
   // models may be stale (provider changed, or a provider was just added);
   // clearing on open keeps "one probe per provider per form open" honest.
   modelEnums = {};
-  // Per-provider "show models" → populate the alias input's datalist. One
-  // upstream call per provider per form-open (cached in modelEnums).
+  // Union of every enumeration fetched this form-open; feeds the model-name
+  // datalist so the operator can pick the client-facing name from what the
+  // providers actually serve (before this, mf-model-known was never filled).
+  const modelNameUnion = new Set();
+  // Per-provider "show models" → populate the alias input's datalist AND a
+  // visible click-to-fill list. The datalist alone only surfaces once the
+  // operator types into the input, which read as "the button did nothing".
+  // One upstream call per provider per form-open (cached in modelEnums).
   provs.forEach(p => {
     const idp = _domId(p);
     const btn = document.getElementById(idp + '-show');
@@ -877,11 +918,34 @@ function renderModelAddForm(knownProviders) {
       const statusEl = document.getElementById(idp + '-status');
       if (statusEl) statusEl.textContent = 'probing\u2026';
       const res = await _fetchProviderModels(p);
+      const models = res.models || [];
       const dl = document.getElementById(idp + '-models');
-      if (dl) dl.innerHTML = (res.models || []).map(m => `<option value="${esc(m)}">`).join('');
+      if (dl) dl.innerHTML = models.map(m => `<option value="${esc(m)}">`).join('');
+      const listEl = document.getElementById(idp + '-list');
+      if (listEl) {
+        listEl.innerHTML = models.map((m, i) =>
+          `<button type="button" id="${idp}-pick-${i}" class="mini-btn"
+                   style="margin:0.1rem 0.2rem 0.1rem 0">${esc(m)}</button>`).join('');
+        models.forEach((m, i) => {
+          const pickBtn = document.getElementById(idp + '-pick-' + i);
+          if (pickBtn) pickBtn.onclick = () => {
+            const aliasEl = document.getElementById(idp + '-alias');
+            if (aliasEl) aliasEl.value = m;
+          };
+        });
+      }
+      if (models.length) {
+        models.forEach(m => modelNameUnion.add(m));
+        const knownDl = document.getElementById('mf-model-known');
+        if (knownDl) {
+          knownDl.innerHTML = Array.from(modelNameUnion).sort()
+            .map(m => `<option value="${esc(m)}">`).join('');
+        }
+      }
       if (statusEl) {
-        if (res.ok && (res.models || []).length) {
-          statusEl.textContent = `${res.models.length} model${res.models.length === 1 ? '' : 's'}`;
+        if (res.ok && models.length) {
+          statusEl.textContent = `${models.length} model${models.length === 1 ? '' : 's'}`
+            + ' — click one to fill the alias';
         } else {
           statusEl.textContent = res.detail || 'no models';
         }
@@ -921,12 +985,20 @@ function renderModelAddForm(knownProviders) {
 // provider offers an exact string match that the model map does not already
 // wire. Matches become one-click "Add" offers; no write happens without the
 // click. A provider that fails to answer is listed, not aborting the scan.
+// The scan renders into the Model Map card, which the 5 s poll rebuilds.
+// scanPinned freezes that card from scan start (before the first await —
+// a poll landing mid-scan would detach statusEl/outEl and the results
+// would render into nodes no longer on the page) until the operator
+// dismisses the results.
 async function runAutoMatchScan(providers, definedModels, currentMap) {
   const statusEl = document.getElementById('scan-match-status');
   const outEl = document.getElementById('scan-match-results');
   if (!outEl) return;
+  scanPinned = true;
   if (!definedModels.length) {
-    outEl.innerHTML = '<p style="color:var(--muted)">No models defined yet — add a model mapping first.</p>';
+    outEl.innerHTML = '<p style="color:var(--muted)">No models defined yet — add a model mapping first.</p>'
+      + _scanDismissHtml();
+    _wireScanDismiss();
     return;
   }
   outEl.innerHTML = '';
@@ -968,14 +1040,24 @@ async function runAutoMatchScan(providers, definedModels, currentMap) {
       </div>`;
     }
   }
-  outEl.innerHTML = html;
+  outEl.innerHTML = html + _scanDismissHtml();
   offers.forEach((o, i) => {
     const b = document.getElementById('mf-am-' + i);
-    if (b) b.onclick = () => applyAutoMatch(o, currentMap);
+    if (b) b.onclick = () => applyAutoMatch(o, currentMap, 'mf-am-' + i);
   });
+  _wireScanDismiss();
 }
 
-async function applyAutoMatch(offer, currentMap) {
+function _scanDismissHtml() {
+  return '<div style="margin-top:0.4rem"><button id="scan-dismiss" class="mini-btn">Dismiss results</button></div>';
+}
+
+function _wireScanDismiss() {
+  const d = document.getElementById('scan-dismiss');
+  if (d) d.onclick = () => { scanPinned = false; load(); };
+}
+
+async function applyAutoMatch(offer, currentMap, btnId) {
   // Finding #2 fix: re-read the CURRENT model-map state before merging, so an
   // alias added between the last load() and this click is not silently dropped.
   // The model-map POST replaces the whole alias set, so a stale snapshot would
@@ -1004,6 +1086,12 @@ async function applyAutoMatch(offer, currentMap) {
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) { alert(data.error || ('HTTP ' + resp.status)); return; }
+    // Mark the offer applied in place — the scan results stay pinned, so the
+    // remaining offers survive this click instead of vanishing on reload.
+    if (btnId) {
+      const b = document.getElementById(btnId);
+      if (b) { b.textContent = 'added ✓'; b.disabled = true; b.onclick = null; }
+    }
     load();
   } catch (e) { alert(String(e)); }
 }
@@ -1150,7 +1238,7 @@ function renderRoutingConfigEditor(data) {
       scored.forEach((s, i) => {
         const cls = s.surplus > 0 ? 'token-warn' : 'token-crit';
         surplusHtml += `<div class="stat"><span class="k">${i+1}. ${esc(s.name)}</span>`
-          + `<span class="v ${cls}">+${s.surplus.toFixed(3)}</span></div>`;
+          + `<span class="v ${cls}">${s.surplus >= 0 ? '+' : ''}${s.surplus.toFixed(3)}</span></div>`;
       });
       // Show unscored providers
       const unscored = provNames.filter(n => !scored.find(s => s.name === n));
@@ -1453,7 +1541,7 @@ async function load() {
     html += '<table><thead><tr><th>Key (truncated)</th><th>Providers</th><th></th></tr></thead><tbody>';
     keyedRoutes.forEach(([key, providers], i) => {
       html += `<tr><td><code>${esc(key.substring(0, 16))}...</code></td>`
-           +  `<td>${providers.join(' &rarr; ')}</td>`
+           +  `<td>${providers.map(esc).join(' &rarr; ')}</td>`
            +  `<td><button id="del-route-${i}" class="mini-btn">Delete</button></td></tr>`;
     });
     html += '</tbody></table>';
@@ -1485,7 +1573,8 @@ async function load() {
           html += `<td style="color:var(--muted)">&mdash;</td>`;
         }
       }
-      html += `<td><button id="del-model-${mi}" class="mini-btn">Delete</button></td></tr>`;
+      html += `<td><button id="edit-model-${mi}" class="mini-btn">Edit</button>
+        <button id="del-model-${mi}" class="mini-btn">Delete</button></td></tr>`;
     });
     html += '</tbody></table>';
   }
@@ -1553,6 +1642,12 @@ async function load() {
   mmModels.slice().sort().forEach((model, mi) => {
     const btn = document.getElementById('del-model-' + mi);
     if (btn) btn.onclick = () => deleteModel(model);
+    const ebtn = document.getElementById('edit-model-' + mi);
+    if (ebtn) ebtn.onclick = () => {
+      scanPinned = false;
+      editingModel = true;
+      renderModelAddForm(allProviders, model, mm[model] || {});
+    };
   });
   // Wire quarantine Release buttons (Plan 023 WI-4).
   if (q && q.entries) {
