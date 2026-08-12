@@ -651,3 +651,79 @@ class TestPermitOwnership:
         await app(_scope(), _receive_body(), send)
 
         assert list(app._affinity.values()) == []
+
+
+def _mutable_responder(status: int):
+    """Like _responder, but the status can be flipped mid-test."""
+    state = {"status": status}
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            state["status"], stream=_Stream(b'{"ok":true}'), headers={}
+        )
+
+    handler.state = state  # type: ignore[attr-defined]
+    handler.seen = seen  # type: ignore[attr-defined]
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_reroute_to_effective_primary_retires_the_stale_pin() -> None:
+    """Plan 026 review, blocking B1. With the model map excluding the
+    configured primary (alpha), beta is the EFFECTIVE primary. A pinned
+    fallback (gamma) that 429s and reroutes onto beta must not keep its
+    pin — pre-fix the re-pin guard (`rerouted_to != primary`) skipped the
+    effective-primary case, so the dwell pin kept fronting the exhausted
+    fallback and every request paid its failed round trip."""
+    from switchboard.model_map import ModelMapManager
+
+    alpha_handler = _responder(500)  # excluded by the model map; never called
+    beta = _mutable_responder(429)   # effective primary; exhausted at first
+    gamma = _mutable_responder(200)  # healthy fallback at first
+
+    a = _ctx("alpha", alpha_handler)
+    b = _ctx("beta", beta)
+    g = _ctx("gamma", gamma)
+    await _ready(a, b, g)
+
+    mm = ModelMapManager()
+    mm.set_model("m", {"beta": "m", "gamma": "m"})
+    app = ProxyApp(
+        providers={"alpha": a, "beta": b, "gamma": g},
+        route_table=RouteTableManager(
+            default_providers=("alpha", "beta", "gamma"),
+        ),
+        routing_config=RoutingConfig(),
+        model_map_mgr=mm,
+        queue_timeout=1.0,
+        reroute_max_attempts=1,
+    )
+
+    async def send_one() -> None:
+        msgs, send = _sender()
+        await app(_scope(), _receive_body(), send)
+        assert _statuses(msgs)[-0:] is not None  # response completed
+
+    # Request 1: beta 429s, gamma serves via reroute → pin lands on gamma.
+    await send_one()
+    assert [af.provider for af in app._affinity.values()] == ["gamma"]
+
+    # gamma is now exhausted; beta recovered.
+    gamma.state["status"] = 429
+    beta.state["status"] = 200
+
+    # Request 2: the pin fronts gamma, gamma 429s, the reroute lands on the
+    # EFFECTIVE primary (beta). The stale gamma pin must be retired.
+    await send_one()
+    assert all(af.provider != "gamma" for af in app._affinity.values())
+
+    # Request 3: straight to beta — gamma pays no further failed round trip.
+    gamma_calls = len(gamma.seen)
+    await send_one()
+    assert len(gamma.seen) == gamma_calls
+    assert len(alpha_handler.seen) == 0
+
+    for ctx in (a, b, g):
+        await ctx.http_client.aclose()

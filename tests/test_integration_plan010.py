@@ -452,3 +452,4 @@ async def test_effective_primary_still_pops_a_pin_naming_someone_else() -> None:
     assert app.metrics.affinity_failbacks_total == 1
     assert app.metrics.failovers == 0
     await _close(app)
+

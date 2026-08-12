@@ -1574,9 +1574,15 @@ function _explainHtml(body) {
     const score = (a.score === null || a.score === undefined)
       ? '<span style="color:var(--muted)">—</span>'
       : Number(a.score).toFixed(3);
-    const sig = (a.signals || []).length
+    let sig = (a.signals || []).length
       ? a.signals.map(s => `<code>${esc(s)}</code>`).join(' ')
       : '<span style="color:var(--muted)">—</span>';
+    // Per-assessment preference marker (cross-lineage review, N3): the API
+    // exposes preference_rank; render it so "why is this one in front" is
+    // answerable from the card, not only from curl.
+    if (a.preference_rank !== null && a.preference_rank !== undefined) {
+      sig = `<code>pref#${Number(a.preference_rank)}</code> ` + sig;
+    }
     return `<tr${selected ? ' style="font-weight:600"' : ''}>`
       + `<td>${esc(a.provider)}${selected ? ' &larr; selected' : ''}</td>`
       + `<td><span class="badge ${tierCls}">${esc(a.tier)}</span></td>`
