@@ -254,6 +254,25 @@ def test_degraded_fallback_never_outranks_fresh_backstop() -> None:
     assert plan.queue_candidate == "umans"
 
 
+def test_degraded_busy_fallback_is_not_a_backstop() -> None:
+    """A DEGRADED fallback with no capacity (BUSY — e.g. an authoritative
+    source failing closed zeroed its gate) is not offered as a backstop:
+    queueing on it would be a doomed wait, turning the fast 503 into a slow
+    one. Only DEGRADED + AVAILABLE earns the last-resort slot."""
+    states = {
+        "umans": _state("umans", availability=Availability.CLOSED),
+        "ollama": _state(
+            "ollama",
+            availability=Availability.BUSY,
+            signal_freshness=SignalFreshness.DEGRADED,
+        ),
+    }
+    plan = route_decision(states, TABLE, "any_key", CONFIG, now=0.0)
+    assert plan.immediate_candidates == ()
+    assert plan.queue_candidate is None
+    assert plan.reason == "no_eligible_candidates"
+
+
 def test_degraded_fallback_yields_to_fresh_busy_fallback() -> None:
     """A fresh-but-BUSY fallback outranks a degraded one for the queue slot:
     stale data never makes a candidate more attractive than fresh data."""
