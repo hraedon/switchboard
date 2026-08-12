@@ -108,6 +108,29 @@ async def test_advisory_fetch_failure_keeps_gate_open() -> None:
 
 
 @pytest.mark.asyncio
+async def test_advisory_first_fetch_failure_stays_closed() -> None:
+    """Before any successful poll there is no last-known-good — the source
+    serves a synthetic failsafe whose remaining fields are None, so the
+    data-driven zeroes cannot fire. The gate must stay closed rather than
+    open on zero evidence (cross-lineage review, blocking finding B1)."""
+    truth = FakeTruthSource(_reading(), advisory=True)
+    truth.set_fail(True)
+    loop, gate = _loop(truth)
+    await loop.tick()
+    assert gate.available == 0
+    assert loop.ready is False
+
+    # The first SUCCESSFUL poll opens it; a later failure keeps it open
+    # from the (now real) last-known-good.
+    truth.set_fail(False)
+    await loop.tick()
+    assert gate.available == 3
+    truth.set_fail(True)
+    await loop.tick()
+    assert gate.available == 3
+
+
+@pytest.mark.asyncio
 async def test_authoritative_fetch_failure_closes_gate() -> None:
     """Header-driven (authoritative) sources keep the fail-closed policy:
     stale rate-limit truth means zero permits (review finding 10)."""

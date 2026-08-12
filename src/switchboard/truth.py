@@ -50,6 +50,11 @@ class TruthSource(Protocol):
 class PolledTruthSource:
     """Wraps umans ``/v1/usage`` polling with LKG caching."""
 
+    # Authoritative: the umans permit computation never consults this flag
+    # (it has its own polled path), but the classification contract is that
+    # every TruthSource carries the right value.
+    advisory = False
+
     def __init__(
         self,
         *,

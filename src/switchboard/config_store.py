@@ -301,6 +301,13 @@ class ConfigStoreManager:
         the GUI never round-trips them; absence on edit means "unchanged",
         not "clear".
 
+        Whole-row semantics cut both ways: a PUT built from a stale form
+        (e.g. a cached pre-025 GUI page that never heard of ``peak_windows``
+        or ``dashboard_provider``) silently resets those fields to NULL.
+        The shipped GUI always round-trips every managed field; any OTHER
+        admin client must do the same or it will strip config it does not
+        know about (cross-lineage review, finding 2).
+
         Raises :class:`ValueError` with an admin-surfaceable message on
         validation failure. DB-first: the row is committed before memory is
         updated, so a DB failure raises and leaves memory unchanged.
@@ -704,10 +711,27 @@ def _validate_row(row: _ProviderRow) -> None:
         # Validate the specs here (not only at build time) so a bad row —
         # whether from an upsert or loaded from the DB — is refused with the
         # spec named, instead of failing provider construction later.
+        # STRICT decode, not _peak_windows_list: the lenient helper swallows
+        # malformed JSON as "no windows", which would silently drop a peak
+        # guard and burn quota at the expensive rate with no sign why
+        # (cross-lineage review, finding 1).
         from switchboard.peak import parse_peak_windows
 
         try:
-            parse_peak_windows(_peak_windows_list(row.peak_windows))
+            loaded = json.loads(row.peak_windows)
+        except json.JSONDecodeError:
+            raise ValueError(
+                f"provider {row.name!r}: peak_windows cell is not valid JSON"
+            ) from None
+        if not isinstance(loaded, list) or not all(
+            isinstance(w, str) for w in loaded
+        ):
+            raise ValueError(
+                f"provider {row.name!r}: peak_windows must be a JSON array "
+                "of window strings"
+            )
+        try:
+            parse_peak_windows(loaded)
         except ValueError as exc:
             raise ValueError(f"provider {row.name!r}: {exc}") from None
 

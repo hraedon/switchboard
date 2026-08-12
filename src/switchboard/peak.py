@@ -118,7 +118,9 @@ def parse_peak_window(spec: str) -> PeakWindow:
     else:
         sign = 1 if off_s[0] == "+" else -1
         oh, om = int(off_s[1:3]), int(off_s[4:6])
-        if oh > 14 or om > 59:
+        # ±14:00 is the largest real UTC offset; 14 with nonzero minutes
+        # would exceed it.
+        if oh > 14 or om > 59 or (oh == 14 and om != 0):
             raise ValueError(f"peak window {spec!r}: UTC offset out of range")
         offset = sign * (oh * 60 + om)
     return PeakWindow(

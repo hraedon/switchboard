@@ -245,6 +245,32 @@ check('blank preference omits the field, clearing it server-side',
       clearCall && !('preference' in JSON.parse(clearCall.opts.body)),
       clearCall && clearCall.opts.body);
 
+// --- 9d. clearing an alias on edit requires confirmation -------------------
+// The POST replaces the whole alias set, so a cleared input silently deletes
+// that provider's mapping — destructive, hence the confirm().
+vm.runInContext('editingModel = true', sandbox);
+sandbox.renderModelAddForm(
+  ['umans', 'ollama-cloud'], 'glm-5.2',
+  { umans: 'umans-glm-5.2', 'ollama-cloud': 'glm-5.2' });
+$('mf-ollama-cloud-alias').value = '';  // operator clears one of two aliases
+let confirmCalls = 0;
+sandbox.confirm = () => { confirmCalls++; return false; };
+fetchCalls = [];
+await $('mf-save').onclick();
+check('shrinking the alias set asks for confirmation', confirmCalls === 1);
+check('declined confirmation does not POST',
+      !fetchCalls.some(c => c.url === '/admin/model-map'));
+sandbox.confirm = () => { confirmCalls++; return true; };
+fetchCalls = [];
+nextResponse = { ok: true, status: 200, json: async () => ({}) };
+await $('mf-save').onclick();
+const shrinkCall = fetchCalls.find(c => c.url === '/admin/model-map');
+check('accepted confirmation POSTs the shrunk alias set',
+      shrinkCall && JSON.stringify(Object.keys(JSON.parse(shrinkCall.opts.body).aliases)) ===
+        JSON.stringify(['umans']),
+      shrinkCall && shrinkCall.opts.body);
+sandbox.confirm = () => true;
+
 // --- 10. XSS: route/model content is escaped in the tables ----------------
 nextResponse = {
   ok: true, status: 200,
