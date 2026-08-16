@@ -62,8 +62,10 @@ data:
     # note) with dashboard_provider mapping switchboard's route key to the
     # dashboard's own id. The signal is ADVISORY: a dashboard outage costs
     # the routing optimisation, never availability. Requires the
-    # SWITCHBOARD_DASHBOARD_TOKEN key in the switchboard-provider-keys
-    # Secret (refresh it from secrets.env per docs/ops/runbook.md) —
+    # SWITCHBOARD_DASHBOARD_TOKEN key (an optional secretKeyRef) in the
+    # switchboard-provider-keys Secret — the pod's env-injected key material
+    # lives in that Secret; rotate it per docs/ops/runbook.md §7 (patch,
+    # never replace) —
     # if the token is absent the truth source falls back to the null
     # source and providers simply lose the weekly signal.
     # dashboard_stale_ttl 2700: the dashboard's refetch cadence stretches

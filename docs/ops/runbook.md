@@ -377,6 +377,30 @@ steps:
    {"api_key_stored": "sk-new-key-here"}
    ```
 
+**Updating one key in the Secret: patch, never replace.** The cluster Secret
+accumulates keys no single file holds (`SWITCHBOARD_ADMIN_TOKEN`, the
+optional `SWITCHBOARD_DASHBOARD_TOKEN`, keys patched in from other hosts'
+env files). Keys set through the GUI or the admin API's stored-key mode do
+**not** live here — those stay in switchboard's SQLite config store and
+rotate via `PUT /admin/providers/<name>` (above); patching the Secret for
+them does nothing. A whole-Secret write — `kubectl create secret ...
+--dry-run -o yaml | kubectl apply -f -`, or `kubectl apply -f
+k8s/secret.yaml` — **replaces every key not named in that write** and takes
+the pod down with it (`ADMIN_TOKEN` is a non-optional secretKeyRef; a
+vanished provider key is a hard startup error by design). The safe form for
+refreshing one value from a local env file is a merge patch:
+
+```
+kubectl -n switchboard patch secret switchboard-provider-keys \
+  --type=merge -p "{\"stringData\":{\"SWITCHBOARD_ZAI_KEY\":\"$(grep -E '^SWITCHBOARD_ZAI_KEY=' ~/.config/switchboard/secrets.env | cut -d= -f2-)\"}}"
+kubectl -n switchboard rollout restart deployment/switchboard
+```
+
+If you genuinely need to rebuild the Secret from a file, that file must first
+be proven a **superset** of the live Secret (`kubectl get secret ... -o
+jsonpath='{.data}' | jq 'keys'` vs the file's keys) — a diff that shows
+anything live-but-not-in-file is a stop, not a cleanup.
+
 **Write-only key semantics.** The admin API treats `api_key` / `api_key_stored`
 as write-only. It is never echoed back on `GET /admin/providers` or
 `GET /admin/config/effective` — those surfaces report `api_key_set: true`
