@@ -354,6 +354,64 @@ class TestRerouteSafetyGaps:
         pinned = [entry.provider for entry in app._affinity.values()]
         assert pinned == ["b"]
 
+    async def test_initial_failover_transport_failure_does_not_create_pin(
+        self,
+    ) -> None:
+        """A selected fallback is not pinned before its first forward works."""
+        primary = _responder(200)
+
+        def connection_reset(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection reset", request=request)
+
+        a, b = _ctx("a", primary), _ctx("b", connection_reset)
+        await _ready(a, b)
+        await a.gate.resize(0)
+        app = _app({"a": a, "b": b})
+        msgs, send = _sender()
+
+        await app(_scope(), _receive_body(), send)
+
+        assert _statuses(msgs) == [502]
+        assert list(app._affinity.values()) == []
+
+    async def test_transport_failure_while_affined_clears_pin(self) -> None:
+        """A per-request connection failure releases an otherwise healthy pin."""
+        primary = _responder(200)
+        b_seen: list[httpx.Request] = []
+        b_failed = False
+
+        def fallback(request: httpx.Request) -> httpx.Response:
+            nonlocal b_failed
+            b_seen.append(request)
+            if b_failed:
+                raise httpx.ConnectError("connection reset", request=request)
+            return httpx.Response(
+                200, stream=_Stream(b'{"ok":true}'), headers={}
+            )
+
+        a, b = _ctx("a", primary), _ctx("b", fallback)
+        await _ready(a, b)
+        await a.gate.resize(0)
+        app = _app({"a": a, "b": b})
+
+        first_msgs, first_send = _sender()
+        await app(_scope(), _receive_body(), first_send)
+        assert _statuses(first_msgs) == [200]
+        assert [entry.provider for entry in app._affinity.values()] == ["b"]
+
+        await a.gate.resize(4)
+        b_failed = True
+        failed_msgs, failed_send = _sender()
+        await app(_scope(), _receive_body(), failed_send)
+        assert _statuses(failed_msgs) == [502]
+        assert list(app._affinity.values()) == []
+
+        next_msgs, next_send = _sender()
+        await app(_scope(), _receive_body(), next_send)
+        assert _statuses(next_msgs) == [200]
+        assert len(primary.seen) == 1
+        assert len(b_seen) == 2
+
     async def test_queue_only_candidate_counts_as_an_alternative(self) -> None:
         """A busy-but-alive provider is still somewhere to go.
 
@@ -597,6 +655,62 @@ class TestPerProviderCredentials:
         sent = healthy.seen[0].headers
         assert sent["authorization"] == "Bearer provider-key"
         assert "x-api-key" not in sent
+
+    async def test_no_space_prefix_gets_exactly_one_space(self) -> None:
+        """A scheme glued to the key is never a valid credential.
+
+        An operator storing "Bearer" (no trailing space) would otherwise send
+        ``Authorization: Bearersk-...`` and be 401'd upstream. Normalize at the
+        choke point so every already-stored form repairs itself.
+        """
+        healthy = _responder(200)
+        a = _ctx("a", healthy)
+        a.api_key = "sk-test"
+        a.auth_prefix = "Bearer"
+        await _ready(a)
+        _msgs, send = _sender()
+
+        await _app({"a": a})(_scope(), _receive_body(), send)
+
+        assert healthy.seen[0].headers["authorization"] == "Bearer sk-test"
+
+    async def test_trailing_space_prefix_is_unchanged(self) -> None:
+        healthy = _responder(200)
+        a = _ctx("a", healthy)
+        a.api_key = "sk-test"
+        a.auth_prefix = "Bearer "
+        await _ready(a)
+        _msgs, send = _sender()
+
+        await _app({"a": a})(_scope(), _receive_body(), send)
+
+        assert healthy.seen[0].headers["authorization"] == "Bearer sk-test"
+
+    async def test_empty_prefix_emits_the_bare_key(self) -> None:
+        """Raw-key headers carry no scheme, so an empty prefix stays empty."""
+        healthy = _responder(200)
+        a = _ctx("a", healthy)
+        a.api_key = "sk-test"
+        a.auth_header = "x-api-key"
+        a.auth_prefix = ""
+        await _ready(a)
+        _msgs, send = _sender()
+
+        await _app({"a": a})(_scope(), _receive_body(), send)
+
+        assert healthy.seen[0].headers["x-api-key"] == "sk-test"
+
+    async def test_basic_scheme_gets_a_single_space(self) -> None:
+        healthy = _responder(200)
+        a = _ctx("a", healthy)
+        a.api_key = "base64cred"
+        a.auth_prefix = "Basic"
+        await _ready(a)
+        _msgs, send = _sender()
+
+        await _app({"a": a})(_scope(), _receive_body(), send)
+
+        assert healthy.seen[0].headers["authorization"] == "Basic base64cred"
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import sqlite3
 import time
 from typing import Any
 
@@ -34,6 +36,7 @@ from switchboard.config_store import ConfigStoreManager
 from switchboard.control import RoutingConfig
 from switchboard.gate import PermitGate
 from switchboard.limit import BreakerConfig
+from switchboard.model_map import ModelMapManager
 from switchboard.provider_manager import ProviderManager
 from switchboard.providers import ProviderContext
 from switchboard.proxy import ProxyApp
@@ -858,6 +861,7 @@ def _make_app(
     providers: dict[str, ProviderContext],
     store: ConfigStoreManager,
     toml_sections: dict[str, dict[str, Any]] | None = None,
+    model_map: ModelMapManager | None = None,
 ) -> ProxyApp:
     route_table = RouteTableManager(
         default_providers=tuple(providers) or ("test",)
@@ -869,6 +873,7 @@ def _make_app(
         routing_config=RoutingConfig(),
         admin_token=ADMIN_TOKEN,
         config_store=store,
+        model_map_mgr=model_map,
         toml_provider_names=frozenset(sections),
         toml_provider_sections=sections,
     )
@@ -961,6 +966,120 @@ async def test_dispatch_full_crud_round_trip(monkeypatch) -> None:
     finally:
         await mgr.remove("beta")
         await mgr.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delete_scrubs_model_map_and_allows_provider_readd(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    model_map = ModelMapManager()
+    model_map.set_model(
+        "shared",
+        {"alpha": "alpha-shared", "test": "test-shared"},
+        ["alpha", "test"],
+    )
+    model_map.set_model("alpha-only", {"alpha": "alpha-only"}, ["alpha"])
+    model_map.set_model("unrelated", {"test": "test-only"}, ["test"])
+    store = ConfigStoreManager()
+    store.upsert("alpha", _passthrough_fields())
+    app = _make_app(
+        {"alpha": _make_ctx("alpha"), "test": _make_ctx("test")},
+        store,
+        model_map=model_map,
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="switchboard.admin"):
+            status, _ = await _dispatch(
+                app,
+                "DELETE",
+                "/admin/providers/alpha",
+                headers=_admin_headers(),
+            )
+        assert status == 200
+        removal_logs = [
+            record.message
+            for record in caplog.records
+            if record.message.startswith("provider removed: alpha")
+        ]
+        assert removal_logs == [
+            "provider removed: alpha (tombstoned=False, "
+            "model-map scrubbed=1, dropped=1)"
+        ]
+
+        status, body = await _dispatch(
+            app,
+            "GET",
+            "/admin/model-map",
+            headers=[(b"authorization", f"Bearer {ADMIN_TOKEN}".encode())],
+        )
+        assert status == 200
+        entries = {entry["model"]: entry for entry in json.loads(body)["models"]}
+        assert "alpha-only" not in entries
+        assert entries["shared"]["aliases"] == {"test": "test-shared"}
+        assert entries["shared"]["preference"] == ["test"]
+        assert entries["unrelated"]["aliases"] == {"test": "test-only"}
+        assert entries["unrelated"]["preference"] == ["test"]
+
+        status, _ = await _dispatch(
+            app,
+            "POST",
+            "/admin/providers",
+            headers=_admin_headers(),
+            body=json.dumps(
+                {
+                    "name": "alpha",
+                    "upstream": "https://alpha-new.example.com",
+                    "provider_type": "generic",
+                    "target": 1,
+                    "key_mode": "passthrough",
+                }
+            ).encode(),
+        )
+        assert status == 200
+        assert "alpha" in app._providers
+    finally:
+        await app.provider_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delete_reports_model_map_scrub_failure_without_failing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A config-store write failure during the model-map scrub must not
+    read as a failed delete: the provider IS removed at that point, so the
+    response stays 200 and carries ``model_map_scrub_failed`` instead."""
+    model_map = ModelMapManager()
+    model_map.set_model("alpha-only", {"alpha": "alpha-only"}, ["alpha"])
+    app = _make_app(
+        {"alpha": _make_ctx("alpha")},
+        ConfigStoreManager(),
+        model_map=model_map,
+    )
+
+    def _raise(provider: str) -> tuple[int, int]:
+        raise sqlite3.Error("disk I/O error")
+
+    monkeypatch.setattr(model_map, "remove_provider", _raise)
+    try:
+        with caplog.at_level(logging.ERROR, logger="switchboard.admin"):
+            status, body = await _dispatch(
+                app,
+                "DELETE",
+                "/admin/providers/alpha",
+                headers=_admin_headers(),
+            )
+        assert status == 200
+        data = json.loads(body)
+        assert data["removed"] is True
+        assert data["model_map_scrub_failed"] is True
+        assert any(
+            "model-map scrub failed" in record.message
+            for record in caplog.records
+        )
+        assert "alpha" not in app._providers
+    finally:
+        await app.provider_manager.shutdown()
 
 
 @pytest.mark.asyncio

@@ -121,28 +121,66 @@ def _make_mocked_ctx(
     )
 
 
+def _json_response(
+    request: httpx.Request,
+    prompt_tokens: int = 100,
+    completion_tokens: int = 200,
+) -> httpx.Response:
+    """Build a non-streaming JSON response with a usage object.
+
+    ``request`` is consumed (and ignored) because ``httpx.MockTransport``
+    passes it as the first positional argument to the handler.
+
+    Uses an explicit stream because ``httpx.Response(content=...)`` or
+    ``json=...`` creates an already-consumed body that ``aiter_raw()`` cannot
+    read, which would make the non-streaming path in the proxy fail with
+    ``StreamConsumed``.
+    """
+    body = json.dumps(
+        {
+            "id": "1",
+            "choices": [{"message": {"content": "Hi"}}],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        }
+    ).encode()
+
+    class _JSONStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield body
+
+        async def aclose(self) -> None:
+            pass
+
+    return httpx.Response(
+        200,
+        headers={"content-type": "application/json"},
+        stream=_JSONStream(),
+    )
+
+
 def _sse_response(
     prompt_tokens: int = 100,
     completion_tokens: int = 200,
 ) -> httpx.Response:
     """Build an SSE response with a usage chunk (stream= for MockTransport)."""
-    chunks = [
-        b'data: {"id":"1","choices":[{"delta":{"content":"Hi"}}]}\n\n',
-        (
-            b'data: {"id":"1","choices":[],"usage":'
-            b'{"prompt_tokens":'
-            + str(prompt_tokens).encode()
-            + b',"completion_tokens":'
-            + str(completion_tokens).encode()
-            + b'}}\n\n'
-        ),
-        b"data: [DONE]\n\n",
-    ]
+    usage_chunk = (
+        b'{"id":"1","choices":[],"usage":'
+        b'{"prompt_tokens":'
+        + str(prompt_tokens).encode()
+        + b',"completion_tokens":'
+        + str(completion_tokens).encode()
+        + b'}}\n\n'
+    )
 
     class _SSEStream(httpx.AsyncByteStream):
         async def __aiter__(self):
-            for c in chunks:
-                yield c
+            yield b'data: {"id":"1","choices":[{"delta":{"content":"Hi"}}]}\n\n'
+            yield b"data: " + usage_chunk
+            yield b"data: [DONE]\n\n"
 
         async def aclose(self) -> None:
             pass
@@ -460,10 +498,10 @@ def test_soft_threshold_accessor() -> None:
 
 
 @pytest.mark.asyncio
-async def test_speed_sample_recorded_for_streamed_response() -> None:
+async def test_speed_tokens_recorded_without_budget_streaming() -> None:
     """A successful streamed response records TTFB + duration into the
-    sampler. Completion tokens are picked up only when a budget observer is
-    active — here there is none, so tokens_per_sec is None."""
+    sampler.  Even with no token budget configured, the usage observer runs
+    for speed stats and supplies completion_tokens for tokens_per_sec."""
     sampler = SpeedSampler()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -486,8 +524,8 @@ async def test_speed_sample_recorded_for_streamed_response() -> None:
     assert summary["ttfb_ms"]["avg"] >= 0.0
     # Duration is at least the TTFB (request-open → completion).
     assert summary["duration_ms"]["avg"] >= summary["ttfb_ms"]["avg"]
-    # No budget observer → no token count → tokens_per_sec is None.
-    assert summary["tokens_per_sec"] is None
+    assert summary["tokens_per_sec"] is not None
+    assert summary["tokens_per_sec"] > 0.0
 
 
 @pytest.mark.asyncio
@@ -505,6 +543,32 @@ async def test_speed_tokens_recorded_with_budget_observer() -> None:
         providers={"ollama-cloud": ctx},
         route_table=RouteTableManager(default_providers=("ollama-cloud",)),
         budget_tracker=tracker,
+        speed_sampler=sampler,
+    )
+
+    body = json.dumps({"model": "test", "messages": []}).encode()
+    status, _ = await _send_request(app, body)
+    assert status == 200
+
+    summary = sampler.summary("ollama-cloud")
+    assert summary is not None
+    assert summary["tokens_per_sec"] is not None
+    assert summary["tokens_per_sec"] > 0.0
+
+
+@pytest.mark.asyncio
+async def test_speed_tokens_recorded_without_budget_non_streaming() -> None:
+    """A non-streaming 2xx response with a usage object also feeds the speed
+    sampler via the same read-only observer, even with no token budget."""
+    sampler = SpeedSampler()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(request, prompt_tokens=100, completion_tokens=200)
+
+    ctx = _make_mocked_ctx("ollama-cloud", handler)
+    app = ProxyApp(
+        providers={"ollama-cloud": ctx},
+        route_table=RouteTableManager(default_providers=("ollama-cloud",)),
         speed_sampler=sampler,
     )
 

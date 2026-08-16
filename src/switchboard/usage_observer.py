@@ -4,8 +4,10 @@ Parses the ``usage`` object from response bytes **as they stream through** —
 read-only, zero modification.  The client receives exactly what the upstream
 sent.  This is the streaming equivalent of the proxy already observing the
 response status code and headers (for 429 classification); the ``usage``
-field is the one additional structural field, and only when the operator
-opts in via ``[token_budget]``.
+field is the one additional structural field.  The observer runs on every
+2xx provider response: it feeds the token-budget tracker (Plan 012) when a
+``[token_budget]`` is configured and the speed sampler's tokens_per_sec
+(Plan 020) unconditionally.
 
 **SSE parsing** (streaming responses, ``Content-Type: text/event-stream``):
 OpenAI-compatible SSE is a sequence of ``data: <json>\\n\\n`` lines.  The
@@ -63,10 +65,12 @@ class UsageObserver:
             line, self._line_buf = self._line_buf.split(b"\n", 1)
             self._process_sse_line(bytes(line))
 
-    def feed_non_streaming(self, body: bytes) -> None:
+    def feed_non_streaming(self, body: bytes | bytearray) -> None:
         """Parse a complete non-streaming JSON response body for usage.
 
         Read-only — the caller forwards the original bytes unchanged.
+        Accepts a ``bytearray`` (the proxy's buffered form) to avoid a copy;
+        the buffer is never mutated.
         """
         try:
             data: Any = json.loads(body)

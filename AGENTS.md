@@ -20,14 +20,15 @@ gates and decides which upstream provider receives each request.
 - **Inert in-path — per provider.** switchboard forwards live traffic to the
   selected upstream. It **never reads, logs, stores, or rewrites request/response
   bodies.** It routes and streams bytes through untouched. Same guarantee as
-  sluice, applied per-upstream-path. *(Exceptions, all opt-in and gated:
+  sluice, applied per-upstream-path. *(Exceptions, each narrow and
+  read-bounded (1 and 3 also opt-in via config):
   (1) when a `[model]` map is configured, switchboard MAY read the request
   body's top-level `model` field and MAY rewrite only that field for the
-  fallback path — Plan 010. No other field is read or altered. (2) When a
-  `[token_budget]` is configured for a provider, switchboard MAY observe the
-  `usage` object in the response stream **read-only in-flight** (SSE
-  `data:` lines or non-streaming JSON) for token accounting — Plan 012.
-  Bytes forwarded to the client are never modified; no other field is read.
+  fallback path — Plan 010. No other field is read or altered. (2) When a 2xx
+  provider response is streamed or returned as JSON, switchboard MAY observe the
+  `usage` object **read-only in-flight** (SSE `data:` lines or non-streaming JSON)
+  to feed token accounting — Plan 012 — and speed statistics — Plan 020. Bytes
+  forwarded to the client are never modified; no other field is read.
   (3) When `[routing] pin_conversations` is configured, switchboard MAY read
   the request body's `messages` array to extract a conversation fingerprint
   (hash of the first user message's text content) for per-conversation

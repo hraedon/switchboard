@@ -2655,6 +2655,7 @@ async def handle_provider_delete(
     toml_provider_names: frozenset[str],
     toml_provider_sections: dict[str, dict[str, Any]],
     cors_allow_origin: str | None = None,
+    model_map_mgr: ModelMapManager | None = None,
 ) -> None:
     """DELETE /admin/providers/<name> — remove, tombstoning TOML providers.
 
@@ -2664,7 +2665,10 @@ async def handle_provider_delete(
     TOML section) upserted with ``enabled=0``, which ``effective_providers``
     treats as "remove from the effective set". Store-only providers are
     genuinely deleted. Either way the live context is deregistered and
-    drained under the WI-2 rules.
+    drained under the WI-2 rules, then its model-map aliases and preferences
+    are scrubbed. The scrub applies to tombstoned providers too: re-enabling
+    a tombstone does not restore its aliases — re-add them via
+    ``POST /admin/model-map`` when re-enabling.
     """
     cors = cors_extra_headers(cors_allow_origin, None)
     if not admin_token:
@@ -2737,11 +2741,33 @@ async def handle_provider_delete(
             return
 
     await provider_manager.remove(prov_name)
+    map_scrubbed = 0
+    map_dropped = 0
+    # Scrub failure is reported, not fatal: the provider itself IS removed
+    # at this point, and a 500 here would read as "nothing happened" while
+    # the map holds stale aliases an operator must still clean up by hand.
+    map_scrub_failed = False
+    if model_map_mgr is not None:
+        try:
+            map_scrubbed, map_dropped = model_map_mgr.remove_provider(prov_name)
+        except sqlite3.Error as exc:
+            map_scrub_failed = True
+            log.error(
+                "provider model-map scrub failed for %s: %s", prov_name, exc
+            )
     log.info(
-        "provider removed: %s (tombstoned=%s)", prov_name, tombstoned,
+        "provider removed: %s (tombstoned=%s, model-map scrubbed=%d, "
+        "dropped=%d%s)",
+        prov_name, tombstoned, map_scrubbed, map_dropped,
+        ", SCRUB FAILED" if map_scrub_failed else "",
     )
     await send_json(
-        send, 200, {"removed": True, "tombstoned": tombstoned},
+        send, 200,
+        {
+            "removed": True,
+            "tombstoned": tombstoned,
+            **({"model_map_scrub_failed": True} if map_scrub_failed else {}),
+        },
         extra_headers=cors,
     )
 
