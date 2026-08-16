@@ -62,6 +62,22 @@ def test_remove_model_returns_false_for_unknown() -> None:
     assert mgr.remove_model("nope") is False
 
 
+def test_remove_provider_scrubs_aliases_preferences_and_empty_entries() -> None:
+    mgr = ModelMapManager()
+    mgr.set_model("shared", {"gone": "g", "kept": "k"}, ["gone", "kept"])
+    mgr.set_model("gone-only", {"gone": "g"}, ["gone"])
+    mgr.set_model("untouched", {"kept": "k"}, ["kept"])
+
+    assert mgr.remove_provider("gone") == (1, 1)
+
+    assert dict(mgr.list_models()) == {
+        "shared": {"kept": "k"},
+        "untouched": {"kept": "k"},
+    }
+    assert mgr.preference_for("shared") == ("kept",)
+    assert mgr.preference_for("untouched") == ("kept",)
+
+
 def test_load_from_config_seeds_models() -> None:
     config = {
         "model": {
@@ -148,6 +164,28 @@ def test_sqlite_persistence_remove_model_gone_in_new_manager() -> None:
         db2 = sqlite3.connect(path)
         mgr2 = ModelMapManager(db=db2)
         assert "doomed" not in mgr2.get_model_map()
+        db1.close()
+        db2.close()
+    finally:
+        os.unlink(path)
+
+
+def test_sqlite_persistence_remove_provider_survives_new_manager() -> None:
+    path, _ = _tmp_db()
+    try:
+        db1 = sqlite3.connect(path)
+        mgr1 = ModelMapManager(db=db1)
+        mgr1.set_model(
+            "shared", {"gone": "g", "kept": "k"}, ["gone", "kept"]
+        )
+        mgr1.set_model("gone-only", {"gone": "g"}, ["gone"])
+
+        assert mgr1.remove_provider("gone") == (1, 1)
+
+        db2 = sqlite3.connect(path)
+        mgr2 = ModelMapManager(db=db2)
+        assert dict(mgr2.list_models()) == {"shared": {"kept": "k"}}
+        assert mgr2.preference_for("shared") == ("kept",)
         db1.close()
         db2.close()
     finally:

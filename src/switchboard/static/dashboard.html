@@ -384,7 +384,8 @@ function renderProviderForm(existing) {
       </div>
       <div class="form-row">
         <label for="pf-auth-prefix">Auth prefix</label>
-        <input id="pf-auth-prefix" autocomplete="off" placeholder="e.g. Bearer"
+        <input id="pf-auth-prefix" autocomplete="off"
+          placeholder="Bearer (blank = provider default; a separating space is appended if missing)"
           value="${esc(existing.auth_prefix || '')}"${lockAttr('auth_prefix')}>
         ${isLocked('auth_prefix') ? lockNote : ''}
       </div>

@@ -327,6 +327,67 @@ class ModelMapManager:
             self._preferences.pop(model, None)
         return found
 
+    def remove_provider(self, provider: str) -> tuple[int, int]:
+        """Remove a provider from every model entry and preference.
+
+        Returns ``(scrubbed, dropped)``: entries retaining at least one alias
+        are scrubbed, while entries left with no aliases are dropped.  The
+        latter cannot serve the model and :meth:`set_model` likewise refuses
+        to create an alias-less entry.
+
+        All affected rows are persisted in one transaction before memory is
+        changed.  A failed store write therefore leaves the complete in-memory
+        map untouched rather than applying only part of the scrub.
+        """
+        updated: dict[str, tuple[dict[str, str], tuple[str, ...]]] = {}
+        dropped: list[str] = []
+        for model, aliases in self._routes.items():
+            preference = self._preferences.get(model, ())
+            if provider not in aliases and provider not in preference:
+                continue
+            remaining = {
+                p: alias for p, alias in aliases.items() if p != provider
+            }
+            if not remaining:
+                dropped.append(model)
+                continue
+            updated[model] = (
+                remaining,
+                tuple(p for p in preference if p != provider),
+            )
+
+        if self._db is not None and (updated or dropped):
+            try:
+                for model in dropped:
+                    self._db.execute(
+                        "DELETE FROM model_map WHERE model = ?", (model,)
+                    )
+                for model, (aliases, preference) in updated.items():
+                    self._db.execute(
+                        "INSERT OR REPLACE INTO model_map "
+                        "(model, aliases, preference) VALUES (?, ?, ?)",
+                        (
+                            model,
+                            json.dumps(aliases),
+                            json.dumps(list(preference)) if preference else None,
+                        ),
+                    )
+                self._db.commit()
+            except sqlite3.Error:
+                self._db.rollback()
+                raise
+
+        for model in dropped:
+            del self._routes[model]
+            self._preferences.pop(model, None)
+        for model, (aliases, preference) in updated.items():
+            self._routes[model] = aliases
+            if preference:
+                self._preferences[model] = preference
+            else:
+                self._preferences.pop(model, None)
+        return len(updated), len(dropped)
+
     def load_from_config(
         self, config: dict[str, Any], *, overwrite: bool = False
     ) -> None:

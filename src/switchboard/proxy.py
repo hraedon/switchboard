@@ -1154,6 +1154,7 @@ class ProxyApp:
                         self._toml_provider_names,
                         self._toml_provider_sections,
                         self._cors_allow_origin,
+                        model_map_mgr=self._model_map_mgr,
                     )
                     return
                 await send_text(send, 405, "Method not allowed")
@@ -1596,17 +1597,20 @@ class ProxyApp:
             {a.name: a.signals for a in plan.assessments if a.signals},
         )
 
-        if acquired_provider != primary:
-            select_time = time.monotonic()
-            self._affinity[affinity_key] = RouteAffinity(
-                provider=acquired_provider,
-                selected_at=select_time,
-                failover_reason=plan.reason,
-            )
-            self._affinity.move_to_end(affinity_key)
-            self._evict_affinity()
-            self._metrics.record_affinity_pin()
-        elif pin_conversations and affinity is None:
+        # A failover target is only eligible for a new pin after it has
+        # actually served this request.  The usage-reroute path below follows
+        # the same rule; recording the selection here would pin a provider
+        # whose first connection can still fail.
+        initial_failover_provider = (
+            acquired_provider if acquired_provider != primary else None
+        )
+        initial_failover_served = False
+
+        if (
+            acquired_provider == primary
+            and pin_conversations
+            and affinity is None
+        ):
             # Conversation pinning (Plan 019 §6.4): pin the FIRST request to
             # whichever provider served it — including the primary — so the
             # conversation stays there until the provider drops.
@@ -1618,7 +1622,11 @@ class ProxyApp:
             )
             self._affinity.move_to_end(affinity_key)
             self._evict_affinity()
-        elif affinity is not None and affinity.provider != primary:
+        elif (
+            acquired_provider == primary
+            and affinity is not None
+            and affinity.provider != primary
+        ):
             # Note (cross-lineage review, N2): `primary` is the EFFECTIVE
             # primary since W2.3, so a model-map edit that changes which
             # provider is effective can pop a pin here and count a
@@ -1694,6 +1702,20 @@ class ProxyApp:
                     hold_seconds=None if forward_failed else hold_seconds,
                 )
 
+            # A provider can remain structurally FRESH+AVAILABLE after an
+            # individual request fails. Do not let that stale pin keep
+            # sending subsequent requests to the provider that just failed.
+            # RequestError is handled inside _forward so it can return a 502;
+            # its probe stamp is the transport-failure equivalent of the
+            # outer forward_failed branch.
+            if forward_failed or probe.transport_error:
+                current_affinity = self._affinity.get(affinity_key)
+                if (
+                    current_affinity is not None
+                    and current_affinity.provider == acquired_provider
+                ):
+                    self._affinity.pop(affinity_key, None)
+
             # Quarantine bookkeeping (Plan 023). Only failures attributable
             # to the PROVIDER count; a caller-caused failure would reproduce
             # on every provider, so counting it would walk the estate into
@@ -1746,6 +1768,17 @@ class ProxyApp:
                     and probe.status is not None
                     and probe.status not in self._reroute_statuses
                 )
+                if (
+                    initial_failover_provider is not None
+                    and acquired_provider == initial_failover_provider
+                    and rerouted_to is None
+                ):
+                    initial_failover_served = (
+                        not forward_failed
+                        and not probe.transport_error
+                        and probe.status is not None
+                        and 200 <= probe.status < 300
+                    )
                 if rerouted_to is not None and served and rerouted_to != primary:
                     # This attempt served. Re-pin so later requests in the
                     # conversation go straight here instead of repaying the
@@ -1828,6 +1861,16 @@ class ProxyApp:
             # stale-pin problem in a new place. The write happens after the
             # loop, once an attempt has succeeded.
             rerouted_to = next_provider
+
+        if initial_failover_provider is not None and initial_failover_served:
+            self._affinity[affinity_key] = RouteAffinity(
+                provider=initial_failover_provider,
+                selected_at=time.monotonic(),
+                failover_reason=plan.reason,
+            )
+            self._affinity.move_to_end(affinity_key)
+            self._evict_affinity()
+            self._metrics.record_affinity_pin()
 
         # Increment healthy observations on the affinity entry when a
         # failover provider served successfully (Plan 012 WI-C5).
@@ -2335,17 +2378,15 @@ class ProxyApp:
                 upstream_idle = False
                 disc_wait = asyncio.ensure_future(disconnect.wait())
 
-                # Token-budget observer (Plan 012 Feature B): read-only
-                # in-flight usage parsing.  Only instantiated when a budget
-                # is configured for this provider and the response is 2xx.
-                # Bytes forwarded to the client are never modified.
+                # Usage observer (Plan 012 Feature B / Plan 020 Wave 3):
+                # read-only in-flight usage parsing.  Instantiated for every
+                # 2xx provider response, regardless of whether a token budget
+                # is configured, so it can feed both the budget tracker (when
+                # present) and the speed sampler.  Bytes forwarded to the client
+                # are never modified.
                 observer: UsageObserver | None = None
                 non_sse_buf: bytearray | None = None
-                if (
-                    self._budget_tracker is not None
-                    and self._budget_tracker.has_budget(ctx.name)
-                    and 200 <= response.status_code < 300
-                ):
+                if 200 <= response.status_code < 300:
                     content_type = (
                         response.headers.get("content-type", "")
                         .lower()
@@ -2439,30 +2480,28 @@ class ProxyApp:
                     ):
                         ctx.reconcile.record_success()
 
-                    # Record observed usage into the budget tracker
-                    # (Plan 012 Feature B — read-only, best-effort).
-                    if (
-                        observer is not None
-                        and self._budget_tracker is not None
-                        and not disconnect.is_set()
-                    ):
+                    # Feed the observed usage into whichever consumers are
+                    # configured (Plan 012 Feature B / Plan 020 Wave 3 —
+                    # read-only, best-effort). The non-SSE body is fed to
+                    # the observer regardless of a budget tracker: the
+                    # speed sampler reads observer.usage below.
+                    if observer is not None and not disconnect.is_set():
                         if non_sse_buf is not None:
-                            observer.feed_non_streaming(
-                                bytes(non_sse_buf)
-                            )
-                        usage = observer.usage
-                        if usage is not None:
-                            self._budget_tracker.record_usage(
-                                ctx.name,
-                                usage[0],
-                                usage[1],
-                                now=time.monotonic(),
-                            )
+                            observer.feed_non_streaming(non_sse_buf)
+                        if self._budget_tracker is not None:
+                            usage = observer.usage
+                            if usage is not None:
+                                self._budget_tracker.record_usage(
+                                    ctx.name,
+                                    usage[0],
+                                    usage[1],
+                                    now=time.monotonic(),
+                                )
 
                     # Speed statistics (Plan 020 Wave 3): record TTFB +
                     # duration for every successful, fully-served response.
-                    # Completion tokens ride along only when the opt-in usage
-                    # observer already parsed them — no extra body reading.
+                    # Completion tokens ride along when the usage observer
+                    # parsed them — no extra body reading.
                     if (
                         self._speed_sampler is not None
                         and 200 <= response.status_code < 300
@@ -2558,6 +2597,13 @@ class ProxyApp:
         providers that configure a key. With none configured the client's
         headers pass through untouched, so a single-vendor deployment keeps
         full cache-transparency.
+
+        A non-empty ``auth_prefix`` is normalized here: if it does not already
+        end in whitespace, exactly one space is appended before the key. A
+        scheme glued to the key (``Bearer<key>``) is never a valid credential
+        and would be 401'd upstream, so any stored form — env, TOML, or GUI —
+        is repaired at this single choke point. An empty prefix stays empty:
+        some providers take the raw key with no scheme.
         """
         if not ctx.api_key:
             return headers
@@ -2567,6 +2613,8 @@ class ProxyApp:
         # have its Authorization forwarded intact — one vendor's key handed to
         # another, which is the exact leak this function exists to prevent.
         value = f"{ctx.auth_prefix}{ctx.api_key}"
+        if ctx.auth_prefix and not ctx.auth_prefix[-1].isspace():
+            value = f"{ctx.auth_prefix} {ctx.api_key}"
         out = [
             (k, v) for k, v in headers if k.lower() not in _CREDENTIAL_HEADERS
         ]
@@ -2631,4 +2679,3 @@ class ProxyApp:
                 and v.strip().lower().startswith(f"{SESSION_COOKIE}=")
             )
         ]
-
