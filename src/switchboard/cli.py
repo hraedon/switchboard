@@ -43,6 +43,8 @@ _DEFAULTS: dict[str, Any] = {
     "drain_timeout": 25.0,
     "route_table_store": None,
     "max_request_body_bytes": None,
+    "capabilities_discovery_interval": 21600.0,
+    "capabilities_max_age": 86400.0,
 }
 
 _LOG_LEVEL_CHOICES = ("DEBUG", "INFO", "WARNING", "ERROR")
@@ -672,6 +674,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="path to SQLite file for route table persistence (default: in-memory)",
     )
 
+    opencode_cfg = sub.add_parser(
+        "opencode-config",
+        help=(
+            "fetch the paste-ready OpenCode provider block from a running "
+            "switchboard and print it to stdout"
+        ),
+    )
+    opencode_cfg.add_argument(
+        "--url",
+        default="http://127.0.0.1:8801",
+        help="base URL of the running switchboard (default: %%(default)s)",
+    )
+
     return parser
 
 
@@ -710,9 +725,16 @@ def _build_serve_app(
     args: argparse.Namespace,
 ) -> tuple[Any, str, int, str, float]:
     """Build the ProxyApp + bind params from CLI args, env, and config file."""
+    from switchboard.capability_store import CapabilityStore
     from switchboard.config_store import ConfigStoreManager
     from switchboard.control import RoutingConfig
     from switchboard.estimator import ThresholdEstimator
+    from switchboard.model_capabilities import (
+        REASONING_FORMAT_EFFORT,
+        REASONING_FORMAT_OBJECT,
+        ModelCaps,
+    )
+    from switchboard.model_discovery import ModelDiscovery
     from switchboard.model_map import ModelMapManager
     from switchboard.overload import OverloadConfig
     from switchboard.providers import build_provider_contexts_from_config
@@ -1215,6 +1237,101 @@ def _build_serve_app(
                 cap_tokens=cap_tokens,
             )
 
+    # Model-capability contract subsystem (Plan 027). Advisory by design:
+    # discovery feeds the client catalog and the admin matrix, never a
+    # routing decision. The observations store rides the route table's
+    # SQLite connection like every other store; without one, observations
+    # live for the process and not across restarts.
+    capability_store = CapabilityStore(db=route_table.db)
+    discovery_interval = _resolve_float(
+        "capabilities_discovery_interval", args, config_data
+    )
+    if discovery_interval < 0:
+        raise _ConfigError(
+            "capabilities_discovery_interval must be >= 0 "
+            "(0 = manual refresh only)"
+        )
+    capabilities_max_age = _resolve_float(
+        "capabilities_max_age", args, config_data
+    )
+    if capabilities_max_age <= 0:
+        raise _ConfigError("capabilities_max_age must be > 0")
+    capabilities_section = config_data.get("capabilities", {})
+    if not isinstance(capabilities_section, dict):
+        raise _ConfigError("capabilities must be a table")
+    caps_models_section = capabilities_section.get("models", {})
+    if not isinstance(caps_models_section, dict):
+        raise _ConfigError("capabilities.models must be a table")
+    model_caps: dict[str, ModelCaps] = {}
+    for model_name, caps_raw in caps_models_section.items():
+        if not isinstance(caps_raw, dict):
+            raise _ConfigError(
+                f"capabilities.models.{model_name} must be a table"
+            )
+        caps_kwargs: dict[str, Any] = {}
+        for caps_key, caps_value in caps_raw.items():
+            if caps_key in ("context_limit", "input_limit", "output_limit"):
+                if (
+                    isinstance(caps_value, bool)
+                    or not isinstance(caps_value, int)
+                    or caps_value <= 0
+                ):
+                    raise _ConfigError(
+                        f"capabilities.models.{model_name}.{caps_key} "
+                        "must be a positive integer"
+                    )
+                caps_kwargs[caps_key] = caps_value
+            elif caps_key in (
+                "input_modalities",
+                "output_modalities",
+                "reasoning_levels",
+            ):
+                if not isinstance(caps_value, list) or not all(
+                    isinstance(s, str) and s for s in caps_value
+                ):
+                    raise _ConfigError(
+                        f"capabilities.models.{model_name}.{caps_key} "
+                        "must be a list of non-empty strings"
+                    )
+                caps_kwargs[caps_key] = tuple(caps_value)
+            elif caps_key in ("tool_calling", "reasoning"):
+                if not isinstance(caps_value, bool):
+                    raise _ConfigError(
+                        f"capabilities.models.{model_name}.{caps_key} "
+                        "must be a boolean"
+                    )
+                caps_kwargs[caps_key] = caps_value
+            elif caps_key == "reasoning_format":
+                if caps_value not in (
+                    REASONING_FORMAT_EFFORT,
+                    REASONING_FORMAT_OBJECT,
+                ):
+                    raise _ConfigError(
+                        f"capabilities.models.{model_name}.reasoning_format "
+                        f"must be '{REASONING_FORMAT_EFFORT}' or "
+                        f"'{REASONING_FORMAT_OBJECT}'"
+                    )
+                caps_kwargs[caps_key] = caps_value
+            else:
+                raise _ConfigError(
+                    f"capabilities.models.{model_name}: unknown field "
+                    f"'{caps_key}'"
+                )
+        model_caps[model_name] = ModelCaps(**caps_kwargs)
+    mapped_models = {m for m, _ in model_map_mgr.list_models()}
+    for cap_model in model_caps:
+        if cap_model not in mapped_models:
+            # Not an error: the map grows at runtime via the GUI. The cap
+            # is inert until the model gets mapped.
+            log.warning(
+                "capabilities.models.%s: not in the model map — the cap "
+                "has no effect until the model is mapped",
+                cap_model,
+            )
+    model_discovery = ModelDiscovery(
+        store=capability_store, interval_s=discovery_interval
+    )
+
     # Boot TOML sections, threaded to the admin layer for the D1 tombstone
     # and /admin/config/effective paths. They may carry an inline api_key;
     # every serialization surface masks them.
@@ -1314,6 +1431,10 @@ def _build_serve_app(
         env_field_sources=env_field_sources,
         unmatched_env=unmatched_env,
         route_key_secrets=route_key_secrets,
+        capability_store=capability_store,
+        model_discovery=model_discovery,
+        model_caps=model_caps,
+        capabilities_max_age=capabilities_max_age,
     )
 
     store_backed = {
@@ -1370,6 +1491,14 @@ def _build_serve_app(
             "  model_map:         %d model(s)",
             len(model_map_mgr.list_models()),
         )
+    if model_caps:
+        log.info(
+            "  capabilities:      %d cap model(s), discovery every %gs, "
+            "max_age %gs",
+            len(model_caps),
+            discovery_interval,
+            capabilities_max_age,
+        )
     if overload_config is not None:
         log.info("  overload:          threshold=%d", overload_config.threshold)
     if estimator is not None:
@@ -1423,6 +1552,40 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_opencode_config(args: argparse.Namespace) -> int:
+    """``switchboard opencode-config`` — the local-sync surface.
+
+    Fetches ``GET /admin/client-config/opencode`` from a running instance
+    and prints the JSON to stdout, so a machine can regenerate its OpenCode
+    provider block after any discovery refresh. The admin token comes from
+    ``SWITCHBOARD_ADMIN_TOKEN`` only — never a flag, so it cannot end up in
+    shell history or a process listing.
+    """
+    import httpx
+
+    base = str(args.url).rstrip("/")
+    token = os.environ.get(f"{_ENV_PREFIX}ADMIN_TOKEN")
+    headers = {"authorization": f"Bearer {token}"} if token else {}
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(
+                f"{base}/admin/client-config/opencode", headers=headers
+            )
+    except httpx.HTTPError as exc:
+        print(f"switchboard: error: request failed: {exc}", file=sys.stderr)
+        return 1
+    if response.status_code != 200:
+        print(
+            f"switchboard: error: {response.status_code} from "
+            f"{base}/admin/client-config/opencode: "
+            f"{response.text[:200]}",
+            file=sys.stderr,
+        )
+        return 1
+    print(response.text)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -1431,6 +1594,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "serve":
         return _cmd_serve(args)
+    if args.command == "opencode-config":
+        return _cmd_opencode_config(args)
     build_parser().print_help()
     return 0
 

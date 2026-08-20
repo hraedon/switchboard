@@ -44,6 +44,7 @@ from typing import Any
 import httpx
 
 from switchboard.admin import (
+    handle_client_config_opencode,
     handle_config_effective,
     handle_config_get,
     handle_config_reset,
@@ -51,6 +52,8 @@ from switchboard.admin import (
     handle_login_get,
     handle_login_post,
     handle_logout,
+    handle_model_capabilities,
+    handle_model_capabilities_refresh,
     handle_model_map_delete,
     handle_model_map_list,
     handle_model_map_set,
@@ -80,6 +83,7 @@ from switchboard.admin import (
     send_status_json,
     serve_static,
 )
+from switchboard.capability_store import CapabilityStore
 from switchboard.config_store import ConfigStoreManager
 from switchboard.control import (
     DEFAULT_REROUTE_STATUSES,
@@ -92,6 +96,7 @@ from switchboard.control import (
     SignalFreshness,
     classify_failure,
     compose_upstream_path,
+    credential_value,
     extract_conversation_fingerprint,
     hash_route_key,
     route_decision,
@@ -99,6 +104,17 @@ from switchboard.control import (
 )
 from switchboard.estimator import ThresholdEstimator
 from switchboard.limit import RETRY_AFTER_SHORT
+from switchboard.model_capabilities import (
+    ModelCaps,
+    ModelContract,
+    ModelObservation,
+    compute_contract,
+    render_client_models,
+)
+from switchboard.model_discovery import (
+    ModelDiscovery,
+    config_fingerprint,
+)
 from switchboard.model_map import ModelMapManager
 from switchboard.overload import OverloadConfig, OverloadTracker
 from switchboard.provider_manager import ProviderManager
@@ -156,7 +172,11 @@ def _extract_model(body: bytes) -> str | None:
     """Extract the top-level ``model`` field from a JSON request body."""
     try:
         data = json.loads(body)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError: deeply-nested JSON (e.g. 300k nested arrays) is
+        # valid syntax that overflows the parser — catch it like
+        # extract_conversation_fingerprint so a crafted body cannot crash
+        # the request path. Returns None (no model rewrite), never raises.
         return None
     if isinstance(data, dict):
         model = data.get("model")
@@ -485,6 +505,17 @@ class ProxyApp:
         env_field_sources: dict[str, dict[str, str]] | None = None,
         unmatched_env: list[str] | None = None,
         route_key_secrets: tuple[str, ...] = (),
+        # Plan 027 — the model-capability contract subsystem.
+        # ``capability_store`` persists the discovery observations (None =
+        # discovery surfaces report no evidence; /v1/models still synthesizes
+        # the deterministic id list, with no capability fields).
+        # ``model_discovery`` is the periodic runner (None = no background
+        # discovery; the manual refresh endpoint answers 409). ``model_caps``
+        # are the operator-declared per-model ceilings from the config.
+        capability_store: CapabilityStore | None = None,
+        model_discovery: ModelDiscovery | None = None,
+        model_caps: dict[str, ModelCaps] | None = None,
+        capabilities_max_age: float = 86400.0,
     ) -> None:
         self._provider_manager = ProviderManager(
             providers, drain_timeout=drain_timeout
@@ -548,6 +579,12 @@ class ProxyApp:
         self._draining = False
         self._affinity: OrderedDict[str, RouteAffinity] = OrderedDict()
         self._provider_healthy_since: dict[str, float] = {}
+        # Plan 027 — model-capability contract subsystem (advisory: feeds the
+        # client catalog and admin matrix, never a routing decision).
+        self._capability_store = capability_store
+        self._model_discovery = model_discovery
+        self._model_caps: dict[str, ModelCaps] = dict(model_caps or {})
+        self._capabilities_max_age = capabilities_max_age
 
     @property
     def _providers(self) -> dict[str, ProviderContext]:
@@ -732,16 +769,19 @@ class ProxyApp:
             method == "OPTIONS"
             and self._cors_allow_origin is not None
             and (
-                path in (
-                    "/", "/status.json", "/metrics",
-                    "/admin/routes", "/admin/config",
-                    "/admin/config/effective", "/admin/config/reset",
-                    "/admin/config/routing",
-                    "/admin/model-map", "/admin/providers",
-                    "/admin/preview-path", "/admin/route-plan",
-                    "/admin/threshold-events", "/admin/usage-history",
-                    "/login", "/logout",
-                )
+                    path in (
+                        "/", "/status.json", "/metrics",
+                        "/admin/routes", "/admin/config",
+                        "/admin/config/effective", "/admin/config/reset",
+                        "/admin/config/routing",
+                        "/admin/model-map", "/admin/providers",
+                        "/admin/model-capabilities",
+                        "/admin/model-capabilities/refresh",
+                        "/admin/preview-path", "/admin/route-plan",
+                        "/admin/threshold-events", "/admin/usage-history",
+                        "/admin/client-config/opencode",
+                        "/login", "/logout",
+                    )
                 or (
                     path == "/admin/routes/default"
                 )
@@ -931,6 +971,41 @@ class ProxyApp:
             await handle_model_map_delete(
                 send, self._model_map_mgr, self._admin_token,
                 scope, model_name, self._cors_allow_origin,
+            )
+            return
+
+        # Plan 027 W3 — the model-capability contract surfaces. Auth lives
+        # inside the handlers (like /admin/model-map GET); the matrix is a
+        # read (no CSRF), the refresh is an explicit probe trigger (auth +
+        # CSRF, like the provider test/models endpoints).
+        if path == "/admin/model-capabilities" and method == "GET":
+            await handle_model_capabilities(
+                send, self._model_map_mgr, self._capability_store,
+                self._admin_token, scope, self._cors_allow_origin,
+                providers=self._providers,
+                model_caps=self._model_caps or None,
+                max_age=self._capabilities_max_age,
+            )
+            return
+
+        if path == "/admin/model-capabilities/refresh" and method == "POST":
+            await handle_model_capabilities_refresh(
+                send, self._model_discovery, self._admin_token,
+                scope, self._cors_allow_origin,
+                providers=self._providers,
+            )
+            return
+
+        if path == "/admin/client-config/opencode":
+            if method != "GET":
+                await send_text(send, 405, "Method not allowed")
+                return
+            await handle_client_config_opencode(
+                send, self._model_map_mgr, self._capability_store,
+                self._admin_token, scope, self._cors_allow_origin,
+                providers=self._providers,
+                model_caps=self._model_caps or None,
+                max_age=self._capabilities_max_age,
             )
             return
 
@@ -1160,12 +1235,26 @@ class ProxyApp:
                 await send_text(send, 405, "Method not allowed")
                 return
 
+        # Plan 027 W4 (resolves WI-009): the client's model catalog is a
+        # synthesized control-plane answer — deterministic, route-scoped,
+        # metadata-bearing — instead of forwarding to whichever provider
+        # wins admission. _serve_synthesized_models returns False when the
+        # model map is empty (feature off) and the request falls through to
+        # normal routing exactly as before. Reads no body, forwards nothing.
+        if (
+            method == "GET"
+            and path in ("/models", "/v1/models")
+            and await self._serve_synthesized_models(scope, send)
+        ):
+            return
+
         await self._proxy_request(scope, receive, send)
 
     async def _handle_lifespan(self, receive: Receive, send: Send) -> None:
         """ASGI lifespan: start/stop all reconcile loops, drain, close clients."""
         prune_task: asyncio.Task[None] | None = None
         usage_history_task: asyncio.Task[None] | None = None
+        discovery_task: asyncio.Task[None] | None = None
         while True:
             event = await receive()
             if event["type"] == "lifespan.startup":
@@ -1178,6 +1267,18 @@ class ProxyApp:
                 if self._usage_history_tracker is not None:
                     usage_history_task = asyncio.create_task(
                         self._usage_history_loop()
+                    )
+                # Plan 027 W3 — periodic model discovery, only when a store
+                # is wired AND the operator set a positive interval. An
+                # interval of 0 means "manual refresh only", so no background
+                # wave of upstream requests.
+                if (
+                    self._model_discovery is not None
+                    and self._model_discovery.interval > 0
+                    and self._capability_store is not None
+                ):
+                    discovery_task = asyncio.create_task(
+                        self._capabilities_discovery_loop()
                     )
                 await send({"type": "lifespan.startup.complete"})
             elif event["type"] == "lifespan.shutdown":
@@ -1194,6 +1295,12 @@ class ProxyApp:
                         asyncio.CancelledError, Exception
                     ):
                         await usage_history_task
+                if discovery_task is not None:
+                    discovery_task.cancel()
+                    with contextlib.suppress(
+                        asyncio.CancelledError, Exception
+                    ):
+                        await discovery_task
                 for ctx in self._providers.values():
                     await ctx.reconcile.stop()
                 if self._drain_timeout > 0:
@@ -1273,6 +1380,101 @@ class ProxyApp:
                 raise
             except Exception:
                 log.warning("usage-history refresh failed", exc_info=True)
+
+    async def _capabilities_discovery_loop(self) -> None:
+        """Periodic model discovery (Plan 027 W3).
+
+        A 60 s tick; the runner itself throttles to the configured interval
+        (and is a no-op while a probe wave is still in flight), so the tick
+        costs nothing between runs. Advisory: a failed wave leaves the
+        stored observations to age out on their own — discovery degrades the
+        guarantee level of the client catalog, never a routing decision.
+        """
+        while True:
+            try:
+                await asyncio.sleep(60)
+                if self._model_discovery is not None:
+                    await self._model_discovery.refresh(self._providers)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("model discovery refresh failed", exc_info=True)
+
+    async def _serve_synthesized_models(
+        self, scope: Scope, send: Send
+    ) -> bool:
+        """Plan 027 W4 — the synthesized, route-specific ``GET /v1/models``.
+
+        Resolves WI-009: the client's model catalog is answerable from
+        switchboard's own state — the operator's model map is the configured
+        model set, and the route key's candidate set scopes what this
+        caller's providers can serve — so it must not depend on whichever
+        provider happens to win admission (nondeterministic answer, raw
+        upstream aliases, and internal routing choices leaking to the
+        client).
+
+        Inert-in-path exception (4), per AGENTS.md: reads no request body,
+        sends a control-plane body, and forwards nothing. Deterministic for
+        a given (model map, route, stored observations).
+
+        Returns True when the request was answered; False when the model
+        map is empty (feature off) and the caller should fall through to
+        normal routing, exactly as before Plan 027.
+        """
+        model_map = self._model_map_mgr.get_model_map()
+        if not model_map.routes:
+            return False
+
+        raw_key = _extract_route_key(scope)
+        candidates, _hashed = self._match_route(raw_key)
+        now = time.time()
+        fps = {
+            name: config_fingerprint(ctx)
+            for name, ctx in self._providers.items()
+        }
+
+        contracts: list[ModelContract] = []
+        for model in sorted(model_map.routes):
+            # Participants = the caller's candidates that hold an alias for
+            # this model AND are live. A keyed route scoped to one backend
+            # therefore sees only what its own set can serve; a mapped model
+            # none of them hold is omitted, not forwarded somewhere.
+            participants = tuple(
+                sorted(
+                    p
+                    for p in model_map.providers_for(model)
+                    if p in candidates and p in self._providers
+                )
+            )
+            if not participants:
+                continue
+            observations: dict[str, ModelObservation | None] = {}
+            for provider in participants:
+                alias = model_map.alias_for(model, provider) or ""
+                observations[provider] = (
+                    self._capability_store.for_alias(provider, alias)
+                    if self._capability_store is not None
+                    else None
+                )
+            contracts.append(
+                compute_contract(
+                    model,
+                    participants,
+                    observations,
+                    self._model_caps.get(model),
+                    now=now,
+                    max_age=self._capabilities_max_age,
+                    current_fingerprints=fps,
+                )
+            )
+
+        await send_json(
+            send,
+            200,
+            render_client_models(tuple(contracts)),
+            extra_headers=[(b"cache-control", b"private, no-store")],
+        )
+        return True
 
     async def _proxy_request(
         self, scope: Scope, receive: Receive, send: Send
@@ -2612,9 +2814,9 @@ class ProxyApp:
         # sending `Authorization` to a provider that wants `x-api-key` would
         # have its Authorization forwarded intact — one vendor's key handed to
         # another, which is the exact leak this function exists to prevent.
-        value = f"{ctx.auth_prefix}{ctx.api_key}"
-        if ctx.auth_prefix and not ctx.auth_prefix[-1].isspace():
-            value = f"{ctx.auth_prefix} {ctx.api_key}"
+        # The prefix normalization lives in the pure core (Plan 027 W1) so the
+        # admin discovery probes send byte-identical credentials.
+        value = credential_value(ctx.auth_prefix, ctx.api_key)
         out = [
             (k, v) for k, v in headers if k.lower() not in _CREDENTIAL_HEADERS
         ]

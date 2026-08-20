@@ -21,7 +21,8 @@ gates and decides which upstream provider receives each request.
   selected upstream. It **never reads, logs, stores, or rewrites request/response
   bodies.** It routes and streams bytes through untouched. Same guarantee as
   sluice, applied per-upstream-path. *(Exceptions, each narrow and
-  read-bounded (1 and 3 also opt-in via config):
+  read-bounded (1, 3, and 4 are opt-in via config; 4 is a control-plane
+  generation exception, not a body read):
   (1) when a `[model]` map is configured, switchboard MAY read the request
   body's top-level `model` field and MAY rewrite only that field for the
   fallback path — Plan 010. No other field is read or altered. (2) When a 2xx
@@ -35,6 +36,14 @@ gates and decides which upstream provider receives each request.
   affinity — Plan 019. No other field is read; body bytes forwarded are
   unchanged; a finite `max_request_body_bytes` is required. This exception
   composes with (1) — each reads only its own field.
+  (4) When the `[model]` map is non-empty, switchboard MAY answer a client
+  `GET` on `/models` or `/v1/models` directly — synthesizing a canonical,
+  deterministic catalog from the route's candidate set, the model map, and
+  stored capability observations — instead of forwarding it to an upstream.
+  Plan 027. It reads no request body (it is a body-less GET), forwards nothing
+  to any upstream, and emits no provider names or credentials. This is a
+  switchboard-owned control-plane response, not a rewrite of in-flight upstream
+  traffic; all proxied traffic remains inert.
   Response bodies are fully inert when none of the exceptions apply.)*
 - **Cache-transparency — indistinguishable from a direct client per upstream.**
   The request switchboard egresses to each upstream must be byte-for-byte what

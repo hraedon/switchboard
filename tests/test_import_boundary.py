@@ -116,7 +116,15 @@ def test_pure_modules_import_stdlib_only() -> None:
     another switchboard submodule (the shell imports the core one-way).
     """
     root = Path(__file__).resolve().parent.parent / "src" / "switchboard"
-    pure_modules = ("control", "limit", "overload", "threshold", "budget", "speed")
+    pure_modules = (
+        "control",
+        "limit",
+        "overload",
+        "threshold",
+        "budget",
+        "speed",
+        "model_capabilities",
+    )
     forbidden_prefixes = ("httpx", "sluice", "switchboard")
     for mod_name in pure_modules:
         src = (root / f"{mod_name}.py").read_text()

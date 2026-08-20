@@ -899,7 +899,12 @@ function renderModelAdd(data) {
     renderModelAddForm(known);
   };
   const scanBtn = document.getElementById('scan-match-btn');
-  if (scanBtn) scanBtn.onclick = () => runAutoMatchScan(known, definedModels, mm);
+  // model_preferences (Plan 026 W3) rides alongside model_map in
+  // status.json; the scan needs it so applyAutoMatch can carry an existing
+  // preference back on its add-or-replace POST (omitting it clears the
+  // preference server-side — the exact data-loss bug this fix closes).
+  const mpref = (data && data.model_preferences) || {};
+  if (scanBtn) scanBtn.onclick = () => runAutoMatchScan(known, definedModels, mm, mpref);
 }
 
 // Plan 024 — fetch a provider's enumerated models for the datalist. Cached
@@ -1130,7 +1135,7 @@ function renderModelAddForm(knownProviders, editModelName, editAliases, editPref
 // a poll landing mid-scan would detach statusEl/outEl and the results
 // would render into nodes no longer on the page) until the operator
 // dismisses the results.
-async function runAutoMatchScan(providers, definedModels, currentMap) {
+async function runAutoMatchScan(providers, definedModels, currentMap, currentPrefs) {
   const statusEl = document.getElementById('scan-match-status');
   const outEl = document.getElementById('scan-match-results');
   if (!outEl) return;
@@ -1183,7 +1188,8 @@ async function runAutoMatchScan(providers, definedModels, currentMap) {
   outEl.innerHTML = html + _scanDismissHtml();
   offers.forEach((o, i) => {
     const b = document.getElementById('mf-am-' + i);
-    if (b) b.onclick = () => applyAutoMatch(o, currentMap, 'mf-am-' + i);
+    if (b) b.onclick = () =>
+      applyAutoMatch(o, currentMap, 'mf-am-' + i, currentPrefs || {});
   });
   _wireScanDismiss();
 }
@@ -1197,13 +1203,21 @@ function _wireScanDismiss() {
   if (d) d.onclick = () => { scanPinned = false; load(); };
 }
 
-async function applyAutoMatch(offer, currentMap, btnId) {
+async function applyAutoMatch(offer, currentMap, btnId, currentPrefs) {
   // Finding #2 fix: re-read the CURRENT model-map state before merging, so an
-  // alias added between the last load() and this click is not silently dropped.
-  // The model-map POST replaces the whole alias set, so a stale snapshot would
-  // overwrite a concurrent add. currentMap is kept only as a fallback if the
-  // re-read fails (better to apply with slightly-stale data than to refuse).
+  // alias added between the last load() and this click is not silently
+  // dropped. The model-map POST replaces the whole entry, so a stale snapshot
+  // would overwrite a concurrent add. currentMap / currentPrefs are kept only
+  // as a fallback if the re-read fails (better to apply with slightly-stale
+  // data than to refuse).
+  // Plan 027: the same add-or-replace POST carries the preference back.
+  // Omitting `preference` clears the stored one server-side, so a one-click
+  // alias add must round-trip the model's existing preference order — read
+  // from the re-fetched entry, falling back to the status.json snapshot.
   let existing = Object.assign({}, currentMap[offer.model] || {});
+  let preference = Array.isArray((currentPrefs || {})[offer.model])
+    ? (currentPrefs || {})[offer.model].slice()
+    : [];
   try {
     const resp = await fetch('/admin/model-map', { credentials: 'same-origin' });
     if (resp.ok) {
@@ -1213,16 +1227,23 @@ async function applyAutoMatch(offer, currentMap, btnId) {
       );
       if (entry && entry.aliases) {
         existing = Object.assign({}, entry.aliases);
+        preference = Array.isArray(entry.preference) ? entry.preference.slice() : [];
       }
     }
-  } catch (e) { /* fall back to currentMap snapshot */ }
+  } catch (e) { /* fall back to currentMap/currentPrefs snapshots */ }
   existing[offer.provider] = offer.alias;
+  // The preference is only valid relative to the aliases being posted (the
+  // server validates the same rule); keep the entries that still have an
+  // alias here. A new provider can never be in the existing preference.
+  const kept = preference.filter(p => p in existing);
   try {
+    const payload = { model: offer.model, aliases: existing };
+    if (kept.length) payload.preference = kept;
     const resp = await fetch('/admin/model-map', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       credentials: 'same-origin',
-      body: JSON.stringify({ model: offer.model, aliases: existing }),
+      body: JSON.stringify(payload),
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) { alert(data.error || ('HTTP ' + resp.status)); return; }

@@ -461,7 +461,89 @@ bounded by the candidate count inside a ring already bounded at 128, and is
 omitted entirely on an unremarkable decision, so existing consumers see exactly
 the three keys they always did.
 
-## 9. What switchboard deliberately does not model
+## 9. Model capability contract and synthesized /v1/models (Plan 027)
+
+`GET /models` and `GET /v1/models` used to fall through to normal admission:
+the client saw whichever provider won the moment, with that provider's raw
+aliases and metadata — nondeterministic, provider-specific, and a leak of the
+internal candidate set (WI-009). The fix is not to annotate one upstream's
+answer: the metadata a client needs is a property of the **`(logical_model,
+provider)` pair across the whole failover set**, so the unit is a
+**model contract** — what is *guaranteed* for a logical model over its
+failover set, computed conservatively and exposed separately from what is
+merely *observed*.
+
+**Participants.** For a route, a model's participants are
+`route candidates ∩ model_map.providers_for(model) ∩ live providers`. A
+participant counts into the contract **even while its gate is closed**: a
+temporarily-down provider returns, and the compatibility contract must already
+cover it. Freshness — not health — is the only thing that can stop a
+participant certifying a field. Models with no participant on the route are
+omitted (a key scoped to one backend sees only what that route can serve).
+
+**Observations and the pure core.** Discovery (`model_discovery`) probes the
+canonical parity URL — `compose_upstream_path(upstream_url, "/v1/models")`,
+the same composition as live egress — with parity credentials
+(`control.credential_value`, the same normalization the egress choke point
+applies), streaming with a 4 MiB body cap. Each listing is parsed by a pure
+normalizer (`model_capabilities.parse_model_listing`) into one
+`ModelObservation` per model: OpenAI base shape (IDs only), vLLM
+(`max_model_len`), LiteLLM (`max_input_tokens`/`max_output_tokens`),
+OpenRouter (context/completion limits, modalities, `supported_parameters`
+including the *exact* reasoning wire encoding). Nothing is inferred from model
+names; a field the shape does not carry stays unknown. Observations persist in
+the shared SQLite file (`capability_store`, one row per `(provider, alias)`,
+freshest wins, with `observed_at` and a provider-config fingerprint so a config
+change reads as stale evidence).
+
+**`compute_contract` (pure).** The LCD over the participants, per field:
+numeric limits → minimum; modality/parameter sets → intersection; booleans →
+three-valued AND; reasoning **levels** → intersection *only when every known
+participant uses the same wire encoding* (`reasoning_effort` vs the
+`reasoning` object) at those levels — otherwise no levels are advertised and
+the divergence is flagged (body translation is prohibited, so a divergent
+provider cannot be coerced; the choices are to advertise the intersection,
+flag it, or drop it from the failover set). Missing/stale participants make
+the affected field not-guaranteed — the observed value stays visible to the
+operator but is never handed to clients as a promise. Each result field carries
+its **source**: `verified`, `capped` (operator cap below observed),
+`declared` (cap filling a gap the providers never reported), or `observed`.
+An operator cap set *above* an observed limit is clamped to the observed value
+and reported as a **deviation** — a declared value above reality is a lie the
+operator will hit on the wire.
+
+**Surfaces.**
+
+- `GET /models` / `GET /v1/models` — synthesized only when the model map is
+  non-empty (empty map = feature off, byte-identical fall-through to normal
+  routing, per ModelMap semantics). Canonical model IDs, deterministic order,
+  guaranteed-only metadata in an `x-switchboard` block,
+  `owned_by: "switchboard"`, `Cache-Control: private, no-store`. No provider
+  names, no credentials, no request body read, nothing forwarded. This is a
+  switchboard-owned **control-plane exception** to in-path inertness
+  (AGENTS.md exception 4); generation responses remain byte-inert.
+- `GET /admin/model-capabilities` — the estate matrix: per model, per
+  participant, freshness / fingerprint match / observed values; the contract
+  with per-field sources, deviations, and the reasoning-advertisement decision.
+- `POST /admin/model-capabilities/refresh` — operator-triggered discovery
+  (auth + CSRF gated like the other probe endpoints).
+- `GET /admin/client-config/opencode` + `switchboard opencode-config` — the
+  OpenCode adapter over the estate-wide contracts: verified limits only,
+  `reasoning` only when verified, named variants only for verified levels in
+  the verified wire format, `baseURL` from the request Host, and an explicit
+  `apiKey` *placeholder* — switchboard never mints a route key into a document
+  that may be pasted somewhere.
+
+**Invariants.** Discovery is **advisory**: the contract shapes what clients
+are told, never which providers are served (routing-enforcement of contracts
+is a separate opt-in plan on the same core). Unknown data never maps to a
+value; it maps to absence of a guarantee. The answer is deterministic for a
+given (model map, route, stored observations) — it no longer depends on who
+won admission. Config: `[capabilities]` `discovery_interval` (default 6 h;
+`0` = manual only) and `max_age` (default 24 h), plus per-model operator caps
+under `[capabilities.models."<name>"]` (TOML-only in this plan).
+
+## 10. What switchboard deliberately does not model
 
 - **Cost.** switchboard routes on provider availability, not monetary cost.
 - **Request/response format translation.** Both upstreams must speak the same

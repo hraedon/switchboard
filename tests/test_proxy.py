@@ -108,6 +108,9 @@ def _make_app(
     admin_token: str | None = None,
     default_providers: tuple[str, ...] = ("test",),
     model_map_mgr: ModelMapManager | None = None,
+    capability_store: object | None = None,
+    model_discovery: object | None = None,
+    model_caps: dict | None = None,
 ) -> ProxyApp:
     if providers is None:
         providers = {"test": _make_provider_context()}
@@ -118,6 +121,9 @@ def _make_app(
         routing_config=RoutingConfig(),
         admin_token=admin_token,
         model_map_mgr=model_map_mgr,
+        capability_store=capability_store,  # type: ignore[arg-type]
+        model_discovery=model_discovery,  # type: ignore[arg-type]
+        model_caps=model_caps,  # type: ignore[arg-type]
     )
 
 
@@ -756,6 +762,14 @@ def test_extract_model_non_json_returns_none() -> None:
     assert _extract_model(b"") is None
 
 
+def test_extract_model_deeply_nested_returns_none() -> None:
+    # 300k nested arrays is valid JSON that overflows the parser's recursion
+    # limit; the request path must treat it like any other parse failure
+    # (no model rewrite) and never raise.
+    body = b"[" * 300000 + b"]" * 300000
+    assert _extract_model(body) is None
+
+
 def test_extract_model_non_string_returns_none() -> None:
     body = b'{"model": 123}'
     assert _extract_model(body) is None
@@ -874,3 +888,336 @@ async def test_chunked_body_over_limit_returns_413_pre_upstream() -> None:
     await app(scope, receive, send)
     status, _body, _ = _parse_response(messages)
     assert status == 413
+
+
+# ── Plan 027: synthesized /v1/models + capability admin surfaces ─────────────
+
+
+def _cap_obs(
+    provider: str, alias: str, observed_at: float, **kw
+):
+    from switchboard.model_capabilities import ModelObservation
+
+    base: dict = dict(provider=provider, alias=alias, observed_at=observed_at)
+    base.update(kw)
+    return ModelObservation(**base)
+
+
+def _cap_store() -> object:
+    import time
+
+    from switchboard.capability_store import CapabilityStore
+    from switchboard.model_capabilities import TriState
+
+    store = CapabilityStore()
+    now = time.time()
+    store.upsert(
+        "a",
+        [
+            _cap_obs(
+                "a", "glm-a", now,
+                context_limit=131072, tool_calling=TriState.TRUE,
+            ),
+            _cap_obs("a", "y-a", now, context_limit=64000),
+        ],
+    )
+    store.upsert(
+        "b",
+        [_cap_obs(
+            "b", "glm-b", now,
+            context_limit=131072, tool_calling=TriState.TRUE,
+        ),
+        ],
+    )
+    return store
+
+
+def _cap_map_mgr() -> ModelMapManager:
+    mgr = ModelMapManager()
+    mgr.set_model("glm", {"a": "glm-a", "b": "glm-b"})
+    mgr.set_model("y-only-b", {"b": "y-b"})
+    return mgr
+
+
+@pytest.mark.asyncio
+async def test_synthesized_models_catalog_deterministic_and_leak_free() -> None:
+    ctx_a = _make_provider_context("a", capacity=1)
+    ctx_b = _make_provider_context("b", capacity=1)
+    app = _make_app(
+        providers={"a": ctx_a, "b": ctx_b},
+        default_providers=("a", "b"),
+        model_map_mgr=_cap_map_mgr(),
+        capability_store=_cap_store(),
+    )
+    scope = _make_scope(method="GET", path="/v1/models")
+    messages, send = _make_send()
+    await app(scope, _MockReceive(), send)
+    status, body, headers = _parse_response(messages)
+    assert status == 200
+    doc = __import__("json").loads(body)
+    assert doc["object"] == "list"
+    assert [d["id"] for d in doc["data"]] == ["glm", "y-only-b"]
+    by_id = {d["id"]: d for d in doc["data"]}
+    x = by_id["glm"]["x-switchboard"]
+    assert x["context_limit"] == 131072
+    assert x["tool_calling"] is True
+    assert x["guaranteed"] is True
+    # y-only-b: one participant certifies → observed, not guaranteed → the
+    # value is not publishable as a promise.
+    assert "x-switchboard" not in by_id["y-only-b"]
+    cc = [v for k, v in headers if k == b"cache-control"]
+    assert cc == [b"private, no-store"]
+    # No provider name or per-provider alias leaks to the client.
+    text = body.decode()
+    assert "glm-a" not in text
+    assert "glm-b" not in text
+    assert "y-a" not in text
+    assert '"provider"' not in text
+    # Deterministic: a second call renders the identical bytes.
+    messages2, send2 = _make_send()
+    await app(scope, _MockReceive(), send2)
+    _status, body2, _ = _parse_response(messages2)
+    assert body2 == body
+    await ctx_a.http_client.aclose()
+    await ctx_b.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_synthesized_models_route_scoped_to_keyed_candidates() -> None:
+    ctx_a = _make_provider_context("a", capacity=1)
+    ctx_b = _make_provider_context("b", capacity=1)
+    app = _make_app(
+        providers={"a": ctx_a, "b": ctx_b},
+        default_providers=("a", "b"),
+        model_map_mgr=_cap_map_mgr(),
+        capability_store=_cap_store(),
+    )
+    from switchboard.control import hash_route_key
+
+    # A key scoped to provider "a" must not see "y-only-b" (b-only model).
+    app._route_table.add_entry(hash_route_key("sk-only-a"), ["a"])
+    scope = _make_scope(
+        method="GET",
+        path="/v1/models",
+        headers=[(b"authorization", b"Bearer sk-only-a")],
+    )
+    messages, send = _make_send()
+    await app(scope, _MockReceive(), send)
+    status, body, _ = _parse_response(messages)
+    assert status == 200
+    doc = __import__("json").loads(body)
+    assert [d["id"] for d in doc["data"]] == ["glm"]
+    # From this key's viewpoint "a" is glm's only provider: its single fresh
+    # certification is a guarantee for THIS route.
+    x = doc["data"][0]["x-switchboard"]
+    assert x["context_limit"] == 131072
+    assert x["guaranteed"] is True
+    await ctx_a.http_client.aclose()
+    await ctx_b.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_models_empty_map_falls_through_to_routing() -> None:
+    # Empty model map = feature off: the request is NOT short-circuited into
+    # a synthesized catalog — it reaches normal routing, where the fresh
+    # (not-yet-admitting) test provider answers the fail-safe 503. A
+    # wrongly-synthesized catalog would have answered 200.
+    app = _make_app()
+    scope = _make_scope(method="GET", path="/models")
+    messages, send = _make_send()
+    await app(scope, _MockReceive(), send)
+    status, body, _ = _parse_response(messages)
+    assert status == 503
+    assert b"concurrency limit reached" in body
+    # Same behavior on the /v1/ spelled variant.
+    messages, send = _make_send()
+    await app(
+        _make_scope(method="GET", path="/v1/models"), _MockReceive(), send
+    )
+    status, _, _ = _parse_response(messages)
+    assert status == 503
+
+
+@pytest.mark.asyncio
+async def test_models_map_without_store_lists_ids_only() -> None:
+    ctx_a = _make_provider_context("a", capacity=1)
+    ctx_b = _make_provider_context("b", capacity=1)
+    app = _make_app(
+        providers={"a": ctx_a, "b": ctx_b},
+        default_providers=("a", "b"),
+        model_map_mgr=_cap_map_mgr(),
+    )
+    scope = _make_scope(method="GET", path="/v1/models")
+    messages, send = _make_send()
+    await app(scope, _MockReceive(), send)
+    status, body, _ = _parse_response(messages)
+    assert status == 200
+    doc = __import__("json").loads(body)
+    assert [d["id"] for d in doc["data"]] == ["glm", "y-only-b"]
+    assert all("x-switchboard" not in d for d in doc["data"])
+    await ctx_a.http_client.aclose()
+    await ctx_b.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_admin_model_capabilities_auth_and_shape() -> None:
+    import time
+
+    ctx_a = _make_provider_context("a", capacity=1)
+    ctx_b = _make_provider_context("b", capacity=1)
+    store = _cap_store()
+    app = _make_app(
+        providers={"a": ctx_a, "b": ctx_b},
+        default_providers=("a", "b"),
+        admin_token="secret",
+        model_map_mgr=_cap_map_mgr(),
+        capability_store=store,
+    )
+    # Unauthenticated → 403.
+    messages, send = _make_send()
+    await app(
+        _make_scope(method="GET", path="/admin/model-capabilities"),
+        _MockReceive(), send,
+    )
+    status, body, _ = _parse_response(messages)
+    assert status == 403
+    # Authenticated → 200 matrix.
+    scope = _make_scope(
+        method="GET",
+        path="/admin/model-capabilities",
+        headers=[(b"authorization", b"Bearer secret")],
+    )
+    messages, send = _make_send()
+    await app(scope, _MockReceive(), send)
+    status, body, _ = _parse_response(messages)
+    assert status == 200
+    doc = __import__("json").loads(body)
+    assert set(doc) == {"now", "max_age", "models", "observations"}
+    assert "glm" in doc["models"]
+    glm = doc["models"]["glm"]
+    assert {p["provider"] for p in glm["participants"]} == {"a", "b"}
+    assert all(p["state"] == "fresh" for p in glm["participants"])
+    assert glm["guaranteed"] is True
+    assert "a" in doc["observations"]
+    assert "glm-a" in doc["observations"]["a"]
+    assert doc["max_age"] == 86400.0
+    now = time.time()
+    assert abs(doc["now"] - now) < 60
+    await ctx_a.http_client.aclose()
+    await ctx_b.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_admin_model_capabilities_refresh_not_configured_409() -> None:
+    app = _make_app(admin_token="secret")
+    scope = _make_scope(
+        method="POST",
+        path="/admin/model-capabilities/refresh",
+        headers=[(b"authorization", b"Bearer secret")],
+    )
+    messages, send = _make_send()
+    await app(scope, _MockReceive(), send)
+    status, _, _ = _parse_response(messages)
+    assert status == 409
+
+
+@pytest.mark.asyncio
+async def test_admin_model_capabilities_refresh_forced_runs_probe() -> None:
+    import switchboard.model_discovery as md
+    from switchboard.capability_store import CapabilityStore
+    from switchboard.model_discovery import ListingResult, ModelDiscovery
+
+    ctx_a = _make_provider_context("a", capacity=1)
+    store = CapabilityStore()
+    discovery = ModelDiscovery(store=store, interval_s=0.0)
+    app = _make_app(
+        providers={"a": ctx_a},
+        default_providers=("a",),
+        admin_token="secret",
+        capability_store=store,
+        model_discovery=discovery,
+    )
+
+    async def fake_probe(ctx, **_kw) -> ListingResult:
+        return ListingResult(
+            provider=ctx.name, ok=True, status=200, models=(),
+            fingerprint="fp",
+        )
+
+    real = md.probe_model_listing
+    md.probe_model_listing = fake_probe  # type: ignore[assignment]
+    try:
+        scope = _make_scope(
+            method="POST",
+            path="/admin/model-capabilities/refresh",
+            headers=[(b"authorization", b"Bearer secret")],
+        )
+        messages, send = _make_send()
+        await app(scope, _MockReceive(), send)
+        status, body, _ = _parse_response(messages)
+        assert status == 200
+        doc = __import__("json").loads(body)
+        assert doc["providers"] == [
+            {"provider": "a", "ok": True, "status": 200,
+             "count": 0, "detail": ""}
+        ]
+    finally:
+        md.probe_model_listing = real  # type: ignore[assignment]
+    await ctx_a.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_admin_client_config_opencode_render() -> None:
+    ctx_a = _make_provider_context("a", capacity=1)
+    ctx_b = _make_provider_context("b", capacity=1)
+    store = _cap_store()
+    app = _make_app(
+        providers={"a": ctx_a, "b": ctx_b},
+        default_providers=("a", "b"),
+        admin_token="secret",
+        model_map_mgr=_cap_map_mgr(),
+        capability_store=store,
+    )
+    scope = _make_scope(
+        method="GET",
+        path="/admin/client-config/opencode",
+        headers=[
+            (b"authorization", b"Bearer secret"),
+            (b"host", b"sb.example.com"),
+        ],
+    )
+    messages, send = _make_send()
+    await app(scope, _MockReceive(), send)
+    status, body, _ = _parse_response(messages)
+    assert status == 200
+    doc = __import__("json").loads(body)
+    prov = doc["provider"]["switchboard"]
+    assert prov["options"]["baseURL"] == "http://sb.example.com"
+    assert prov["options"]["apiKey"] == "<your-switchboard-route-key>"
+    assert set(prov["models"]) == {"glm", "y-only-b"}
+    # No provider name or per-provider alias in the paste-ready document.
+    text = body.decode()
+    assert "glm-a" not in text
+    assert "glm-b" not in text
+    # Method discipline.
+    messages, send = _make_send()
+    await app(
+        _make_scope(
+            method="POST",
+            path="/admin/client-config/opencode",
+            headers=[(b"authorization", b"Bearer secret")],
+        ),
+        _MockReceive(), send,
+    )
+    status, _, _ = _parse_response(messages)
+    assert status == 405
+    # Unauthenticated.
+    messages, send = _make_send()
+    await app(
+        _make_scope(method="GET", path="/admin/client-config/opencode"),
+        _MockReceive(), send,
+    )
+    status, _, _ = _parse_response(messages)
+    assert status == 403
+    await ctx_a.http_client.aclose()
+    await ctx_b.http_client.aclose()

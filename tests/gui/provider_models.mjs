@@ -32,6 +32,11 @@ let nextResponse = { ok: true, status: 200, json: async () => ({}) };
 // and /admin/model-map get explicit overrides set per-test.
 let modelsResponse = null;
 let modelMapResponse = null;
+// Optional per-method overrides for /admin/model-map (Plan 027 carry-over
+// tests need the GET re-read and the POST to differ). Both fall back to
+// modelMapResponse, so every existing test keeps its previous behaviour.
+let modelMapListResponse = null;
+let modelMapPostResponse = null;
 const els = {};
 const document = { getElementById(id) { if (!els[id]) els[id] = makeEl(id); return els[id]; } };
 const sandbox = {
@@ -41,7 +46,11 @@ const sandbox = {
     fetchCalls.push({ url, opts });
     const u = String(url);
     if (u.endsWith('/models')) return modelsResponse || nextResponse;
-    if (u === '/admin/model-map') return modelMapResponse || nextResponse;
+    if (u === '/admin/model-map') {
+      const isPost = opts && opts.method === 'POST';
+      if (isPost) return modelMapPostResponse || modelMapResponse || nextResponse;
+      return modelMapListResponse || modelMapResponse || nextResponse;
+    }
     return nextResponse;
   },
   URLSearchParams, confirm: () => true, alert: () => {},
@@ -304,6 +313,114 @@ check('panel stays pinned after applying an offer',
 await $('scan-dismiss').onclick();
 check('dismiss unpins the card',
       vm.runInContext('scanPinned', sandbox) === false);
+
+// --- 10. Plan 027: one-click apply round-trips the model preference --------
+// The add-or-replace POST replaces the whole model entry server-side, and
+// OMITTING `preference` clears the stored one — so a one-click alias add
+// must carry the model's existing preference order back in the POST.
+const okResp = { ok: true, status: 200, json: async () => ({ ok: true }) };
+
+// 10a. preference is read from the re-fetch (fresh), not the snapshot.
+modelMapListResponse = {
+  ok: true, status: 200,
+  json: async () => ({ models: [{
+    model: 'glm-5.2',
+    aliases: { umans: 'umans-glm-5.2', 'ollama-cloud': 'ollama-glm-5.2' },
+    preference: ['umans', 'ollama-cloud'],
+  }] }),
+};
+modelMapPostResponse = okResp;
+fetchCalls = [];
+await sandbox.applyAutoMatch(
+  { model: 'glm-5.2', provider: 'zai', alias: 'zai-glm-5.2' },
+  {}, // empty snapshot: the carry-over must come from the re-read
+  undefined, {},
+);
+const pPost = fetchCalls.find(
+  c => c.url === '/admin/model-map' && c.opts && c.opts.method === 'POST');
+const pBody = pPost ? JSON.parse(pPost.opts.body) : {};
+check('apply carries the re-read preference back',
+      Array.isArray(pBody.preference) &&
+      JSON.stringify(pBody.preference) === JSON.stringify(['umans', 'ollama-cloud']),
+      pPost && pPost.opts.body);
+check('apply keeps the preference order',
+      pBody.preference &&
+      pBody.preference[0] === 'umans' && pBody.preference[1] === 'ollama-cloud',
+      pPost && pPost.opts.body);
+check('apply never promotes the offered provider into the preference',
+      pBody.preference && !pBody.preference.includes('zai'),
+      pPost && pPost.opts.body);
+check('apply merges the new alias alongside the carried ones',
+      pBody.aliases && pBody.aliases.umans === 'umans-glm-5.2' &&
+      pBody.aliases['ollama-cloud'] === 'ollama-glm-5.2' &&
+      pBody.aliases.zai === 'zai-glm-5.2',
+      pPost && pPost.opts.body);
+
+// 10b. a failed re-read falls back to the status.json snapshot preference.
+modelMapListResponse = { ok: false, status: 500, json: async () => ({}) };
+modelMapPostResponse = okResp;
+fetchCalls = [];
+await sandbox.applyAutoMatch(
+  { model: 'glm-5.2', provider: 'ollama-cloud', alias: 'ollama-glm-5.2' },
+  { 'glm-5.2': { umans: 'umans-glm-5.2' } },
+  undefined, { 'glm-5.2': ['umans'] },
+);
+const bPost = fetchCalls.find(
+  c => c.url === '/admin/model-map' && c.opts && c.opts.method === 'POST');
+const bBody = bPost ? JSON.parse(bPost.opts.body) : {};
+check('fallback: snapshot preference survives a failed re-read',
+      JSON.stringify(bBody.preference) === JSON.stringify(['umans']),
+      bPost && bPost.opts.body);
+check('fallback: snapshot aliases survive a failed re-read',
+      bBody.aliases && bBody.aliases.umans === 'umans-glm-5.2' &&
+      bBody.aliases['ollama-cloud'] === 'ollama-glm-5.2',
+      bPost && bPost.opts.body);
+
+// 10c. preference entries whose alias no longer exists are dropped, not
+// posted (the server would reject them); the rest keep their order.
+modelMapListResponse = {
+  ok: true, status: 200,
+  json: async () => ({ models: [{
+    model: 'glm-5.2',
+    aliases: { umans: 'umans-glm-5.2' }, // ollama-cloud concurrently removed
+    preference: ['umans', 'ollama-cloud'],
+  }] }),
+};
+modelMapPostResponse = okResp;
+fetchCalls = [];
+await sandbox.applyAutoMatch(
+  { model: 'glm-5.2', provider: 'zai', alias: 'zai-glm-5.2' },
+  {}, undefined, {},
+);
+const cPost = fetchCalls.find(
+  c => c.url === '/admin/model-map' && c.opts && c.opts.method === 'POST');
+const cBody = cPost ? JSON.parse(cPost.opts.body) : {};
+check('apply drops preference entries with no posted alias',
+      JSON.stringify(cBody.preference) === JSON.stringify(['umans']),
+      cPost && cPost.opts.body);
+
+// 10d. a model with no stored preference POSTs no `preference` key at all
+// (an explicit empty array is treated by the server as "clear").
+modelMapListResponse = {
+  ok: true, status: 200,
+  json: async () => ({ models: [{
+    model: 'glm-5.2',
+    aliases: { umans: 'umans-glm-5.2' },
+    preference: [],
+  }] }),
+};
+modelMapPostResponse = okResp;
+fetchCalls = [];
+await sandbox.applyAutoMatch(
+  { model: 'glm-5.2', provider: 'zai', alias: 'zai-glm-5.2' },
+  {}, undefined, {},
+);
+const dPost = fetchCalls.find(
+  c => c.url === '/admin/model-map' && c.opts && c.opts.method === 'POST');
+const dBody = dPost ? JSON.parse(dPost.opts.body) : {};
+check('apply omits the preference key when none is set',
+      !('preference' in dBody),
+      dPost && dPost.opts.body);
 
 // --- report ---------------------------------------------------------------
 let failed = 0;

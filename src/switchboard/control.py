@@ -717,6 +717,33 @@ def compose_upstream_path(base: str, client_path: str) -> str:
     return composed + (sep + query if sep else "")
 
 
+def credential_value(prefix: str, key: str) -> str:
+    """The egress credential string for a configured ``auth_prefix`` + key.
+
+    Plan 027 W1 — the single normalization the egress choke point
+    (:meth:`ProxyApp._apply_provider_credential`) applies, lifted here so
+    every surface that presents a provider credential (forwarding AND the
+    admin discovery probes) computes the identical value. A scheme glued to
+    the key (``Bearer`` without the trailing space, ``Bearer<key>``) is
+    never a valid credential and would be 401'd upstream, so any stored
+    form — env, TOML, or GUI — is repaired here: an empty prefix means the
+    raw key with no scheme; a prefix not ending in whitespace gets exactly
+    one separating space appended. Pure and deterministic.
+
+        >>> credential_value("Bearer ", "abc")
+        'Bearer abc'
+        >>> credential_value("Bearer", "abc")
+        'Bearer abc'
+        >>> credential_value("", "abc")
+        'abc'
+    """
+    if not prefix:
+        return key
+    if not prefix[-1].isspace():
+        return f"{prefix} {key}"
+    return f"{prefix}{key}"
+
+
 def _satisfies_capabilities(
     state: ProviderState,
     required: frozenset[str],

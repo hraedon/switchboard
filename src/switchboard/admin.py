@@ -33,9 +33,32 @@ from switchboard.config_reset import (
     reset_sections,
 )
 from switchboard.config_store import ConfigStoreManager
-from switchboard.control import MUTABLE_ROUTING_FIELDS as _MUTABLE_ROUTING_FIELDS
-from switchboard.control import RETIRED_ROUTING_FIELDS as _RETIRED_ROUTING_FIELDS
-from switchboard.control import retired_routing_field_message
+from switchboard.control import (
+    MUTABLE_ROUTING_FIELDS as _MUTABLE_ROUTING_FIELDS,
+)
+from switchboard.control import (
+    RETIRED_ROUTING_FIELDS as _RETIRED_ROUTING_FIELDS,
+)
+from switchboard.control import (
+    ModelMap,
+    credential_value,
+    retired_routing_field_message,
+)
+from switchboard.model_capabilities import (
+    ModelCaps,
+    ModelContract,
+    ModelObservation,
+    compute_contract,
+    contract_to_dict,
+    observation_to_dict,
+    parse_model_listing,
+    render_opencode_config,
+)
+from switchboard.model_discovery import (
+    config_fingerprint,
+    probe_model_listing,
+    probe_status_only,
+)
 from switchboard.session import (
     SESSION_COOKIE,
     LoginThrottle,
@@ -52,7 +75,9 @@ from switchboard.utils import (
 )
 
 if TYPE_CHECKING:
+    from switchboard.capability_store import CapabilityStore
     from switchboard.estimator import ThresholdEstimator
+    from switchboard.model_discovery import ModelDiscovery
     from switchboard.model_map import ModelMapManager
     from switchboard.provider_manager import ProviderManager
     from switchboard.providers import ProviderContext
@@ -2783,14 +2808,15 @@ async def handle_provider_test(
 ) -> None:
     """POST /admin/providers/<name>/test — upstream reachability probe.
 
-    Issues ``GET {upstream}/models`` with the provider's own credential,
-    resolved exactly as the forwarding path presents it (the live context's
-    ``api_key``/``auth_header``/``auth_prefix``), and reports status +
-    latency. The credential is applied to the OUTBOUND request only and
-    appears nowhere in the response — no header echo, no key material.
-    Auth-gated like the mutating endpoints because each call spends a
-    request against a real upstream. ``client_factory`` exists for tests
-    (MockTransport); the default is a short-lived client with a 5 s timeout.
+    Issues the parity discovery probe (Plan 027 W1): the exact URL and
+    credential the live forwarding path would present for a client
+    ``GET /v1/models`` — see :mod:`switchboard.model_discovery` — and
+    reports status + latency. The credential is applied to the OUTBOUND
+    request only and appears nowhere in the response — no header echo, no
+    key material. Auth-gated like the mutating endpoints because each call
+    spends a request against a real upstream. ``client_factory`` exists for
+    tests (MockTransport); the default is a short-lived client with a 5 s
+    timeout.
     """
     cors = cors_extra_headers(cors_allow_origin, None)
     if not admin_token:
@@ -2817,28 +2843,9 @@ async def handle_provider_test(
         )
         return
 
-    url = ctx.upstream_url.rstrip("/") + "/models"
-    headers: dict[str, str] = {}
-    if ctx.api_key:
-        headers[ctx.auth_header] = f"{ctx.auth_prefix}{ctx.api_key}"
-    factory = client_factory or (
-        lambda: httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+    status_code, latency_ms, detail = await probe_status_only(
+        ctx, client_factory=client_factory,
     )
-
-    status_code: int | None = None
-    detail = ""
-    start = time.monotonic()
-    try:
-        async with factory() as client:
-            response = await client.get(url, headers=headers)
-            status_code = response.status_code
-            if status_code is not None and not (200 <= status_code < 300):
-                detail = _extract_upstream_detail(response)
-    except httpx.TimeoutException:
-        detail = "timeout"
-    except httpx.HTTPError as exc:
-        detail = type(exc).__name__
-    latency_ms = round((time.monotonic() - start) * 1000.0, 1)
 
     ok = status_code is not None and 200 <= status_code < 300
     log.info(
@@ -2867,12 +2874,20 @@ async def handle_provider_models(
 ) -> None:
     """GET /admin/providers/<name>/models — enumerate the upstream's models.
 
-    Generalises :func:`handle_provider_test` (Plan 020 WI-3): same upstream
-    ``/models`` GET, same credential resolution, same no-echo discipline, but
-    parses the response body's ``data`` array (the OpenAI-compatible shape
-    every provider in the registry speaks) and returns the model IDs so the
-    GUI can populate a datalist on the model-map alias input and offer exact
-    matches (Plan 024).
+    Generalises :func:`handle_provider_test` (Plan 020 WI-3): the parity
+    discovery probe (Plan 027 W1) — the exact URL and credential the live
+    forwarding path would present — which also parses the response body's
+    ``data`` array (the OpenAI-compatible shape every provider in the
+    registry speaks) and returns the model IDs so the GUI can populate a
+    datalist on the model-map alias input and offer exact matches
+    (Plan 024).
+
+    ``models`` stays the flat id list the GUI's datalist consumes; the
+    Plan 027 addition is ``models_meta``, the same ids WITH whatever
+    capability metadata the upstream's listing actually carried (context
+    limits, modalities, supported parameters — shape-driven, never
+    guessed). A provider that sends the bare OpenAI shape gets ids with
+    every capability field honestly unknown.
 
     Auth + CSRF gated like the test endpoint because each call spends a
     request against a real upstream. Read-only: no alias is written here; the
@@ -2903,63 +2918,23 @@ async def handle_provider_models(
         )
         return
 
-    url = ctx.upstream_url.rstrip("/") + "/models"
-    headers: dict[str, str] = {}
-    if ctx.api_key:
-        headers[ctx.auth_header] = f"{ctx.auth_prefix}{ctx.api_key}"
-    factory = client_factory or (
-        lambda: httpx.AsyncClient(timeout=httpx.Timeout(5.0))
-    )
-
-    status_code: int | None = None
-    detail = ""
-    models: list[str] = []
-    start = time.monotonic()
-    try:
-        async with factory() as client:
-            response = await client.get(url, headers=headers)
-            status_code = response.status_code
-            if 200 <= status_code < 300:
-                try:
-                    payload = response.json()
-                except ValueError:
-                    detail = "non-JSON response"
-                else:
-                    models = _parse_openai_models(payload)
-                    if not models:
-                        # A 200 with an empty or unrecognised shape is not a
-                        # transport failure, but the operator needs to know
-                        # the parse found nothing rather than a silent empty.
-                        data_arr = (
-                            payload.get("data")
-                            if isinstance(payload, dict) else None
-                        )
-                        if not isinstance(data_arr, list) or not data_arr:
-                            detail = "no models in response"
-            else:
-                # Non-2xx: surface the upstream's reason so the operator sees
-                # WHY the enumeration failed, not just that it did. Plan 024
-                # §3 promises "the operator sees the failure reason in detail".
-                detail = _extract_upstream_detail(response)
-    except httpx.TimeoutException:
-        detail = "timeout"
-    except httpx.HTTPError as exc:
-        detail = type(exc).__name__
-    latency_ms = round((time.monotonic() - start) * 1000.0, 1)
-
-    ok = status_code is not None and 200 <= status_code < 300 and bool(models)
+    result = await probe_model_listing(ctx, client_factory=client_factory)
+    models = [m.alias for m in result.models]
     log.info(
         "provider models: %s -> status=%s ok=%s count=%d",
-        prov_name, status_code, ok, len(models),
+        prov_name, result.status, result.ok, len(models),
     )
     await send_json(
         send, 200,
         {
-            "ok": ok,
-            "status": status_code,
-            "latency_ms": latency_ms,
+            "ok": result.ok,
+            "status": result.status,
+            "latency_ms": result.latency_ms,
             "models": models,
-            "detail": detail,
+            "models_meta": [
+                observation_to_dict(m) for m in result.models
+            ],
+            "detail": result.detail,
         },
         extra_headers=cors,
     )
@@ -2968,36 +2943,19 @@ async def handle_provider_models(
 def _parse_openai_models(payload: Any) -> list[str]:
     """Extract model IDs from an OpenAI-compatible ``/models`` response.
 
-    The canonical shape is ``{"data": [{"id": "glm-5.2", ...}, ...]}``. Some
-    providers return a bare list; a few nest under ``models`` instead of
-    ``data``. All three are accepted, de-duplicated in stable order. A
-    non-dict ``id`` is skipped rather than crashing the parse.
+    Thin shim over the pure normalizer (Plan 027): the canonical shape is
+    ``{"data": [{"id": "glm-5.2", ...}, ...]}``, with the bare-list and
+    ``models``-key fallbacks; de-duplicated in stable order, non-string ids
+    skipped. Kept for direct callers/tests; the endpoints themselves go
+    through :mod:`switchboard.model_discovery` and the richer
+    :func:`~switchboard.model_capabilities.parse_model_listing`.
     """
-    items: list[Any]
-    if isinstance(payload, list):
-        items = payload
-    elif isinstance(payload, dict):
-        data_arr = payload.get("data")
-        if isinstance(data_arr, list):
-            items = data_arr
-        else:
-            models_arr = payload.get("models")
-            items = models_arr if isinstance(models_arr, list) else []
-    else:
-        return []
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in items:
-        if isinstance(item, dict):
-            mid = item.get("id")
-        elif isinstance(item, str):
-            mid = item
-        else:
-            mid = None
-        if isinstance(mid, str) and mid and mid not in seen:
-            seen.add(mid)
-            out.append(mid)
-    return out
+    return [
+        obs.alias
+        for obs in parse_model_listing(
+            payload, provider="<probe>", observed_at=0.0
+        )
+    ]
 
 
 def _extract_upstream_detail(response: httpx.Response) -> str:
@@ -3029,6 +2987,278 @@ def _extract_upstream_detail(response: httpx.Response) -> str:
                 if isinstance(msg, str) and msg:
                     return msg[:200]
     return f"HTTP {response.status_code}"
+
+
+# ── Plan 027: model-capability contract surfaces ─────────────────────────────
+
+
+def _resolve_contract_observations(
+    model: str,
+    model_map: ModelMap,
+    participants: tuple[str, ...],
+    capability_store: CapabilityStore | None,
+) -> dict[str, ModelObservation | None]:
+    """Freshest stored observation per participant, keyed by provider name.
+
+    The model map resolves each participant's alias for THIS model; the store
+    is then looked up by (provider, alias). A participant with no stored
+    observation (never discovered, or its listing dropped the alias) maps to
+    None — the contract treats it as unable to certify.
+    """
+    out: dict[str, ModelObservation | None] = {}
+    for provider in participants:
+        alias = model_map.alias_for(model, provider)
+        if alias is None or capability_store is None:
+            out[provider] = None
+            continue
+        out[provider] = capability_store.for_alias(provider, alias)
+    return out
+
+
+def _current_provider_fingerprints(
+    providers: dict[str, ProviderContext],
+) -> dict[str, str]:
+    return {
+        name: config_fingerprint(ctx) for name, ctx in providers.items()
+    }
+
+
+async def handle_model_capabilities(
+    send: Send,
+    model_map_mgr: ModelMapManager,
+    capability_store: CapabilityStore | None,
+    admin_token: str | None,
+    scope: Scope,
+    cors_allow_origin: str | None = None,
+    providers: dict[str, ProviderContext] | None = None,
+    model_caps: dict[str, ModelCaps] | None = None,
+    max_age: float = 86400.0,
+    now: float | None = None,
+) -> None:
+    """GET /admin/model-capabilities — the full provider capability matrix.
+
+    For every model in the model map, compute the :class:`ModelContract`
+    (Plan 027 §3.2) over the participants — the live providers that hold an
+    alias for the model — and report:
+
+    * the contract itself: guaranteed vs merely-observed vs declared values,
+      per-field source, operator-cap deviations, and the reasoning
+      wire-format agreement (or divergence flag).
+    * per-participant freshness: fresh / stale / missing, observed_at, and
+      whether the provider's config fingerprint still matches the
+      observation's (a config change since the probe = stale evidence).
+    * the raw observations, so the operator can see each provider's actual
+      listing values rather than only the aggregated contract.
+
+    Read-only. Auth-gated like the other /admin surfaces (no CSRF for GET).
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+
+    now_value = now if now is not None else time.time()
+    model_map = model_map_mgr.get_model_map()
+    live = providers or {}
+    fps = _current_provider_fingerprints(live)
+    caps = model_caps or {}
+
+    models: dict[str, Any] = {}
+    for model in sorted(model_map.routes.keys()):
+        alias_providers = model_map.providers_for(model)
+        # Participants = live providers holding the alias. A provider that
+        # holds an alias but is not live (removed / tombstoned) cannot be
+        # observed and cannot serve, so it is not a participant.
+        participants = tuple(
+            sorted(p for p in alias_providers if p in live)
+        )
+        if not participants:
+            continue
+        obs = _resolve_contract_observations(
+            model, model_map, participants, capability_store
+        )
+        contract = compute_contract(
+            model,
+            participants,
+            obs,
+            caps.get(model),
+            now=now_value,
+            max_age=max_age,
+            current_fingerprints=fps,
+        )
+        models[model] = contract_to_dict(contract)
+
+    # Raw observations grouped by provider, with their fingerprint + age, so
+    # the admin can see the evidence the contract was aggregated from.
+    raw_observations: dict[str, Any] = {}
+    if capability_store is not None:
+        for name in sorted(live.keys()):
+            per = capability_store.for_provider(name)
+            if not per:
+                continue
+            raw_observations[name] = {
+                alias: observation_to_dict(obs)
+                for alias, obs in sorted(per.items())
+            }
+
+    await send_json(
+        send,
+        200,
+        {
+            "now": now_value,
+            "max_age": max_age,
+            "models": models,
+            "observations": raw_observations,
+        },
+        extra_headers=cors,
+    )
+
+
+async def handle_model_capabilities_refresh(
+    send: Send,
+    discovery: ModelDiscovery | None,
+    admin_token: str | None,
+    scope: Scope,
+    cors_allow_origin: str | None = None,
+    providers: dict[str, ProviderContext] | None = None,
+) -> None:
+    """POST /admin/model-capabilities/refresh — run discovery on demand.
+
+    Forces a full model-listing probe across every live provider and
+    persists the successful listings (bypassing the periodic interval).
+    Auth + CSRF gated like the other probe endpoints, because each call
+    spends a request against every real upstream.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+    if not check_csrf(scope, admin_token):
+        await send_json(
+            send, 403, {"error": "cross-site request blocked"},
+            extra_headers=cors,
+        )
+        return
+
+    if discovery is None:
+        await send_json(
+            send, 409,
+            {"error": "model discovery is not configured"},
+            extra_headers=cors,
+        )
+        return
+
+    results = await discovery.refresh(providers or {}, force=True)
+    log.info(
+        "model capabilities refresh: %d provider(s) probed, %d ok",
+        len(results),
+        sum(1 for r in results if r.ok),
+    )
+    await send_json(
+        send,
+        200,
+        {
+            "providers": [
+                {
+                    "provider": r.provider,
+                    "ok": r.ok,
+                    "status": r.status,
+                    "count": len(r.models),
+                    "detail": r.detail,
+                }
+                for r in results
+            ]
+        },
+        extra_headers=cors,
+    )
+
+
+def _client_base_url(scope: Scope) -> str:
+    """Derive switchboard's own client-facing base URL from the request.
+
+    The scheme comes from the ASGI scope (uvicorn learns it from
+    X-Forwarded-Proto when proxy headers are trusted), the host from the
+    client's Host header, falling back to the socket server pair. No path:
+    the OpenCode adapter appends its API paths to ``baseURL``.
+    """
+    scheme = scope.get("scheme")
+    scheme = "https" if scheme == "https" else "http"
+    host = ""
+    for key, value in scope.get("headers", []):
+        if key == b"host":
+            host = value.decode("latin-1", errors="replace")
+            break
+    if not host:
+        server = scope.get("server")
+        if isinstance(server, (list, tuple)) and len(server) == 2:
+            host = f"{server[0]}:{server[1]}"
+    if not host:
+        return ""
+    return f"{scheme}://{host}"
+
+
+async def handle_client_config_opencode(
+    send: Send,
+    model_map_mgr: ModelMapManager,
+    capability_store: CapabilityStore | None,
+    admin_token: str | None,
+    scope: Scope,
+    cors_allow_origin: str | None = None,
+    providers: dict[str, ProviderContext] | None = None,
+    model_caps: dict[str, ModelCaps] | None = None,
+    max_age: float = 86400.0,
+    now: float | None = None,
+) -> None:
+    """GET /admin/client-config/opencode — a paste-ready OpenCode block.
+
+    Renders :func:`render_opencode_config` over the estate-wide contracts
+    (every live provider that holds an alias — the same LCD/participant
+    rules as the capability matrix, but unscoped: the document describes
+    the gateway, not one key). ``baseURL`` is derived from the request's
+    Host; the ``apiKey`` stays the explicit placeholder — switchboard does
+    not mint route keys into a document that may be pasted somewhere.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+
+    now_value = now if now is not None else time.time()
+    model_map = model_map_mgr.get_model_map()
+    live = providers or {}
+    fps = _current_provider_fingerprints(live)
+    caps = model_caps or {}
+
+    contracts: list[ModelContract] = []
+    for model in sorted(model_map.routes.keys()):
+        participants = tuple(
+            sorted(p for p in model_map.providers_for(model) if p in live)
+        )
+        if not participants:
+            continue
+        obs = _resolve_contract_observations(
+            model, model_map, participants, capability_store
+        )
+        contracts.append(
+            compute_contract(
+                model,
+                participants,
+                obs,
+                caps.get(model),
+                now=now_value,
+                max_age=max_age,
+                current_fingerprints=fps,
+            )
+        )
+
+    await send_json(
+        send,
+        200,
+        render_opencode_config(
+            tuple(contracts), base_url=_client_base_url(scope)
+        ),
+        extra_headers=cors,
+    )
 
 
 # ── Plan 021 Wave 2: registry, path preview, discovery probe ────────────────
@@ -3204,8 +3434,14 @@ async def handle_provider_discover(
         return
 
     urls = _discover_candidates(base, probe)
+    # The provider does not exist yet, so there is no context to take the
+    # credential from — but the value MUST be normalized exactly as the
+    # egress choke point will present it once this base is saved
+    # (Plan 027 W1): "Bearer" without the trailing space must become
+    # "Bearer KEY" in the probe and in the live path alike, or the probe's
+    # "this works" prediction lies.
     headers: dict[str, str] = (
-        {auth_header: f"{auth_prefix}{api_key}"} if api_key else {}
+        {auth_header: credential_value(auth_prefix, api_key)} if api_key else {}
     )
     factory = client_factory or (
         lambda: httpx.AsyncClient(timeout=httpx.Timeout(5.0))
