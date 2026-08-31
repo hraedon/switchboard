@@ -243,8 +243,19 @@ async def probe_model_listing(
                     and isinstance(payload.get("data"), list)
                     else payload if isinstance(payload, list) else []
                 )
-                if not items:
-                    detail = "no models in response"
+                # Items present but none parsed as a model still needs a
+                # reason: without one the probe returns ok=False with an empty
+                # detail, and the admin matrix shows a failed provider with a
+                # blank explanation. Reached by a listing whose entries are the
+                # wrong shape, and by deeply-nested hostile JSON on an
+                # interpreter with stack enough to parse it (3.14 raises
+                # RecursionError or not depending on stack available at
+                # runtime, not on the input).
+                detail = (
+                    "no models in response"
+                    if not items
+                    else "no parsable models in response"
+                )
         elif detail == "" and payload is None:
             detail = "non-JSON response"
 

@@ -279,10 +279,18 @@ async def test_probe_non_json_response_reports_detail() -> None:
 
 async def test_probe_deeply_nested_listing_does_not_raise() -> None:
     # A hostile upstream may answer 200 with deeply-nested (syntactically
-    # valid) JSON well inside the byte cap; json.loads overflows its
-    # recursion on it. The probe must report it like a non-JSON body —
-    # never raise — or one bad provider aborts the whole discovery wave
-    # (asyncio.gather) and the admin models endpoints.
+    # valid) JSON well inside the byte cap. The probe must never raise, or
+    # one bad provider aborts the whole discovery wave (asyncio.gather) and
+    # the admin models endpoints.
+    #
+    # Which way it degrades is NOT a property of the input: json.loads
+    # overflows on it under a small stack ("non-JSON response") and parses it
+    # under a large one ("no parsable models in response"). Python 3.14
+    # checks real stack depth rather than a fixed recursion counter, so the
+    # same bytes go one way on a laptop and the other on a CI runner. Assert
+    # the invariants that hold either way -- no raise, not ok, no models, and
+    # a detail an operator can act on -- rather than pinning the wording of
+    # whichever branch this machine happens to take.
     nested = b"[" * 100000 + b"]" * 100000
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -296,8 +304,27 @@ async def test_probe_deeply_nested_listing_does_not_raise() -> None:
     )
     assert result.ok is False
     assert result.status == 200
-    assert result.detail == "non-JSON response"
+    assert result.detail in {"non-JSON response", "no parsable models in response"}
     assert result.models == ()
+
+
+async def test_probe_unparsable_listing_entries_report_a_reason() -> None:
+    # A 200 whose entries are the wrong shape parses fine but yields no
+    # models. The probe must still say why, or the admin matrix shows a
+    # failed provider with a blank reason.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"not_an_id": 1}]})
+
+    result = await probe_model_listing(
+        _ctx(),
+        client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ),
+    )
+    assert result.ok is False
+    assert result.status == 200
+    assert result.models == ()
+    assert result.detail == "no parsable models in response"
 
 
 async def test_probe_status_only_returns_status_and_latency() -> None:

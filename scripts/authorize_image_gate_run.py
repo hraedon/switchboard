@@ -187,7 +187,12 @@ def main() -> int:
         )
         validate_ci_jobs(ci_jobs)
     except (AuthorizationError, OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-        print(f"image authorization refused: {type(exc).__name__}", file=sys.stderr)
+        # Include the reason, not just the class. Every AuthorizationError
+        # message in this file is a static string written here -- no API
+        # payload, no token, nothing from the network -- so printing it leaks
+        # nothing, and without it a refusal reads only "AuthorizationError"
+        # and the operator has to re-derive which of a dozen checks tripped.
+        print(f"image authorization refused: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     print("canonical identifier-gate scan job authorized image publication")
     return 0
