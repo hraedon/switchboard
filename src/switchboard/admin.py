@@ -936,7 +936,7 @@ async def handle_route_add(
 
     try:
         data = json.loads(body) if body else {}
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         await send_json(
             send, 400, {"error": "invalid JSON body"},
             extra_headers=cors,
@@ -1100,7 +1100,7 @@ async def handle_route_default_set(
 
     try:
         data = json.loads(body) if body else {}
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         await send_json(
             send, 400, {"error": "invalid JSON body"},
             extra_headers=cors,
@@ -1295,7 +1295,7 @@ async def handle_model_map_set(
 
     try:
         data = json.loads(body) if body else {}
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         await send_json(
             send, 400, {"error": "invalid JSON body"},
             extra_headers=cors,
@@ -1806,7 +1806,7 @@ async def handle_routing_config_update(
         return
     try:
         payload = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
         await send_json(send, 400, {"error": "invalid JSON body"}, extra_headers=cors)
         return
     if not isinstance(payload, dict):
@@ -1984,7 +1984,7 @@ async def handle_provider_override(
 
     try:
         data = json.loads(body) if body else {}
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         await send_json(send, 400, {"error": "invalid JSON body"}, extra_headers=cors)
         return
 
@@ -2388,7 +2388,7 @@ async def handle_provider_create(
 
     try:
         data = json.loads(body) if body else {}
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         await send_json(
             send, 400, {"error": "invalid JSON body"},
             extra_headers=cors,
@@ -2582,7 +2582,7 @@ async def handle_provider_update(
 
     try:
         data = json.loads(body) if body else {}
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         await send_json(
             send, 400, {"error": "invalid JSON body"},
             extra_headers=cors,
@@ -3417,7 +3417,7 @@ async def handle_provider_discover(
 
     try:
         data = json.loads(raw) if raw else {}
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         await send_json(send, 400, {"error": "invalid JSON body"}, extra_headers=cors)
         return
     if not isinstance(data, dict):
@@ -3624,7 +3624,7 @@ async def handle_config_reset(
 
     try:
         data = json.loads(body) if body else {}
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         await send_json(
             send, 400, {"error": "invalid JSON body"}, extra_headers=cors
         )

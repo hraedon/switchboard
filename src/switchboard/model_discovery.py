@@ -129,7 +129,9 @@ async def _bounded_detail(
     text = raw.decode("utf-8", "replace")
     try:
         payload = json.loads(text) if text.strip() else None
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: a crafted deeply-nested error body (valid syntax)
+        # overflows the parser; treat it as unparseable like any junk body.
         payload = None
     if isinstance(payload, dict):
         for key in ("error", "message", "detail"):
@@ -220,7 +222,10 @@ async def probe_model_listing(
     if 200 <= (status or 0) < 300 and body:
         try:
             payload = json.loads(body)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # RecursionError: a deeply-nested listing (valid syntax, up to the
+            # byte cap) overflows the parser; report it like a non-JSON body
+            # instead of letting it abort the probe (and the gather wave).
             payload = None
             detail = "non-JSON response"
         if detail == "" and isinstance(payload, (dict, list)):

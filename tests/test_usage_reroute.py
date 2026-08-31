@@ -766,6 +766,25 @@ class TestPermitOwnership:
 
         assert list(app._affinity.values()) == []
 
+    async def test_reroute_target_answering_4xx_is_not_pinned(self) -> None:
+        """WI-020: the re-pin predicate mirrors the initial-failover 2xx gate.
+
+        A reroute target that answers a non-rerouteable 4xx (404 here)
+        completed the request but never SERVED it; pinning it would keep the
+        conversation on a provider that rejects the very request it is about
+        to be sent. The 404 still reaches the client — only the pin is
+        withheld.
+        """
+        a, b = _ctx("a", _responder(429)), _ctx("b", _responder(404))
+        await _ready(a, b)
+        app = _app({"a": a, "b": b})
+        msgs, send = _sender()
+
+        await app(_scope(), _receive_body(), send)
+
+        assert _statuses(msgs) == [404]
+        assert list(app._affinity.values()) == []
+
 
 def _mutable_responder(status: int):
     """Like _responder, but the status can be flipped mid-test."""

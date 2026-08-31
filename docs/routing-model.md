@@ -123,7 +123,7 @@ but the choice of that middle term:
 |---|---|---|
 | `ordered` (default) | table position | the primary fronts unless a pin or a per-model preference overrides; post-dwell failback and `failback_delay` hysteresis belong to this strategy alone (§3.4) |
 | `headroom` | `usage_headroom` desc | Plan 015; `headroom_ranking = true` is the same thing |
-| `pace` | weekly quota surplus desc | Plan 020 D5: `remaining_fraction − burn_rate × days_until_reset`; only FRESH weekly signals are scored, unscored providers follow in table order and are never starved; `pace_flap_margin` is a deadband on the top two, not hysteresis with memory |
+| `pace` | weekly quota surplus desc | Plan 020 D5: `remaining_fraction − burn_rate × days_until_reset`; only FRESH weekly signals are scored, unscored providers follow in table order and are never starved; `pace_flap_margin` is a pairwise-adjacent deadband in surplus order, not hysteresis with memory |
 
 `QUEUE` and `BACKSTOP` keep candidate order — stale never outranks fresh, and a
 queue backstop is not a preference contest.
@@ -161,9 +161,10 @@ the preference partition means the pace key never reorders across groups, so
 `preference_rank`; only the one-word reason loses the pace distinction. Accepted
 as-is rather than growing a new reason string.
 
-**Composition with the pace flap margin.** `pace_flap_margin` is a deadband on
-the top two *scored* candidates (§3.3), and preference is lexicographically
-above the score, so the two compose the only way that keeps both meaningful:
+**Composition with the pace flap margin.** `pace_flap_margin` is a deadband
+that clusters adjacent *scored* candidates in surplus order (§3.3), and
+preference is lexicographically above the score, so the two compose the only
+way that keeps both meaningful:
 **preference groups dominate, and the deadband applies within a
 same-preference-rank group.** Across groups it is silent — a near-tie between a
 named and an unnamed provider is settled by the operator, not by an anti-flap

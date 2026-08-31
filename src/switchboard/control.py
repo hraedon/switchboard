@@ -66,9 +66,11 @@ class RoutingStrategy(Enum):
       use-it-or-lose-it and should be burned first. Only providers with a FRESH
       weekly-window signal are scored; unscored providers rank after scored
       ones in table order (they are never starved). ``pace_flap_margin`` is a
-      deadband, not hysteresis with memory: it compares the top two candidates
-      rather than the currently-serving one, which is enough to stop
-      per-request alternation between near-equal providers.
+      deadband, not hysteresis with memory: adjacent providers in surplus order
+      whose gap is below it keep table order rather than the currently-serving
+      one, which is enough to stop per-request alternation between near-equal
+      providers (WI-017: pairwise-adjacent, so a provider decisively below a
+      near-tie still ranks by surplus).
     """
 
     ORDERED = "ordered"
@@ -292,8 +294,9 @@ class RoutingConfig:
     # ~a weekly quota consumed evenly, 100%/7d ≈ 14.3%. The surplus formula is
     # ``remaining_fraction - burn_rate_per_day * days_until_reset``.
     pace_flap_margin: float = 0.05
-    # Minimum surplus advantage the leader must hold over the runner-up to
-    # re-rank (Plan 020 D5 deadband). Prevents two near-equal providers from
+    # Minimum surplus gap between adjacent providers (in surplus order) below
+    # which they keep table order instead of re-ranking (Plan 020 D5 deadband,
+    # WI-017 pairwise-adjacent shape). Prevents near-equal providers from
     # alternating per-request. Default 0.05 = 5 percentage points.
     quarantine_threshold: int = 5
     # Consecutive PROVIDER-attributable failures before a (provider, model)
@@ -798,10 +801,15 @@ def pace_rank(
     """Reorder ``immediate`` by pace surplus descending (Plan 020 D5, WI-13).
 
     Scored providers rank first (highest surplus), unscored providers follow
-    in table order. The ranking is stable within each group. Deadband: when
-    the leader's surplus advantage over the runner-up is less than
-    ``pace_flap_margin``, table order is preserved to avoid flapping between
-    near-equal providers.
+    in table order. The ranking is stable within each group. Deadband
+    (WI-017): adjacent providers in surplus order whose gap is less than
+    ``pace_flap_margin`` form a cluster that keeps table order, so near-equal
+    providers do not alternate per request as the signal jitters. Clustering
+    is pairwise-adjacent, so a provider decisively below a near-tie at the
+    top still ranks by surplus — the pre-WI-017 shape discarded the whole
+    group's ranking whenever the top two were close, which could front a
+    provider far worse than both (A=0.90, B=0.88, C=0.10 with table order
+    C,B,A fronted C).
 
     Mutates ``immediate`` in place — the caller already separated immediate
     candidates; this only reorders them. Returns ``True`` when the ranking
@@ -831,23 +839,27 @@ def pace_rank(
 
     scored.sort(key=_sort_key)
 
-    # Deadband: if the leader's advantage < pace_flap_margin, keep table
-    # order to avoid per-request flapping between near-equal providers.  But
-    # still enforce the scored-first invariant (unscored providers never
-    # outrank scored ones) — the plan's guardrail holds even under the deadband.
-    if len(scored) >= 2:
-        best_surplus = scored[0][1]
-        runner_up_surplus = scored[1][1]
-        if best_surplus - runner_up_surplus < config.pace_flap_margin:
-            # Too close to re-rank: keep scored (table order via the sort
-            # ties) before unscored, but do not re-order by surplus.
-            scored.sort(key=lambda item: order[item[0]])
-            new_order = [name for name, _ in scored] + unscored
-            changed = new_order != immediate
-            immediate[:] = new_order
-            return changed
+    # Deadband (WI-017): walk the surplus-sorted list and cluster adjacent
+    # providers whose gap is below ``pace_flap_margin``; each cluster keeps
+    # table order, clusters stay in surplus order. The scored-first invariant
+    # (unscored providers never outrank scored ones) holds regardless.
+    clusters: list[list[tuple[str, float]]] = []
+    for item in scored:
+        if (
+            clusters
+            and (clusters[-1][-1][1] - item[1]) < config.pace_flap_margin
+        ):
+            clusters[-1].append(item)
+        else:
+            clusters.append([item])
 
-    new_order = [name for name, _ in scored] + unscored
+    ranked: list[str] = []
+    for cluster in clusters:
+        if len(cluster) > 1:
+            cluster.sort(key=lambda item: order[item[0]])
+        ranked.extend(name for name, _ in cluster)
+
+    new_order = ranked + unscored
     changed = new_order != immediate
     immediate[:] = new_order
     return changed

@@ -76,7 +76,7 @@ class CapabilityStore:
         for provider, alias, observed_at, fingerprint, payload in cursor:
             try:
                 data = json.loads(payload)
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError, RecursionError) as exc:
                 log.warning(
                     "capability row %s/%s has corrupt JSON, skipping: %s",
                     provider, alias, exc,

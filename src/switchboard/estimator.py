@@ -98,7 +98,10 @@ class ThresholdEstimator:
             row = cursor.fetchone()
             if row is not None and row[0] is not None:
                 self._state = _dict_to_state(json.loads(row[0]))
-        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+        except (
+            json.JSONDecodeError, KeyError, ValueError, TypeError,
+            RecursionError,
+        ):
             log.warning(
                 "failed to load threshold state for %s; using default",
                 self.provider_name,

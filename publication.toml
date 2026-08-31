@@ -31,21 +31,26 @@ author_email = ["plm@hraedon.com"]
 #
 # public: the repo has been cleared by a publication review.
 #
-# This field changes NOTHING about CI. An earlier version of this comment
-# claimed the identifier gate "fails closed on a missing denylist secret once
-# this is set" — that is false, and was corrected 2026-08-08 after it was
-# repeated as the rationale for a public flip. Verified three ways:
+# CI runs scripts/check_committed_identifiers.py with --ci on every push and
+# pull request. In that mode this declaration is part of the hard gate: missing,
+# malformed, or unknown publication settings fail closed, and a public repo also
+# requires a configured, non-empty, usable denylist secret. Repository code can
+# validate configuration and usability, not prove where the secret came from.
+# Provision SWITCHBOARD_FORBIDDEN_IDENTIFIERS from the canonical denylist source
+# via the publication-prep procedure. The always-on samples/ guard remains active
+# independently of that secret.
 #
-#   1. scripts/check_committed_identifiers.py returns 0 ("skipping identifier
-#      gate") whenever <REPO>_FORBIDDEN_IDENTIFIERS is unset, unconditionally.
-#   2. That script contains no reference to this file or to visibility.
-#   3. The only reader of this field is scripts/check_publication_plumbing.py,
-#      a PRE-PUSH hook, and its `case Visibility.PUBLIC` branch is `pass`.
+# Pull requests use pull_request_target so the gate runs scanner and plumbing
+# code from the trusted base branch with the configured secret. Contributor
+# commits are fetched and scanned as git objects only: no contributor-controlled
+# script, workflow, or checked-out file is executed. Local hook invocations
+# without --ci retain their no-secret skip behavior for fresh clones.
 #
-# So for a public repo the only thing between a work-domain identifier and
-# publication is the CI secret ACTUALLY BEING SET. Delete or rename it and CI
-# goes quiet and green. Believing otherwise is the false confidence that lets a
-# leak land — check `gh secret list` rather than trusting this field.
-#
-# The always-on samples/ guard is unaffected and still runs without any secret.
+# This repo's trusted PR gate additionally requires the scanner's --tree mode,
+# all-blob raw-byte matching, control-safe commit-message reads, and redacted
+# diagnostics. The shared
+# sync-identifier-gate template is external to this repository. Before running
+# that sync tool here, update its template to preserve these capabilities; the
+# workflow and focused tests intentionally fail closed if an older template
+# overwrites them.
 visibility = "public"

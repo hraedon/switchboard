@@ -1,15 +1,111 @@
 name: identifier-gate
-on: [push, pull_request]
+on:
+  workflow_run:
+    workflows: [identifier-gate-dispatch]
+    types: [completed]
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  actions: read
+  contents: read
+
 jobs:
-  identifier-gate:
+  scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Both event types execute scanner code from a trusted base/default branch.
+      # Push and PR commits are fetched as git objects and never checked out or run.
+      - name: Check out trusted scanner
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.event.repository.default_branch }}
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
-      - name: Check for committed work-domain identifiers
+      - name: Verify repository gate compatibility
+        run: python scripts/check_identifier_gate_compatibility.py
+      - name: Authorize canonical no-secret push dispatcher
+        if: github.event_name == 'workflow_run'
+        id: dispatch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISPATCH_RUN_ID: ${{ github.event.workflow_run.id }}
+          DISPATCH_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          DISPATCH_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: python scripts/authorize_identifier_dispatch.py
+      - name: Fetch and derive the exact publication range
+        if: github.event_name == 'pull_request_target' || steps.dispatch.outputs.mode == 'scan'
+        id: range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          PUSH_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          require_commit() {
+            if [ -z "$1" ] || ! git cat-file -e "$1^{commit}" 2>/dev/null; then
+              echo "::error::identifier gate could not resolve a required commit"
+              exit 1
+            fi
+          }
+
+          if [ "$EVENT_NAME" = "pull_request_target" ]; then
+            require_commit "$PR_BASE_SHA"
+            git fetch --no-tags origin "pull/$PR_NUMBER/head"
+            fetched=$(git rev-parse "FETCH_HEAD^{commit}")
+            if [ "$fetched" != "$PR_HEAD_SHA" ]; then
+              echo "::error::fetched PR ref does not match the event head commit"
+              exit 1
+            fi
+            require_commit "$PR_HEAD_SHA"
+            range="$PR_BASE_SHA..$PR_HEAD_SHA"
+          elif [ "$EVENT_NAME" = "workflow_run" ]; then
+            git fetch --no-tags origin "$PUSH_HEAD_SHA"
+            require_commit "$PUSH_HEAD_SHA"
+            if [ "$PUSH_HEAD_BRANCH" = "$DEFAULT_BRANCH" ]; then
+              if ! parent=$(git rev-parse "$PUSH_HEAD_SHA^"); then
+                echo "::error::default-branch publication has no safe parent baseline"
+                exit 1
+              fi
+              range="$parent..$PUSH_HEAD_SHA"
+            else
+              default_ref="refs/remotes/origin/$DEFAULT_BRANCH"
+              require_commit "$default_ref"
+              if ! base=$(git merge-base "$default_ref" "$PUSH_HEAD_SHA"); then
+                echo "::error::branch publication has no safe default-branch baseline"
+                exit 1
+              fi
+              range="$base..$PUSH_HEAD_SHA"
+            fi
+          else
+            echo "::error::identifier gate does not recognize this event"
+            exit 1
+          fi
+
+          printf 'range=%s\n' "$range" >> "$GITHUB_OUTPUT"
+      - name: Scan every introduced commit tree as data using trusted scanner code
+        if: github.event_name == 'pull_request_target' || steps.dispatch.outputs.mode == 'scan'
         env:
           SWITCHBOARD_FORBIDDEN_IDENTIFIERS: ${{ secrets.SWITCHBOARD_FORBIDDEN_IDENTIFIERS }}
-        run: python3 scripts/check_committed_identifiers.py
+        run: >-
+          python scripts/check_committed_identifiers.py --ci
+          --tree-range "${{ steps.range.outputs.range }}"
+      - name: Scan commit messages using trusted scanner code
+        if: github.event_name == 'pull_request_target' || steps.dispatch.outputs.mode == 'scan'
+        env:
+          SWITCHBOARD_FORBIDDEN_IDENTIFIERS: ${{ secrets.SWITCHBOARD_FORBIDDEN_IDENTIFIERS }}
+        run: >-
+          python scripts/check_committed_identifiers.py
+          --rev-range "${{ steps.range.outputs.range }}"
+      - name: Acknowledge authorized branch deletion
+        if: github.event_name == 'workflow_run' && steps.dispatch.outputs.mode == 'delete'
+        run: echo "Authorized branch deletion publishes no new tree or commit message."

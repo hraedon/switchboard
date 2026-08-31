@@ -96,7 +96,18 @@ def load_declaration(repo_root: Path) -> Declaration | None:
             f"{DECLARATION_FILENAME} [publication] is missing: {', '.join(missing)}"
         )
 
-    raw_visibility = str(section["visibility"])
+    raw_owner = section["remote_owner"]
+    if not isinstance(raw_owner, str) or not raw_owner.strip():
+        raise PlumbingError(
+            f"{DECLARATION_FILENAME} remote_owner must be a non-empty string"
+        )
+
+    raw_visibility = section["visibility"]
+    if not isinstance(raw_visibility, str):
+        raise PlumbingError(
+            f"{DECLARATION_FILENAME} visibility must be a string; "
+            f"expected one of {[v.value for v in Visibility]}"
+        )
     try:
         visibility = Visibility(raw_visibility)
     except ValueError as exc:
@@ -105,18 +116,23 @@ def load_declaration(repo_root: Path) -> Declaration | None:
             f"expected one of {[v.value for v in Visibility]}"
         ) from exc
     raw_authors = section["author_email"]
-    authors = (
-        tuple(str(a) for a in raw_authors)
-        if isinstance(raw_authors, list)
-        else (str(raw_authors),)
-    )
-    if not authors or not all(a.strip() for a in authors):
+    if isinstance(raw_authors, str):
+        authors = (raw_authors,)
+    elif isinstance(raw_authors, list) and all(
+        isinstance(author, str) for author in raw_authors
+    ):
+        authors = tuple(raw_authors)
+    else:
+        raise PlumbingError(
+            f"{DECLARATION_FILENAME} author_email must be a string or list of strings"
+        )
+    if not authors or not all(author.strip() for author in authors):
         raise PlumbingError(
             f"{DECLARATION_FILENAME} author_email must be a non-empty address "
             f"or list of addresses"
         )
     return Declaration(
-        remote_owner=str(section["remote_owner"]),
+        remote_owner=raw_owner,
         author_emails=authors,
         visibility=visibility,
     )

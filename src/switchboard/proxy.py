@@ -1965,22 +1965,28 @@ class ProxyApp:
                 tried_statuses[acquired_provider] = probe.status
 
             if not probe.triggered:
+                # WI-020: the re-pin predicate mirrors the initial-failover
+                # 2xx gate (WI-010). The previous shape counted any
+                # non-rerouteable status as "served", so a reroute target
+                # answering 404 got pinned; a pin must record who actually
+                # served, not who merely answered. transport_error is
+                # possible with a status already stamped (a mid-stream
+                # RequestError), so it is excluded explicitly.
                 served = (
                     not forward_failed
+                    and not probe.transport_error
                     and probe.status is not None
-                    and probe.status not in self._reroute_statuses
+                    and 200 <= probe.status < 300
                 )
                 if (
                     initial_failover_provider is not None
                     and acquired_provider == initial_failover_provider
                     and rerouted_to is None
                 ):
-                    initial_failover_served = (
-                        not forward_failed
-                        and not probe.transport_error
-                        and probe.status is not None
-                        and 200 <= probe.status < 300
-                    )
+                    # Same predicate as the reroute re-pin above — kept as
+                    # one expression so the two pin paths cannot drift
+                    # (WI-020).
+                    initial_failover_served = served
                 if rerouted_to is not None and served and rerouted_to != primary:
                     # This attempt served. Re-pin so later requests in the
                     # conversation go straight here instead of repaying the
@@ -2076,8 +2082,13 @@ class ProxyApp:
 
         # Increment healthy observations on the affinity entry when a
         # failover provider served successfully (Plan 012 WI-C5).
+        # "Served" means the same thing it means for the pin predicates
+        # (WI-020): a confirmed 2xx, not merely a completed response — a
+        # fallback answering 404 is not a success, and Plan 014 keeps this
+        # counter as advisory telemetry for a future failback input, so it
+        # must count fallback SUCCESSES, not answers.
         if (
-            not forward_failed
+            served
             and acquired_provider != primary
             and affinity_key in self._affinity
         ):

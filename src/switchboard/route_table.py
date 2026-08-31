@@ -73,7 +73,7 @@ class RouteTableManager:
         for key, providers_json in cursor:
             try:
                 providers_list = json.loads(providers_json)
-            except (TypeError, json.JSONDecodeError):
+            except (TypeError, json.JSONDecodeError, RecursionError):
                 log.warning(
                     "route table: keyed row %s is not valid JSON; "
                     "ignoring it", key,
@@ -99,7 +99,7 @@ class RouteTableManager:
             return
         try:
             stored_default = json.loads(row[0])
-        except (TypeError, json.JSONDecodeError):
+        except (TypeError, json.JSONDecodeError, RecursionError):
             # A corrupt row must not brick boot — the TOML/constructor default
             # stands and the operator can rewrite it through the API.
             log.warning(

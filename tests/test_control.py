@@ -1851,6 +1851,63 @@ def test_pace_flap_margin_allows_rerank() -> None:
     assert plan.immediate_candidates[0] == "ollama"
 
 
+def test_pace_flap_deadband_does_not_discard_distant_providers() -> None:
+    """WI-017: the deadband is pairwise-adjacent, not all-or-nothing.
+
+    A near-tie at the top clusters only the tied providers; a provider
+    decisively below them still ranks by surplus. Pre-WI-017, any near-tie
+    between the top two discarded the ENTIRE group's surplus ranking and
+    reverted to table order — with table order (c, b, a) that fronted c
+    (surplus ~0.09) over a (~0.89) and b (~0.87).
+    """
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE, pace_flap_margin=0.05,
+    )
+    table = RouteTable(entries={}, default_providers=("c", "b", "a"))
+    # One-hour reset keeps expected burn tiny (~0.006), so surplus tracks the
+    # remaining fraction: a ≈ 0.894, b ≈ 0.874, c ≈ 0.094.
+    # a-b = 0.02 < 0.05 → cluster, table order inside (b before a).
+    # b-c = 0.78 >= 0.05 → c stays ranked by surplus, last.
+    states = {
+        "a": _state(
+            "a", weekly_remaining_fraction=0.90, weekly_reset_in=3600.0,
+        ),
+        "b": _state(
+            "b", weekly_remaining_fraction=0.88, weekly_reset_in=3600.0,
+        ),
+        "c": _state(
+            "c", weekly_remaining_fraction=0.10, weekly_reset_in=3600.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    assert plan.immediate_candidates == ("b", "a", "c")
+
+
+def test_pace_flap_deadband_chains_adjacent_ties() -> None:
+    """WI-017: clustering chains along the surplus order — each adjacent gap
+    is judged on its own, so three providers within a margin of their NEIGHBOUR
+    form one table-order cluster even when the extremes differ by more than
+    the margin (a=0.89, b=0.86, c=0.83 with margin 0.05)."""
+    config = RoutingConfig(
+        strategy=RoutingStrategy.PACE, pace_flap_margin=0.05,
+    )
+    table = RouteTable(entries={}, default_providers=("c", "b", "a"))
+    states = {
+        "a": _state(
+            "a", weekly_remaining_fraction=0.90, weekly_reset_in=3600.0,
+        ),
+        "b": _state(
+            "b", weekly_remaining_fraction=0.87, weekly_reset_in=3600.0,
+        ),
+        "c": _state(
+            "c", weekly_remaining_fraction=0.84, weekly_reset_in=3600.0,
+        ),
+    }
+    plan = route_decision(states, table, "k", config, now=100.0)
+    # One chained cluster → table order c, b, a.
+    assert plan.immediate_candidates == ("c", "b", "a")
+
+
 def test_pace_does_not_demote_primary() -> None:
     """Pace is a ranking signal, not a demotion: the primary stays
     immediate-eligible, queue backstop, and terminal fallback even when it has

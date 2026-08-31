@@ -542,11 +542,12 @@ provider. The fields still parse, so an old file or a stored overlay will not
 break a boot; boot logs one `RETIRED` warning when `opportunistic_enabled` is
 true, and `PUT /admin/config/routing` answers 400 if you try to set one.
 
-`pace_flap_margin` (default `0.05`) is a deadband: when the leader's surplus
-advantage over the runner-up is smaller than the margin, table order is kept
-instead of re-ranking. It stops two near-equal providers alternating on every
-request. Note it compares the top two *candidates*, not the currently-serving
-provider — it is a deadband, not true hysteresis with memory.
+`pace_flap_margin` (default `0.05`) is a deadband: walking down the surplus
+ranking, adjacent providers whose gap is smaller than the margin keep table
+order instead of re-ranking. It stops near-equal providers alternating on every
+request. It compares neighbours in the *surplus order*, not the currently-serving
+provider — it is a deadband, not true hysteresis with memory. A provider
+decisively below a near-tie at the top is unaffected and still ranks by surplus.
 
 **Changing it.** Either surface works, and they validate identically:
 

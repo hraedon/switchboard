@@ -116,7 +116,7 @@ class ModelMapManager:
             return ()
         try:
             parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError) as exc:
+        except (json.JSONDecodeError, TypeError, RecursionError) as exc:
             log.warning(
                 "model-map row %r has corrupt preference JSON, ignoring it: %s",
                 model, exc,
@@ -168,7 +168,7 @@ class ModelMapManager:
         for model, aliases_json, preference_json in cursor:
             try:
                 aliases: dict[str, str] = json.loads(aliases_json)
-            except json.JSONDecodeError as exc:
+            except (json.JSONDecodeError, RecursionError) as exc:
                 log.warning(
                     "model-map row %r has corrupt aliases JSON, skipping: %s",
                     model, exc,

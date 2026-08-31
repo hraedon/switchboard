@@ -74,7 +74,10 @@ class UsageObserver:
         """
         try:
             data: Any = json.loads(body)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
+            # RecursionError: a deeply-nested (syntactically valid) body
+            # overflows the parser — treat it like any other unparseable
+            # body (no usage), never let it break the response path.
             return
         self._extract_usage(data)
 
@@ -101,7 +104,9 @@ class UsageObserver:
                 return
             try:
                 data: Any = json.loads(payload)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
+                # RecursionError: a crafted deeply-nested SSE data line must
+                # not abort the stream mid-flight (see feed_non_streaming).
                 return
             self._extract_usage(data)
 

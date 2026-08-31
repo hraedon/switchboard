@@ -277,6 +277,29 @@ async def test_probe_non_json_response_reports_detail() -> None:
     assert result.detail == "non-JSON response"
 
 
+async def test_probe_deeply_nested_listing_does_not_raise() -> None:
+    # A hostile upstream may answer 200 with deeply-nested (syntactically
+    # valid) JSON well inside the byte cap; json.loads overflows its
+    # recursion on it. The probe must report it like a non-JSON body —
+    # never raise — or one bad provider aborts the whole discovery wave
+    # (asyncio.gather) and the admin models endpoints.
+    nested = b"[" * 100000 + b"]" * 100000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=nested)
+
+    result = await probe_model_listing(
+        _ctx(),
+        client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ),
+    )
+    assert result.ok is False
+    assert result.status == 200
+    assert result.detail == "non-JSON response"
+    assert result.models == ()
+
+
 async def test_probe_status_only_returns_status_and_latency() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url).endswith("/v1/models")

@@ -1,0 +1,21 @@
+name: identifier-gate-dispatch
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    if: '!github.event.deleted'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch trusted identifier scan
+        run: echo "Trusted default-branch identifier scan requested."
+
+  branch-deletion:
+    if: github.event.deleted
+    runs-on: ubuntu-latest
+    steps:
+      - name: Acknowledge branch deletion
+        run: echo "Branch deletion publishes no new tree or commit message."

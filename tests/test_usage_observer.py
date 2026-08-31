@@ -70,6 +70,15 @@ class TestSSEUsageParsing:
         )
         assert observer.usage == (3, 4)
 
+    def test_deeply_nested_sse_data_does_not_raise(self) -> None:
+        # A crafted deeply-nested (syntactically valid) data line overflows
+        # the JSON parser's recursion; the observer must drop it like any
+        # other unparseable line, never abort the stream mid-flight.
+        observer = UsageObserver(is_sse=True)
+        nested = b"[" * 100000 + b"]" * 100000
+        observer.feed_chunk(b"data: " + nested + b"\n\n")
+        assert observer.usage is None
+
 
 class TestNonStreamingUsageParsing:
     def test_extracts_usage_from_json_body(self) -> None:
@@ -97,4 +106,14 @@ class TestNonStreamingUsageParsing:
     def test_malformed_json(self) -> None:
         observer = UsageObserver(is_sse=False)
         observer.feed_non_streaming(b"{not json")
+        assert observer.usage is None
+
+    def test_deeply_nested_body_does_not_raise(self) -> None:
+        # Same class as the SSE case but for the buffered non-streaming body
+        # (capped at 1 MiB upstream of the observer — still deep enough to
+        # overflow the parser). Must be dropped, not raised into the
+        # response path.
+        observer = UsageObserver(is_sse=False)
+        nested = b"[" * 100000 + b"]" * 100000
+        observer.feed_non_streaming(nested)
         assert observer.usage is None

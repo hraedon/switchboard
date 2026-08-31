@@ -1,6 +1,6 @@
 """Mechanical gate against committing work-domain identifiers.
 
-Two complementary checks:
+Three complementary checks:
 
 1. Always-on (no configuration): no tracked file may live under ``samples/``.
    ``.gitignore`` is advisory — ``git add -f`` bypasses it — so this guard makes
@@ -10,11 +10,12 @@ Two complementary checks:
 
 2. Secret-driven: when ``SWITCHBOARD_FORBIDDEN_IDENTIFIERS`` is set (a
    whitespace-separated list of real identifiers — hostnames, emails, service
-   accounts, principal handles, personal names), every tracked text file
-   outside ``samples/`` is scanned for those identifiers. This catches real
-   names that leaked into docs, tests, or reflections. It is a no-op (exit 0)
-   until the secret is configured, so it never blocks a fresh clone or a fork
-   without the secret.
+   accounts, principal handles, personal names), every tracked path and blob is
+   scanned as unmodified bytes, including binary files and force-added build
+   directories. UTF-8 plus both UTF-16 and UTF-32 byte orders are covered.
+   Gitlink names are scanned; LFS pointers fail closed because their referenced
+   bytes are not present to inspect. Outside CI policy mode it is a no-op (exit
+   0) until the secret is configured, so local hooks do not block a fresh clone.
 
    **Multi-word identifiers are double-quoted** (``"two words"``) and match any
    separator run — spaced, hyphenated, underscored, dotted, or wrapped across a
@@ -23,6 +24,10 @@ Two complementary checks:
    tokens that the length filter dropped. A real two-word work-domain name sat
    undetected in sixteen repositories — eight of them public — because of that
    blind spot. Any denylist entry containing a space must stay quoted.
+
+3. CI policy (``--ci``): the publication declaration must be valid and a public
+   repository must have a usable configured denylist. PR CI executes this copy
+   from the trusted base branch while scanning contributor blobs only as data.
 
 Run locally: python scripts/check_committed_identifiers.py
 """
@@ -35,9 +40,12 @@ import re
 import shlex
 import subprocess
 import sys
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
+
+from check_publication_plumbing import PlumbingError, Visibility, load_declaration
 
 MIN_IDENTIFIER_LENGTH = 4
 # Separators a multi-word identifier may be written with. A two-word domain name
@@ -45,12 +53,17 @@ MIN_IDENTIFIER_LENGTH = 4
 # — in wrapped prose — with a line break between the words. A phrase entry
 # matches all of those forms; see _phrase_pattern.
 _PHRASE_SEPARATOR = r"[\s._\-]+"
-_BINARY_SNIFF_LEN = 8192
-# Dirs skipped by the identifier scan: .venv is build output. The always-on
-# guard below handles root-level samples/ (which holds real identifier-bearing
-# data); nested directories named samples/ (e.g. tests/samples/) are legitimate
-# code dirs and SHOULD be scanned.
-_SKIP_DIRS = frozenset({".venv"})
+REPO_GATE_CAPABILITIES = frozenset(
+    {
+        "raw-all-blobs",
+        "trusted-tree",
+        "history-tree-range",
+        "control-safe-messages",
+        "raw-message-bytes",
+        "lfs-fail-closed",
+        "redacted-logs",
+    }
+)
 # Root-level gitignored data dirs that must never contain a tracked file. The
 # guard matches the first path component so a legitimate nested code dir named
 # ``samples`` (e.g. ``tests/samples/``) is not a false positive.
@@ -63,6 +76,16 @@ class Violation:
     path: Path
     line_number: int
     line: str
+    byte_offset: int | None = None
+    source_commit: str | None = None
+
+
+@dataclass(frozen=True)
+class GitTreeFile:
+    path: Path
+    object_id: str
+    object_type: str
+    raw_path: bytes
 
 
 class GateError(Exception):
@@ -75,17 +98,22 @@ class GateError(Exception):
 
 
 def _filter_identifiers(identifiers: frozenset[str]) -> frozenset[str]:
-    """Lowercase, collapse internal whitespace, drop empty or short identifiers.
+    """Casefold, collapse internal whitespace, drop empty or short identifiers.
 
     Internal whitespace is collapsed to a single space so a phrase entry is
     normalized regardless of how it was spaced in the denylist; scan_text then
     matches any separator run.
     """
     return frozenset(
-        " ".join(token.lower().split())
+        " ".join(_normalize_casefold(token).split())
         for token in (i.strip() for i in identifiers)
         if len(" ".join(token.split())) >= MIN_IDENTIFIER_LENGTH
     )
+
+
+def _normalize_casefold(value: str) -> str:
+    """Compatibility-normalize then casefold for canonical Unicode matching."""
+    return unicodedata.normalize("NFKC", value).casefold()
 
 
 def parse_identifier_set(raw: str) -> frozenset[str]:
@@ -129,7 +157,7 @@ def _phrase_pattern(identifier: str) -> re.Pattern[str]:
     and line-wrapped spellings. Everything else is escaped literally.
     """
     parts = [re.escape(word) for word in identifier.split()]
-    return re.compile(_PHRASE_SEPARATOR.join(parts), re.IGNORECASE)
+    return re.compile(_PHRASE_SEPARATOR.join(parts))
 
 
 def scan_text(text: str, identifiers: frozenset[str]) -> Iterator[Violation]:
@@ -152,11 +180,11 @@ def scan_text(text: str, identifiers: frozenset[str]) -> Iterator[Violation]:
 
     lines = text.splitlines()
     for line_number, line in enumerate(lines, start=1):
-        lower = line.lower()
+        folded = _normalize_casefold(line)
         for identifier in words:
             start = 0
             while True:
-                offset = lower.find(identifier, start)
+                offset = folded.find(identifier, start)
                 if offset == -1:
                     break
                 yield Violation(
@@ -169,15 +197,90 @@ def scan_text(text: str, identifiers: frozenset[str]) -> Iterator[Violation]:
 
     if not phrases:
         return
+    folded_text = _normalize_casefold(text)
     for identifier in phrases:
-        for match in _phrase_pattern(identifier).finditer(text):
-            line_number = text.count("\n", 0, match.start()) + 1
+        for match in _phrase_pattern(identifier).finditer(folded_text):
+            line_number = folded_text.count("\n", 0, match.start()) + 1
             yield Violation(
                 identifier=identifier,
                 path=Path("."),
                 line_number=line_number,
                 line=lines[line_number - 1] if line_number <= len(lines) else "",
             )
+
+
+def _encoded_identifier_patterns(identifier: str) -> tuple[re.Pattern[bytes], ...]:
+    """Patterns for an identifier's UTF-8 and UTF-16 raw-byte encodings."""
+    words = identifier.split()
+    patterns: list[re.Pattern[bytes]] = []
+    for encoding, separator in (
+        ("utf-8", rb"[\s._\-]+"),
+        ("utf-16-le", rb"(?:[\x09-\x0d ._\-]\x00)+"),
+        ("utf-16-be", rb"(?:\x00[\x09-\x0d ._\-])+"),
+        ("utf-32-le", rb"(?:[\x09-\x0d ._\-]\x00\x00\x00)+"),
+        ("utf-32-be", rb"(?:\x00\x00\x00[\x09-\x0d ._\-])+")
+    ):
+        encoded_words = [re.escape(word.encode(encoding)) for word in words]
+        pattern = separator.join(encoded_words)
+        patterns.append(re.compile(pattern, re.IGNORECASE))
+    return tuple(patterns)
+
+
+def scan_bytes(data: bytes, identifiers: frozenset[str]) -> Iterator[Violation]:
+    """Scan unmodified bytes, including binary data, for encoded identifiers."""
+    for identifier in _filter_identifiers(identifiers):
+        matched_spans: list[tuple[int, int]] = []
+        for pattern in _encoded_identifier_patterns(identifier):
+            for match in pattern.finditer(data):
+                if any(
+                    match.start() < end and start < match.end()
+                    for start, end in matched_spans
+                ):
+                    continue
+                matched_spans.append(match.span())
+                yield Violation(
+                    identifier=identifier,
+                    path=Path("."),
+                    line_number=0,
+                    line="",
+                    byte_offset=match.start(),
+                )
+
+
+def scan_content(data: bytes, identifiers: frozenset[str]) -> Iterator[Violation]:
+    """Combine binary byte matching with Unicode-casefold decoded matching."""
+    raw_violations = list(scan_bytes(data, identifiers))
+    yield from raw_violations
+    raw_identifiers = {violation.identifier for violation in raw_violations}
+    remaining = _filter_identifiers(identifiers) - raw_identifiers
+    if not remaining:
+        return
+    seen: set[tuple[str, int]] = set()
+    for encoding in ("utf-8", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+        try:
+            text = data.decode(encoding, errors="strict")
+        except UnicodeDecodeError:
+            continue
+        for violation in scan_text(text, remaining):
+            key = (violation.identifier, violation.line_number)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield violation
+
+
+_LFS_VERSION_LINES = frozenset(
+    {
+        b"version https://git-lfs.github.com/spec/v1",
+        b"version https://hawser.github.com/spec/v1",
+    }
+)
+
+
+def _is_lfs_pointer(data: bytes) -> bool:
+    """Recognize current, extension-bearing, and legacy Git LFS pointers."""
+    first_line = data.splitlines()[0] if data else b""
+    return first_line.rstrip(b"\r") in _LFS_VERSION_LINES
 
 
 def _sniff_encoding(chunk: bytes) -> str | None:
@@ -204,11 +307,7 @@ def scan_files(
     *,
     unreadable: list[Path] | None = None,
 ) -> list[Violation]:
-    """Scan every readable text file in *paths* for forbidden identifiers.
-
-    UTF-16 files (common in Windows tooling output) are detected via BOM and
-    decoded correctly rather than misclassified as binary by the null-byte
-    heuristic.
+    """Scan every readable tracked file's raw bytes for forbidden identifiers.
 
     Returns the violations. A tracked file the gate could not read is collected
     into *unreadable* when a list is supplied (WI-027): silently skipping an
@@ -225,32 +324,28 @@ def scan_files(
     if unreadable is None:
         unreadable = []
     for path in paths:
+        for violation in scan_content(os.fsencode(path), identifiers):
+            violations.append(replace(violation, path=path, line=""))
         # A tracked symlink's blob content is its target path, not file data.
         # Scan the target string without following the link: following it either
         # leaves the repo (wrong thing to scan) or fails on a broken link and
         # looks like an unreadable file. The target itself can carry a forbidden
         # identifier, so it is scanned rather than skipped.
         if path.is_symlink():
-            target = os.readlink(path)
-            for violation in scan_text(target, identifiers):
-                violations.append(replace(violation, path=path, line=target))
+            target = os.fsencode(os.readlink(path))
+            for violation in scan_content(target, identifiers):
+                violations.append(replace(violation, path=path, line=""))
             continue
         try:
-            with path.open("rb") as f:
-                chunk = f.read(_BINARY_SNIFF_LEN)
+            data = path.read_bytes()
         except OSError:
             unreadable.append(path)
             continue
-        if _is_binary(chunk):
-            continue
-        encoding = _sniff_encoding(chunk) or "utf-8"
-        try:
-            text = path.read_text(encoding=encoding, errors="replace")
-        except OSError:
-            unreadable.append(path)
-            continue
-        for violation in scan_text(text, identifiers):
+        for violation in scan_content(data, identifiers):
             violations.append(replace(violation, path=path))
+        if _is_lfs_pointer(data):
+            unreadable.append(path)
+            continue
     return violations
 
 
@@ -286,12 +381,29 @@ def _run_git(args: list[str]) -> str:
     return result.stdout
 
 
+def _run_git_bytes(args: list[str]) -> bytes:
+    """Run git without text framing and return stdout bytes."""
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise GateError(
+            f"git command failed ({' '.join(args)}): exit {exc.returncode}: {stderr}"
+        ) from exc
+    except OSError as exc:
+        raise GateError(f"could not run git ({' '.join(args)}): {exc}") from exc
+    return result.stdout
+
+
 def _paths_from_git(args: list[str]) -> list[Path]:
     """Run a NUL-delimited git path command and return Paths.
 
     No filtering is applied here — the always-on samples/ guard needs to see
-    every tracked path so it can detect a force-add. The identifier scan
-    filters out _SKIP_DIRS separately.
+    every tracked path so it can detect a force-add and scans every path.
     """
     paths: list[Path] = []
     for raw in _run_git(args).split("\0"):
@@ -306,7 +418,20 @@ def collect_tracked_paths() -> list[Path]:
     return _paths_from_git(["git", "ls-files", "-z"])
 
 
-def collect_range_messages(rev_range: str) -> list[tuple[str, str]]:
+def collect_range_commits(rev_range: str) -> list[str]:
+    hashes = _run_git(
+        ["git", "rev-list", "--reverse", *rev_range.split()]
+    ).splitlines()
+    commits: list[str] = []
+    for sha in hashes:
+        sha = sha.strip()
+        if re.fullmatch(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?", sha) is None:
+            raise GateError("git rev-list returned an invalid commit object id")
+        commits.append(sha)
+    return commits
+
+
+def collect_range_messages(rev_range: str) -> list[tuple[str, bytes]]:
     """Return ``(sha, message)`` for every commit in *rev_range*.
 
     Commit messages are a publication channel the content gate never covered:
@@ -319,16 +444,122 @@ def collect_range_messages(rev_range: str) -> list[tuple[str, str]]:
     # rev_range may carry several git-log arguments (the pre-push new-branch case
     # passes "<sha> --not --remotes=<name>"), so it is split rather than passed
     # as one opaque argument.
-    result = _run_git(
-        ["git", "log", "--format=%H%x1f%B%x1e", *rev_range.split()],
-    )
-    messages: list[tuple[str, str]] = []
-    for record in result.split("\x1e"):
-        if "\x1f" not in record:
-            continue
-        sha, body = record.split("\x1f", 1)
-        messages.append((sha.strip(), body))
+    # Resolve hashes first, then read each message independently. Message bytes
+    # are never used as framing, so ASCII control characters (including RS, US,
+    # and NUL) cannot terminate one record or hide the next one.
+    messages: list[tuple[str, bytes]] = []
+    for sha in collect_range_commits(rev_range):
+        commit = _run_git_bytes(["git", "cat-file", "commit", sha])
+        _headers, separator, message = commit.partition(b"\n\n")
+        if not separator:
+            raise GateError(f"commit {sha[:9]} has no header/message separator")
+        messages.append((sha, message))
     return messages
+
+
+def collect_tree_files(revision: str) -> list[GitTreeFile]:
+    """Return blob paths and object IDs from *revision* without checkout."""
+    output = _run_git_bytes(
+        ["git", "ls-tree", "-rz", "--full-tree", revision]
+    )
+    files: list[GitTreeFile] = []
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, raw_path = record.split(b"\t", 1)
+            _mode, object_type, object_id = metadata.split(b" ", 2)
+        except ValueError as exc:
+            raise GateError("git ls-tree returned a malformed record") from exc
+        files.append(
+            GitTreeFile(
+                path=Path(raw_path.decode("utf-8", errors="replace")),
+                object_id=object_id.decode("ascii"),
+                object_type=object_type.decode("ascii"),
+                raw_path=raw_path,
+            )
+        )
+    return files
+
+
+def scan_tree_files(
+    identifiers: frozenset[str],
+    files: list[GitTreeFile],
+    *,
+    seen_object_ids: set[str] | None = None,
+    source_commit: str | None = None,
+) -> list[Violation]:
+    """Scan blobs from a git tree without executing or checking out their content."""
+    violations: list[Violation] = []
+    if seen_object_ids is None:
+        seen_object_ids = set()
+    for entry in files:
+        for violation in scan_content(entry.raw_path, identifiers):
+            violations.append(
+                replace(
+                    violation,
+                    path=entry.path,
+                    line="",
+                    source_commit=source_commit,
+                )
+            )
+        if entry.object_type == "commit":
+            for violation in scan_bytes(entry.object_id.encode("ascii"), identifiers):
+                violations.append(
+                    replace(
+                        violation,
+                        path=entry.path,
+                        line="",
+                        source_commit=source_commit,
+                    )
+                )
+            continue
+        if entry.object_type != "blob":
+            raise GateError("git ls-tree returned an unsupported object type")
+        if entry.object_id in seen_object_ids:
+            continue
+        seen_object_ids.add(entry.object_id)
+        blob = _run_git_bytes(["git", "cat-file", "blob", entry.object_id])
+        for violation in scan_content(blob, identifiers):
+            violations.append(
+                replace(violation, path=entry.path, source_commit=source_commit)
+            )
+        if _is_lfs_pointer(blob):
+            path = _sanitize_path(entry.path, identifiers)
+            commit = f" in commit {source_commit[:9]}" if source_commit else ""
+            raise GateError(
+                f"tracked LFS pointer at {path}{commit} hides content the gate cannot scan"
+            )
+    return violations
+
+
+def scan_tree_range(
+    identifiers: frozenset[str],
+    rev_range: str,
+) -> list[Violation]:
+    """Scan each newly introduced commit tree, deduplicating repeated blob objects."""
+    violations: list[Violation] = []
+    seen_object_ids: set[str] = set()
+    for commit in collect_range_commits(rev_range):
+        files = collect_tree_files(commit)
+        leaked = leaked_tracked_files(
+            [entry.path for entry in files],
+            _GUARDED_DIRS,
+        )
+        if leaked:
+            path = _sanitize_path(leaked[0], identifiers)
+            raise GateError(
+                f"tracked guarded path {path} is present in commit {commit[:9]}"
+            )
+        violations.extend(
+            scan_tree_files(
+                identifiers,
+                files,
+                seen_object_ids=seen_object_ids,
+                source_commit=commit,
+            )
+        )
+    return violations
 
 
 def collect_staged_paths() -> list[Path]:
@@ -348,12 +579,66 @@ def collect_staged_paths() -> list[Path]:
     )
 
 
+def _redact_location(value: str, identifier: str) -> str:
+    pattern = (
+        _phrase_pattern(identifier)
+        if " " in identifier
+        else re.compile(re.escape(identifier), re.IGNORECASE)
+    )
+    return pattern.sub("[REDACTED]", value)
+
+
+def _redact_identifiers(value: str, identifiers: frozenset[str]) -> str:
+    for identifier in identifiers:
+        value = _redact_location(value, identifier)
+        folded = _normalize_casefold(value)
+        remains = (
+            _phrase_pattern(identifier).search(folded) is not None
+            if " " in identifier
+            else _normalize_casefold(identifier) in folded
+        )
+        if remains:
+            return "[REDACTED PATH]"
+    return value
+
+
+def _sanitize_controls(value: str) -> str:
+    """Escape control characters so diagnostics cannot inject log commands."""
+    sanitized: list[str] = []
+    for char in value:
+        codepoint = ord(char)
+        if unicodedata.category(char).startswith("C") or char in {"\u2028", "\u2029"}:
+            escape = (
+                f"\\x{codepoint:02x}"
+                if codepoint <= 0xFF
+                else f"\\u{codepoint:04x}"
+            )
+            sanitized.append(escape)
+        else:
+            sanitized.append(char)
+    return "".join(sanitized)
+
+
+def _sanitize_path(path: Path, identifiers: frozenset[str]) -> str:
+    return _sanitize_controls(_redact_identifiers(str(path), identifiers))
+
+
 def print_report(violations: list[Violation]) -> None:
     violations.sort(key=lambda v: (str(v.path), v.line_number, v.identifier))
+    identifiers = frozenset(violation.identifier for violation in violations)
     print("Committed identifier violations detected:", file=sys.stderr)
     for v in violations:
-        print(f"  {v.path}:{v.line_number}: {v.identifier!r}", file=sys.stderr)
-        print(f"      {v.line.rstrip()}", file=sys.stderr)
+        path = _sanitize_path(v.path, identifiers)
+        location = (
+            f"byte offset {v.byte_offset}"
+            if v.byte_offset is not None
+            else f"line {v.line_number}"
+        )
+        commit = f"commit {v.source_commit[:9]}: " if v.source_commit else ""
+        print(
+            f"  {commit}{path}: {location}: forbidden identifier detected",
+            file=sys.stderr,
+        )
     print(f"\nTotal: {len(violations)} violation(s)", file=sys.stderr)
 
 
@@ -395,11 +680,48 @@ def _resolve_identifiers() -> frozenset[str] | None:
     return identifiers
 
 
+def _enforce_ci_policy() -> None:
+    """Fail closed when CI cannot provide a trustworthy identifier scan.
+
+    Public repositories require a valid publication declaration and a usable
+    configured denylist.
+    """
+    try:
+        declaration = load_declaration(Path.cwd())
+    except PlumbingError as exc:
+        raise GateError(f"publication policy is invalid: {exc}") from exc
+    if declaration is None:
+        raise GateError(
+            "publication.toml is missing; CI cannot determine whether the identifier "
+            "gate must be configured"
+        )
+
+    if declaration.visibility is not Visibility.PUBLIC:
+        return
+
+    raw = os.environ.get("SWITCHBOARD_FORBIDDEN_IDENTIFIERS", "")
+    if not raw.strip():
+        raise GateError(
+            "publication.toml declares visibility=public but the configured denylist "
+            "secret is empty or unset"
+        )
+    if not parse_identifier_set(raw):
+        raise GateError(
+            "publication.toml declares visibility=public but the configured denylist "
+            f"secret contains no usable identifiers (minimum length is "
+            f"{MIN_IDENTIFIER_LENGTH} characters)"
+        )
+
+
 def _report_message_violations(label: str, violations: list[Violation]) -> None:
-    print(f"Forbidden identifier in {label}:", file=sys.stderr)
+    print(f"Forbidden identifier in {_sanitize_controls(label)}:", file=sys.stderr)
     for v in sorted(violations, key=lambda v: (v.line_number, v.identifier)):
-        print(f"  line {v.line_number}: {v.identifier!r}", file=sys.stderr)
-        print(f"      {v.line.rstrip()}", file=sys.stderr)
+        location = (
+            f"byte offset {v.byte_offset}"
+            if v.byte_offset is not None
+            else f"line {v.line_number}"
+        )
+        print(f"  {location}: forbidden identifier detected", file=sys.stderr)
     print(
         "\nA commit message is published with the commit. Rewrite the message "
         "without the identifier (the canonical denylist is the authority on what "
@@ -414,13 +736,13 @@ def _scan_message_file(path: Path) -> int:
     if identifiers is None:
         return 0
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        data = path.read_bytes()
     except OSError as exc:
         raise GateError(f"could not read the commit message file {path}: {exc}") from exc
     # git puts everything after a scissors line out of the commit; comment lines
     # are stripped too. Scan only what will actually be recorded.
-    kept = [ln for ln in text.splitlines() if not ln.startswith("#")]
-    violations = list(scan_text("\n".join(kept), identifiers))
+    kept = [line for line in data.splitlines() if not line.startswith(b"#")]
+    violations = list(scan_content(b"\n".join(kept), identifiers))
     if violations:
         _report_message_violations("the proposed commit message", violations)
         return 1
@@ -434,7 +756,7 @@ def _scan_rev_range(rev_range: str) -> int:
         return 0
     failed = False
     for sha, body in collect_range_messages(rev_range):
-        violations = list(scan_text(body, identifiers))
+        violations = list(scan_content(body, identifiers))
         if violations:
             _report_message_violations(f"commit message {sha[:9]}", violations)
             failed = True
@@ -442,12 +764,30 @@ def _scan_rev_range(rev_range: str) -> int:
 
 
 def _run(args: argparse.Namespace) -> int:
+    if args.ci:
+        _enforce_ci_policy()
     if args.message_file is not None:
         return _scan_message_file(Path(args.message_file))
     if args.rev_range is not None:
         return _scan_rev_range(args.rev_range)
+    if args.tree_range is not None:
+        identifiers = _resolve_identifiers()
+        if identifiers is None:
+            return 0
+        violations = scan_tree_range(identifiers, args.tree_range)
+        if violations:
+            print_report(violations)
+            return 1
+        return 0
 
-    paths = collect_staged_paths() if args.staged else collect_tracked_paths()
+    tree_files = collect_tree_files(args.tree) if args.tree is not None else None
+    paths = (
+        [entry.path for entry in tree_files]
+        if tree_files is not None
+        else (collect_staged_paths() if args.staged else collect_tracked_paths())
+    )
+    raw = os.environ.get("SWITCHBOARD_FORBIDDEN_IDENTIFIERS", "")
+    report_identifiers = parse_identifier_set(raw) if raw.strip() else frozenset()
 
     # 1. Always-on: no tracked file under a guarded (gitignored) data dir. This
     #    catches a ``git add -f samples/...`` leak regardless of secret config.
@@ -455,7 +795,7 @@ def _run(args: argparse.Namespace) -> int:
     if leaked:
         print("Tracked files under a gitignored data directory detected:", file=sys.stderr)
         for p in sorted(leaked, key=str):
-            print(f"  {p}", file=sys.stderr)
+            print(f"  {_sanitize_path(p, report_identifiers)}", file=sys.stderr)
         print(
             "\nThese paths are gitignored by convention (samples/ holds real "
             "identifier-bearing data — hostnames, service accounts, principal "
@@ -466,7 +806,6 @@ def _run(args: argparse.Namespace) -> int:
 
     # 2. Secret-driven: scan tracked text files (outside guarded dirs) for
     #    forbidden identifiers. No-op until the secret is configured.
-    raw = os.environ.get("SWITCHBOARD_FORBIDDEN_IDENTIFIERS", "")
     if not raw.strip():
         # Split so the line still fits at 100 columns after the per-repo env-var
         # substitution: the longest name in the estate is 52 characters, 19 more
@@ -488,16 +827,18 @@ def _run(args: argparse.Namespace) -> int:
         )
         return 0
 
-    scan_paths = [p for p in paths if not any(part in _SKIP_DIRS for part in p.parts)]
     unreadable: list[Path] = []
-    violations = scan_files(identifiers, scan_paths, unreadable=unreadable)
+    if tree_files is not None:
+        violations = scan_tree_files(identifiers, tree_files)
+    else:
+        violations = scan_files(identifiers, paths, unreadable=unreadable)
     if violations:
         print_report(violations)
         return 1
     if unreadable:
         print("Tracked files could not be read; the gate cannot clear them:", file=sys.stderr)
         for p in sorted(unreadable, key=str):
-            print(f"  {p}", file=sys.stderr)
+            print(f"  {_sanitize_path(p, identifiers)}", file=sys.stderr)
         print(
             "\nAn unreadable tracked file may contain a forbidden identifier. Fix the "
             "permissions (or untrack the file) and re-run; the gate will not pass a "
@@ -519,6 +860,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Scan only staged files (for the pre-commit hook) instead of the "
         "full tracked tree (the CI default).",
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Enforce publication and trusted-event policy before scanning in CI.",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--message-file",
@@ -532,12 +878,28 @@ def main(argv: list[str] | None = None) -> int:
         help="Scan the commit messages in a git rev range (for the pre-push "
         "hook), e.g. origin/main..HEAD.",
     )
+    mode.add_argument(
+        "--tree",
+        metavar="REVISION",
+        help="Scan tracked blobs from a git tree without checking them out.",
+    )
+    mode.add_argument(
+        "--tree-range",
+        metavar="RANGE",
+        help="Scan every commit tree in a git revision range, deduplicating blobs.",
+    )
     args = parser.parse_args(argv)
 
     try:
         return _run(args)
     except GateError as exc:
-        print(f"identifier gate could not complete: {exc}", file=sys.stderr)
+        raw = os.environ.get("SWITCHBOARD_FORBIDDEN_IDENTIFIERS", "")
+        try:
+            identifiers = parse_identifier_set(raw) if raw.strip() else frozenset()
+        except ValueError:
+            identifiers = frozenset()
+        message = _sanitize_controls(_redact_identifiers(str(exc), identifiers))
+        print(f"identifier gate could not complete: {message}", file=sys.stderr)
         return 1
     except ValueError as exc:
         # Unparseable denylist (bad quoting). Fail closed, loudly.

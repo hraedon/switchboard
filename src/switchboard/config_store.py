@@ -559,7 +559,7 @@ class ConfigStoreManager:
             return {}
         try:
             loaded = json.loads(row[0])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             log.warning(
                 "config store: routing overlay is not valid JSON; ignoring it"
             )
@@ -611,7 +611,7 @@ class ConfigStoreManager:
             return []
         try:
             loaded = json.loads(row[0])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             log.warning("config store: quarantine is not valid JSON; ignoring")
             return []
         if not isinstance(loaded, list):
@@ -719,7 +719,7 @@ def _validate_row(row: _ProviderRow) -> None:
 
         try:
             loaded = json.loads(row.peak_windows)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             raise ValueError(
                 f"provider {row.name!r}: peak_windows cell is not valid JSON"
             ) from None
@@ -750,7 +750,7 @@ def _normalize_peak_windows(value: object) -> str | None:
     if isinstance(value, str):
         try:
             value = json.loads(value)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             raise ValueError(
                 "field 'peak_windows' must be a list of window strings"
             ) from None
@@ -772,7 +772,7 @@ def _peak_windows_list(row_value: str | None) -> list[str]:
         return []
     try:
         loaded = json.loads(row_value)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         return []
     if not isinstance(loaded, list):
         return []
