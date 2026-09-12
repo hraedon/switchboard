@@ -20,11 +20,19 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # The ingress controller, so the internal hostname works.
+    # The ingress controller, so the internal hostname works. This must name
+    # the namespace the controller ACTUALLY runs in: the Ingress for this
+    # service sets ingressClassName: traefik-internal, and that controller
+    # lives in the namespace of the same name. A namespaceSelector that
+    # matches nothing fails closed and silently -- the pod stays Ready, its
+    # probes pass, and the only symptom is a 502 from the ingress.
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: kube-system
+              kubernetes.io/metadata.name: traefik-internal
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
       ports:
         - protocol: TCP
           port: 8801
