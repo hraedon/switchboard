@@ -69,16 +69,6 @@ data:
     # dashboard_stale_ttl 2700: the dashboard's refetch cadence stretches
     # to ~30 min; the 900 s default flags normal-cadence readings stale.
 
-    [provider.opencode-go]
-    upstream = "https://opencode.ai/zen/go/v1"
-    type = "generic"
-    target = 4
-    api_key_env = "SWITCHBOARD_OPENCODE_GO_KEY"
-    dashboard_url = "http://usage-dashboard-server.usage-dashboard.svc.cluster.local:8080"
-    dashboard_token_env = "SWITCHBOARD_DASHBOARD_TOKEN"
-    dashboard_provider = "opencode"
-    dashboard_stale_ttl = 2700
-
     [provider.ollama-cloud]
     upstream = "https://ollama.com/v1"
     type = "generic"
@@ -112,7 +102,7 @@ data:
     # candidates ranked by headroom at decision time.
 
     [route.default]
-    providers = ["opencode-go", "ollama-cloud", "zai"]
+    providers = ["ollama-cloud", "zai"]
 
     # ── usage-error reroute ──────────────────────────────────────────────────
     #
@@ -129,15 +119,12 @@ data:
     # failover does not forward a name the fallback rejects.
 
     [model."deepseek-v4-flash"]
-    opencode-go = "deepseek-v4-flash"
     ollama-cloud = "deepseek-v4-flash"
 
     [model."kimi-k3"]
-    opencode-go = "kimi-k3"
     ollama-cloud = "kimi-k3"
 
     [model."glm-5.2"]
-    opencode-go = "glm-5.2"
     ollama-cloud = "glm-5.2"
     zai = "glm-5.2"
 
