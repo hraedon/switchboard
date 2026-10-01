@@ -40,11 +40,13 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import tomllib
 import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from check_publication_plumbing import PlumbingError, Visibility, load_declaration
 
@@ -697,6 +699,65 @@ def _staged_declaration_text() -> str | None:
         ) from exc
 
 
+def _git_or_none(args: list[str]) -> str | None:
+    """Return the stdout of a git command, or None when it fails (optional lookups)."""
+    try:
+        return _run_git(args)
+    except GateError:
+        return None
+
+
+def _absent_declaration_verdict() -> bool:
+    """Verdict for a repo whose declaration is ABSENT: False, unless it was removed.
+
+    Absence is the "never opted in" skip. But deleting a declaration that said
+    public does not make the remote private: it only disarmed the gate (the
+    missing-denylist refusal became a skip). So if the last declaration this
+    history recorded -- in HEAD, or just before the commit that deleted it --
+    was public, absence is an error. To leave the publication system, declare
+    "private-until-review" first and remove the file in a later commit.
+
+    Best effort on shallow clones: a deletion older than the fetched history is
+    invisible here, and then the absence skip applies as before.
+    """
+    prior: str | None = None
+    if _git_or_none(["git", "rev-parse", "--verify", "-q", "HEAD"]) is not None:
+        prior = _git_or_none(["git", "show", f"HEAD:{_DECLARATION_FILENAME}"])
+        if prior is None:
+            deleted_in = (
+                _git_or_none(
+                    [
+                        "git",
+                        "log",
+                        "-1",
+                        "--format=%H",
+                        "--diff-filter=D",
+                        "HEAD",
+                        "--",
+                        f":(top,literal){_DECLARATION_FILENAME}",
+                    ]
+                )
+                or ""
+            ).strip()
+            if deleted_in:
+                prior = _git_or_none(["git", "show", f"{deleted_in}^:{_DECLARATION_FILENAME}"])
+    if prior is None:
+        return False
+    try:
+        section = tomllib.loads(prior).get("publication")
+    except tomllib.TOMLDecodeError:
+        return False
+    declared = section.get("visibility") if isinstance(section, dict) else None
+    if isinstance(declared, str) and declared.strip().casefold() == "public":
+        raise GateError(
+            f"{_DECLARATION_FILENAME} is absent, but this history last declared "
+            'visibility="public"; removing the declaration does not make the remote '
+            "private, so the gate will not treat it as never opted in. Restore it, or "
+            'declare "private-until-review" before removing it.'
+        )
+    return False
+
+
 def _declares_public() -> bool:
     """True when this repo's publication.toml declares public visibility.
 
@@ -726,7 +787,7 @@ def _declares_public() -> bool:
     if _DECLARATION_FROM_INDEX[0]:
         text = _staged_declaration_text()
         if text is None:
-            return False
+            return _absent_declaration_verdict()
     else:
         path = repo_root / _DECLARATION_FILENAME
         # Only genuine absence is the "never opted in" skip. A path that exists
@@ -734,7 +795,7 @@ def _declares_public() -> bool:
         # not) used to take the same branch via `not path.is_file()`, so a
         # stray directory or link silently disarmed a public repo's gate.
         if not os.path.lexists(path):
-            return False
+            return _absent_declaration_verdict()
         if path.is_symlink() or not path.is_file():
             raise GateError(
                 f"{_DECLARATION_FILENAME} is present but is not a regular file; the "
@@ -928,6 +989,52 @@ def _scan_rev_range(rev_range: str) -> int:
     return 1 if failed else 0
 
 
+def _scan_index_snapshot(identifiers: frozenset[str], paths: list[Path], **kwargs: Any) -> Any:
+    """``scan_files`` over the STAGED (stage-0 index) content of *paths*.
+
+    --staged is the pre-commit hook, so it must judge the bytes the commit will
+    record. Scanning the worktree let a staged forbidden identifier hide behind a
+    clean unstaged copy (stage it, then overwrite the file) -- and blocked clean
+    commits whose worktree held unstaged junk. The staged blobs are materialised
+    with ``git checkout-index`` into a private temporary directory and scanned by
+    the unchanged ``scan_files``, so binary/encoding/symlink handling is exactly the
+    tree scan's (checkout-index writes a staged symlink as a symlink, whose target
+    string scan_files scans). Reported paths are mapped back to repo-relative.
+
+    Fail closed: a path git cannot materialise (for example an unmerged entry) is
+    missing from the snapshot, which scan_files reports as unreadable.
+    """
+    repo_root = _run_git(["git", "rev-parse", "--show-toplevel"]).strip()
+    with tempfile.TemporaryDirectory(prefix="identifier-gate-index-") as tmp:
+        if paths:
+            try:
+                _run_git(
+                    ["git", "-C", repo_root, "checkout-index", "-f", f"--prefix={tmp}/", "--"]
+                    + [p.as_posix() for p in paths]
+                )
+            except GateError as exc:
+                raise GateError(
+                    f"could not read the staged content to scan it ({exc}); the gate "
+                    "will not pass a commit it could not fully scan."
+                ) from exc
+        base = Path(tmp)
+
+        def back(p: Path) -> Path:
+            try:
+                return Path(p).relative_to(base)
+            except ValueError:
+                return Path(p)
+
+        unreadable = kwargs.get("unreadable")
+        result = scan_files(identifiers, [base / p for p in paths], **kwargs)
+        if isinstance(unreadable, list):
+            unreadable[:] = [back(p) for p in unreadable]
+        if isinstance(result, tuple):
+            found, missed = result
+            return [replace(v, path=back(v.path)) for v in found], [back(p) for p in missed]
+        return [replace(v, path=back(v.path)) for v in result]
+
+
 def _run(args: argparse.Namespace) -> int:
     if args.ci:
         _enforce_ci_policy()
@@ -990,7 +1097,9 @@ def _run(args: argparse.Namespace) -> int:
     if tree_files is not None:
         violations = scan_tree_files(identifiers, tree_files)
     else:
-        violations = scan_files(identifiers, paths, unreadable=unreadable)
+        # --staged judges the index blobs (what the commit records), never the worktree.
+        scan = _scan_index_snapshot if args.staged else scan_files
+        violations = scan(identifiers, paths, unreadable=unreadable)
     if violations:
         print_report(violations)
         return 1
