@@ -40,6 +40,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tomllib
 import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -86,6 +87,9 @@ class GitTreeFile:
     object_id: str
     object_type: str
     raw_path: bytes
+
+
+_DECLARATION_FILENAME = "publication.toml"
 
 
 class GateError(Exception):
@@ -651,6 +655,105 @@ def leaked_tracked_files(paths: list[Path], guarded: frozenset[str]) -> list[Pat
     return [p for p in paths if p.parts and p.parts[0] in guarded]
 
 
+def _declares_public() -> bool:
+    """True when this repo's publication.toml declares public visibility.
+
+    Governs whether a missing denylist is a no-op or a hard failure. The
+    distinction is the whole point: a private-until-review repo must stay
+    clonable and committable without the secret, but a PUBLIC repo whose gate is
+    unconfigured is a silent pass — the scan prints "skipping" and exits 0, and
+    nothing downstream can tell that apart from a clean tree.
+
+    Absence of the file is False (fail-open): a repo that never opted into the
+    publication system is not suddenly blocked. A file that is PRESENT but
+    unparseable is a GateError, not False — that repo did opt in, and guessing
+    its visibility is exactly the coin-flip this function exists to remove.
+    """
+    try:
+        repo_root = Path(_run_git(["git", "rev-parse", "--show-toplevel"]).strip())
+    except GateError:
+        # Not a git repo (or git is unusable). The caller's other git work will
+        # surface that; do not convert it into a publication verdict here.
+        return False
+
+    path = repo_root / _DECLARATION_FILENAME
+    if not path.is_file():
+        return False
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise GateError(
+            f"{_DECLARATION_FILENAME} is present but could not be parsed ({exc}); "
+            "the gate cannot tell whether this repo is public, so it will not pass."
+        ) from exc
+
+    section = raw.get("publication")
+    if not isinstance(section, dict):
+        raise GateError(
+            f"{_DECLARATION_FILENAME} has no [publication] table; the gate cannot "
+            "tell whether this repo is public, so it will not pass."
+        )
+    # The set of legal visibilities is closed, and owned by Visibility in
+    # check_publication_plumbing.py. Compare against it rather than against the
+    # bare string "public": anything outside the set is a GateError, not a quiet
+    # "not public".
+    #
+    # This used to be `str(section.get("visibility", "")).strip() == "public"`,
+    # which coerced every other shape into the fail-OPEN branch. On a public repo
+    # that silently disarmed the gate -- the exact "nothing was scanned and CI is
+    # green" failure this function exists to prevent. A wrong-cased value
+    # ("Public"), a missing visibility key, an empty string, and a non-string
+    # (visibility = true) all took that branch. The declaration flip is precisely
+    # the commit where this matters: a case typo or a dropped line in the
+    # publication-review commit disarmed every later run.
+    if "visibility" not in section:
+        raise GateError(
+            f"{_DECLARATION_FILENAME} has a [publication] table but no visibility "
+            "key; the gate cannot tell whether this repo is public, so it will "
+            "not pass."
+        )
+    declared = section["visibility"]
+    if not isinstance(declared, str):
+        raise GateError(
+            f"{_DECLARATION_FILENAME} declares visibility={declared!r}, which is "
+            f"{type(declared).__name__} rather than a string; the gate cannot tell "
+            "whether this repo is public, so it will not pass."
+        )
+    normalised = declared.strip().casefold()
+    if normalised == "public":
+        return True
+    if normalised == "private-until-review":
+        return False
+    raise GateError(
+        f"{_DECLARATION_FILENAME} declares visibility={declared!r}, which is not "
+        'one of "public" or "private-until-review"; the gate cannot tell whether '
+        "this repo is public, so it will not pass."
+    )
+
+
+def _unconfigured(reason: str) -> None:
+    """Handle a denylist that is unset or unusable.
+
+    Returns quietly (caller no-ops) for a non-public repo; raises GateError for a
+    public one.
+    """
+    if _declares_public():
+        raise GateError(
+            f"{reason} but {_DECLARATION_FILENAME} declares visibility=\"public\". "
+            "A public repo with an unconfigured gate is a silent pass, so this is "
+            # The env-name placeholder below sits on a line of its own. The longest
+            # name in the estate is 52 characters, and folding it into a prose line
+            # pushes the SUBSTITUTED file past 100 columns while the template itself
+            # still looks clean. (This comment may not name the placeholder: it would
+            # be substituted too, and would itself go over.)
+            "a failure, not a skip. Provide the denylist via the "
+            "SWITCHBOARD_FORBIDDEN_IDENTIFIERS environment variable "
+            "(in CI, the secret of that name: org-level where the repo is in an "
+            "org, otherwise a repo-level secret)."
+        )
+    print(f"{reason}; skipping identifier gate.", file=sys.stderr)
+
+
 def _resolve_identifiers() -> frozenset[str] | None:
     """Return the configured denylist, or None if the gate should no-op.
 
@@ -659,22 +762,16 @@ def _resolve_identifiers() -> frozenset[str] | None:
     """
     raw = os.environ.get("SWITCHBOARD_FORBIDDEN_IDENTIFIERS", "")
     if not raw.strip():
-        # Split so the line still fits at 100 columns after the per-repo env-var
-        # substitution: the longest name in the estate is 52 characters, 19 more
-        # than the canonical one, which pushed this over the limit in two repos.
-        print(
-            "SWITCHBOARD_FORBIDDEN_IDENTIFIERS is empty or unset; "
-            "skipping identifier gate.",
-            file=sys.stderr,
+        _unconfigured(
+            "SWITCHBOARD_FORBIDDEN_IDENTIFIERS is empty or unset"
         )
         return None
     identifiers = parse_identifier_set(raw)
     if not identifiers:
-        print(
+        _unconfigured(
             "SWITCHBOARD_FORBIDDEN_IDENTIFIERS contained no usable "
             f"identifiers (minimum length is {MIN_IDENTIFIER_LENGTH} "
-            "characters); skipping gate.",
-            file=sys.stderr,
+            "characters)"
         )
         return None
     return identifiers
@@ -807,23 +904,17 @@ def _run(args: argparse.Namespace) -> int:
     # 2. Secret-driven: scan tracked text files (outside guarded dirs) for
     #    forbidden identifiers. No-op until the secret is configured.
     if not raw.strip():
-        # Split so the line still fits at 100 columns after the per-repo env-var
-        # substitution: the longest name in the estate is 52 characters, 19 more
-        # than the canonical one, which pushed this over the limit in two repos.
-        print(
-            "SWITCHBOARD_FORBIDDEN_IDENTIFIERS is empty or unset; "
-            "skipping identifier gate.",
-            file=sys.stderr,
+        _unconfigured(
+            "SWITCHBOARD_FORBIDDEN_IDENTIFIERS is empty or unset"
         )
         return 0
 
     identifiers = parse_identifier_set(raw)
     if not identifiers:
-        print(
+        _unconfigured(
             "SWITCHBOARD_FORBIDDEN_IDENTIFIERS contained no usable "
             f"identifiers (minimum length is {MIN_IDENTIFIER_LENGTH} "
-            "characters); skipping gate.",
-            file=sys.stderr,
+            "characters)"
         )
         return 0
 
