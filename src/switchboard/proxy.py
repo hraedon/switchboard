@@ -451,7 +451,7 @@ class RoutingMetrics:
         self.usage_giveups_total += 1
 
     def record_forwarded(self, provider: str) -> None:
-        """Record a successful forward to a provider."""
+        """Record a fully delivered 2xx response from a provider."""
         self.forwarded_per_provider[provider] = (
             self.forwarded_per_provider.get(provider, 0) + 1
         )
@@ -1893,8 +1893,6 @@ class ProxyApp:
                     model_map=model_map,
                     probe=probe,
                 )
-                if not probe.triggered:
-                    self._metrics.record_forwarded(acquired_provider)
             except Exception:
                 forward_failed = True
                 log.exception("proxy forward failed")
@@ -2692,6 +2690,16 @@ class ProxyApp:
                         and not upstream_idle
                     ):
                         ctx.reconcile.record_success()
+
+                    # Count success only after the final downstream send.
+                    # _forward also returns normally for handled errors,
+                    # disconnects and idle timeouts (WI-005).
+                    if (
+                        200 <= response.status_code < 300
+                        and not upstream_idle
+                        and not disconnect.is_set()
+                    ):
+                        self._metrics.record_forwarded(ctx.name)
 
                     # Feed the observed usage into whichever consumers are
                     # configured (Plan 012 Feature B / Plan 020 Wave 3 —
