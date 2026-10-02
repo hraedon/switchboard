@@ -99,7 +99,7 @@ jobs:
         run: >-
           python scripts/check_committed_identifiers.py --ci
           --tree-range "${{ steps.range.outputs.range }}"
-      - name: Scan commit messages using trusted scanner code
+      - name: Scan commit metadata and published history using trusted scanner code
         if: github.event_name == 'pull_request_target' || steps.dispatch.outputs.mode == 'scan'
         env:
           SWITCHBOARD_FORBIDDEN_IDENTIFIERS: ${{ secrets.SWITCHBOARD_FORBIDDEN_IDENTIFIERS }}
