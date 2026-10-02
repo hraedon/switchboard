@@ -1,12 +1,10 @@
 """Mechanical gate against committing work-domain identifiers.
 
-Three complementary checks:
+Four complementary checks:
 
-1. Always-on (no configuration): no tracked file may live under ``samples/``.
-   ``.gitignore`` is advisory — ``git add -f`` bypasses it — so this guard makes
-   an accidental force-add of a real identifier-bearing data file fail CI. The
-   ``samples/`` directory holds real environment data (hostnames, service
-   accounts, principal handles) that must never be committed (AGENTS.md).
+1. Always-on (no configuration): no tracked file may live under ``samples/`` or
+   under a ``.venv/`` directory at any depth. ``.gitignore`` is advisory —
+   ``git add -f`` bypasses it — so this guard makes accidental force-adds fail.
 
 2. Secret-driven: when ``SWITCHBOARD_FORBIDDEN_IDENTIFIERS`` is set (a
    whitespace-separated list of real identifiers — hostnames, emails, service
@@ -14,8 +12,8 @@ Three complementary checks:
    scanned as unmodified bytes, including binary files and force-added build
    directories. UTF-8 plus both UTF-16 and UTF-32 byte orders are covered.
    Gitlink names are scanned; LFS pointers fail closed because their referenced
-   bytes are not present to inspect. Outside CI policy mode it is a no-op (exit
-   0) until the secret is configured, so local hooks do not block a fresh clone.
+   bytes are not present to inspect. Without a denylist it is a no-op only for a
+   private-until-review repo; a public declaration fails closed.
 
    **Multi-word identifiers are double-quoted** (``"two words"``) and match any
    separator run — spaced, hyphenated, underscored, dotted, or wrapped across a
@@ -25,7 +23,11 @@ Three complementary checks:
    undetected in sixteen repositories — eight of them public — because of that
    blind spot. Any denylist entry containing a space must stay quoted.
 
-3. CI policy (``--ci``): the publication declaration must be valid and a public
+3. Published ranges (``--rev-range`` / ``--ci-range``): every commit's message,
+   author/committer identity, path, and complete tree are scanned as raw git
+   objects, so intermediate content removed before the tip remains visible.
+
+4. CI policy (``--ci``): the publication declaration must be valid and a public
    repository must have a usable configured denylist. PR CI executes this copy
    from the trusted base branch while scanning contributor blobs only as data.
 
@@ -35,6 +37,8 @@ Run locally: python scripts/check_committed_identifiers.py
 from __future__ import annotations
 
 import argparse
+import codecs
+import json
 import os
 import re
 import shlex
@@ -71,6 +75,9 @@ REPO_GATE_CAPABILITIES = frozenset(
 # guard matches the first path component so a legitimate nested code dir named
 # ``samples`` (e.g. ``tests/samples/``) is not a false positive.
 _GUARDED_DIRS = frozenset({"samples"})
+_VENV_DIR = ".venv"
+_OBJECT_ID = re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?")
+_NULL_OBJECT_ID = re.compile(r"0+")
 
 
 @dataclass(frozen=True)
@@ -262,7 +269,14 @@ def scan_content(data: bytes, identifiers: frozenset[str]) -> Iterator[Violation
     if not remaining:
         return
     seen: set[tuple[str, int]] = set()
-    for encoding in ("utf-8", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+    for encoding in (
+        "latin-1",
+        "utf-8",
+        "utf-16-le",
+        "utf-16-be",
+        "utf-32-le",
+        "utf-32-be",
+    ):
         try:
             text = data.decode(encoding, errors="strict")
         except UnicodeDecodeError:
@@ -420,7 +434,7 @@ def _paths_from_git(args: list[str]) -> list[Path]:
 
 
 def collect_tracked_paths() -> list[Path]:
-    """Return tracked file paths from ``git ls-files``, excluding obvious skips."""
+    """Return every tracked file path from ``git ls-files`` without path skips."""
     return _paths_from_git(["git", "ls-files", "-z"])
 
 
@@ -431,7 +445,7 @@ def collect_range_commits(rev_range: str) -> list[str]:
     commits: list[str] = []
     for sha in hashes:
         sha = sha.strip()
-        if re.fullmatch(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?", sha) is None:
+        if _OBJECT_ID.fullmatch(sha) is None:
             raise GateError("git rev-list returned an invalid commit object id")
         commits.append(sha)
     return commits
@@ -461,6 +475,78 @@ def collect_range_messages(rev_range: str) -> list[tuple[str, bytes]]:
             raise GateError(f"commit {sha[:9]} has no header/message separator")
         messages.append((sha, message))
     return messages
+
+
+def _object_encoding(headers: bytes) -> str:
+    """Return a commit or tag's declared codec, defaulting safely to UTF-8."""
+    for line in headers.split(b"\n"):
+        if line.startswith(b"encoding "):
+            name = line[len(b"encoding ") :].decode("ascii", errors="replace").strip()
+            try:
+                return codecs.lookup(name).name
+            except LookupError:
+                return "utf-8"
+    return "utf-8"
+
+
+def _text_views(data: bytes, declared: str) -> str:
+    """*data* decoded every plausible way, one view per line; a hit in ANY view counts.
+
+    Git does not guarantee that a commit's or tag's bytes match its ``encoding``
+    header: a legacy-encoded message can carry no header at all (read as UTF-8),
+    and author/committer names are often UTF-8 inside an ISO-8859-1 commit.
+    Picking the "right" codec is guesswork, so the scan does not pick: the
+    declared encoding, UTF-8 and latin-1 (the raw bytes, one char each) are all
+    scanned.
+    """
+    views: list[str] = []
+    for codec in dict.fromkeys((declared, "utf-8", "latin-1")):
+        view = data.decode(codec, errors="replace")
+        if view not in views:
+            views.append(view)
+    return "\n".join(views)
+
+
+def _split_commit_publication(
+    sha: str, commit: bytes
+) -> tuple[tuple[bytes, ...], bytes, str]:
+    """Return raw commit metadata plus its declared codec."""
+    headers, separator, message = commit.partition(b"\n\n")
+    if not separator:
+        raise GateError(f"commit {sha[:9]} has no header/message separator")
+    encoding = _object_encoding(headers)
+    identities: list[bytes] = []
+    for line in headers.split(b"\n"):
+        key, _, value = line.partition(b" ")
+        if key in (b"author", b"committer"):
+            # Drop the timestamp and timezone; the published name and email remain.
+            identities.append(value.rsplit(b" ", 2)[0])
+    return tuple(identities), message, encoding
+
+
+def _range_tag_objects(rev_range: str) -> list[str]:
+    """Return annotated tag objects named on the positive side of a range."""
+    positive: list[str] = []
+    negated = False
+    for token in rev_range.split():
+        if token == "--not":
+            negated = not negated
+        elif token.startswith(("-", "^")):
+            continue
+        elif ".." in token:
+            positive.append(token.rsplit("..", 1)[1].lstrip(".") or "HEAD")
+        elif not negated:
+            positive.append(token)
+    tags: list[str] = []
+    for rev in positive:
+        oid = _run_git(["git", "rev-parse", "--verify", "--end-of-options", rev]).strip()
+        while oid not in tags and _run_git(["git", "cat-file", "-t", oid]).strip() == "tag":
+            tags.append(oid)
+            first = _run_git_bytes(["git", "cat-file", "tag", oid]).split(b"\n", 1)[0].split()
+            if len(first) != 2 or first[0] != b"object":
+                raise GateError(f"tag {oid[:9]} has no object header")
+            oid = first[1].decode("ascii", errors="replace")
+    return tags
 
 
 def collect_tree_files(revision: str) -> list[GitTreeFile]:
@@ -651,12 +737,18 @@ def print_report(violations: list[Violation]) -> None:
 
 
 def leaked_tracked_files(paths: list[Path], guarded: frozenset[str]) -> list[Path]:
-    """Tracked files whose root component is a guarded (gitignored) data dir.
+    """Tracked files in a guarded data dir or under any ``.venv/`` directory.
 
     Matches only the first path component so a nested code directory that happens
-    to be named ``samples`` (e.g. ``tests/samples/``) is not a false positive.
+    to be named ``samples`` (e.g. ``tests/samples/``) is not a false positive. A
+    file named ``.venv`` is ordinary tracked content; only a directory component
+    is refused.
     """
-    return [p for p in paths if p.parts and p.parts[0] in guarded]
+    return [
+        p
+        for p in paths
+        if (p.parts and p.parts[0] in guarded) or _VENV_DIR in p.parts[:-1]
+    ]
 
 
 # Set by main() from --staged. In staged mode the publication verdict must come
@@ -1160,17 +1252,167 @@ def _scan_message_file(path: Path) -> int:
 
 
 def _scan_rev_range(rev_range: str) -> int:
-    """pre-push mode: scan every commit message about to be published."""
+    """Scan everything in every commit about to be published.
+
+    Switchboard's existing tree-range scanner reads each complete commit tree as
+    raw git objects. That is stricter than scanning only changed paths and keeps
+    its binary, encoding, Gitlink, and LFS rules intact.
+    """
+    commits = collect_range_commits(rev_range)
+    tags = _range_tag_objects(rev_range)
+    trees = [(sha, collect_tree_files(sha)) for sha in commits]
+    raw_denylist = os.environ.get("SWITCHBOARD_FORBIDDEN_IDENTIFIERS", "")
+    report_identifiers = (
+        parse_identifier_set(raw_denylist) if raw_denylist.strip() else frozenset()
+    )
+
+    # Path guards do not depend on the secret: every tree being published must
+    # be clear even when a private-until-review repo has no local denylist.
+    for sha, files in trees:
+        leaked = leaked_tracked_files([entry.path for entry in files], _GUARDED_DIRS)
+        if leaked:
+            print(f"Commit {sha[:9]} contains paths that must never be committed:", file=sys.stderr)
+            for path in sorted(leaked, key=str):
+                print(f"  {_sanitize_path(path, report_identifiers)}", file=sys.stderr)
+            print(
+                "\nRewrite the range so no commit carries them (the complete "
+                "history is published even if a later commit removes them).",
+                file=sys.stderr,
+            )
+            return 1
+
     identifiers = _resolve_identifiers()
     if identifiers is None:
         return 0
     failed = False
-    for sha, body in collect_range_messages(rev_range):
-        violations = list(scan_content(body, identifiers))
+    tree_violations: list[Violation] = []
+    seen_object_ids: set[str] = set()
+    for oid in tags:
+        raw = _run_git_bytes(["git", "cat-file", "tag", oid])
+        headers, _separator, message = raw.partition(b"\n\n")
+        encoding = _object_encoding(headers)
+        fields = [_text_views(message, encoding)]
+        for line in headers.split(b"\n"):
+            key, _, value = line.partition(b" ")
+            if key == b"tag":
+                fields.append(_text_views(value, encoding))
+            elif key == b"tagger":
+                tagger_identity = (
+                    value.rsplit(b" ", 2)[0] if value.count(b" ") >= 2 else value
+                )
+                fields.append(_text_views(tagger_identity, encoding))
+        violations = [v for field in fields for v in scan_text(field, identifiers)]
         if violations:
-            _report_message_violations(f"commit message {sha[:9]}", violations)
+            _report_message_violations(
+                f"annotated tag {oid[:9]} (name, tagger or message)", violations
+            )
             failed = True
+    for sha, files in trees:
+        commit = _run_git_bytes(["git", "cat-file", "commit", sha])
+        identities, message, encoding = _split_commit_publication(sha, commit)
+        message_violations = list(scan_content(message, identifiers))
+        message_violations.extend(
+            scan_text(_text_views(message, encoding), identifiers)
+        )
+        if message_violations:
+            _report_message_violations(f"commit message {sha[:9]}", message_violations)
+            failed = True
+        for identity in identities:
+            identity_violations = list(scan_content(identity, identifiers))
+            identity_violations.extend(
+                scan_text(_text_views(identity, encoding), identifiers)
+            )
+            if identity_violations:
+                _report_message_violations(
+                    f"author/committer identity of commit {sha[:9]}",
+                    identity_violations,
+                )
+                failed = True
+        tree_violations.extend(
+            scan_tree_files(
+                identifiers,
+                files,
+                seen_object_ids=seen_object_ids,
+                source_commit=sha,
+            )
+        )
+    if tree_violations:
+        print_report(tree_violations)
+        failed = True
+    if failed:
+        print(
+            "\nEverything in the range is published: commit metadata and every "
+            "intermediate tree. Rewrite the offending commits before pushing.",
+            file=sys.stderr,
+        )
     return 1 if failed else 0
+
+
+def _ci_rev_range() -> str:
+    """Derive the publication range from a full-history GitHub Actions event."""
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+    event_path = os.environ.get("GITHUB_EVENT_PATH", "")
+    if not event_name or not event_path:
+        raise GateError("--ci-range needs GITHUB_EVENT_NAME and GITHUB_EVENT_PATH")
+    try:
+        event = json.loads(Path(event_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise GateError(f"could not read the GitHub event payload ({exc})") from exc
+    if not isinstance(event, dict):
+        raise GateError("the GitHub event payload is not an object")
+    if _run_git(["git", "rev-parse", "--is-shallow-repository"]).strip() != "false":
+        raise GateError(
+            "--ci-range needs full history; set fetch-depth: 0 on actions/checkout"
+        )
+
+    def resolvable(oid: object) -> bool:
+        return (
+            isinstance(oid, str)
+            and _OBJECT_ID.fullmatch(oid) is not None
+            and _NULL_OBJECT_ID.fullmatch(oid) is None
+            and _git_or_none(["git", "cat-file", "-e", f"{oid}^{{commit}}"])
+            is not None
+        )
+
+    if event_name in ("pull_request", "pull_request_target"):
+        pull_request = event.get("pull_request")
+        if not isinstance(pull_request, dict):
+            raise GateError("the pull request event has no pull_request object")
+        base_data = pull_request.get("base")
+        head_data = pull_request.get("head")
+        base = base_data.get("sha") if isinstance(base_data, dict) else None
+        head = head_data.get("sha") if isinstance(head_data, dict) else None
+        if not (resolvable(base) and resolvable(head)):
+            raise GateError("the pull request's base or head commit is not in this checkout")
+        return f"{head} HEAD --not {base}"
+    if event_name == "push":
+        if event.get("deleted"):
+            return ""
+        after = event.get("after")
+        if not resolvable(after):
+            raise GateError("the pushed commit is not in this checkout")
+        before = event.get("before")
+        if resolvable(before):
+            return f"{before}..{after}"
+        ref = str(event.get("ref", ""))
+        if ref.startswith("refs/tags/"):
+            # A tag push: name the tag itself so its object (message, tagger) is
+            # scanned, not only the commits it peels to.
+            tag = _git_or_none(["git", "rev-parse", "--verify", "-q", ref])
+            if tag is not None:
+                after = tag.strip()
+        # Post-push, origin/<branch> already equals *after*, so it is left out of
+        # the subtraction; every other remote ref (the default branch above all)
+        # still bounds the range. A force-push to the default branch with *before*
+        # gone therefore rescans its history -- deliberately: that is a history
+        # rewrite, exactly when everything published should be judged again.
+        exclude = []
+        if ref.startswith("refs/heads/"):
+            exclude = [f"--exclude=origin/{ref[len('refs/heads/'):]}"]
+        return " ".join([str(after), "--not", *exclude, "--remotes=origin"])
+    raise GateError(
+        f"--ci-range does not know the {event_name!r} event; run it on push or pull_request"
+    )
 
 
 def _scan_index_snapshot(identifiers: frozenset[str], paths: list[Path], **kwargs: Any) -> Any:
@@ -1271,6 +1513,13 @@ def _run(args: argparse.Namespace) -> int:
         return _scan_message_file(Path(args.message_file))
     if args.rev_range is not None:
         return _scan_rev_range(args.rev_range)
+    if args.ci_range:
+        rev_range = _ci_rev_range()
+        if not rev_range:
+            print("branch deletion: nothing is published; nothing to scan.", file=sys.stderr)
+            return 0
+        print(f"scanning the published range: {rev_range}", file=sys.stderr)
+        return _scan_rev_range(rev_range)
     if args.tree_range is not None:
         identifiers = _resolve_identifiers()
         if identifiers is None:
@@ -1290,17 +1539,17 @@ def _run(args: argparse.Namespace) -> int:
     raw = os.environ.get("SWITCHBOARD_FORBIDDEN_IDENTIFIERS", "")
     report_identifiers = parse_identifier_set(raw) if raw.strip() else frozenset()
 
-    # 1. Always-on: no tracked file under a guarded (gitignored) data dir. This
-    #    catches a ``git add -f samples/...`` leak regardless of secret config.
+    # 1. Always-on: no tracked file under a guarded data dir or any .venv/.
+    #    This catches a force-add regardless of secret configuration.
     leaked = leaked_tracked_files(paths, _GUARDED_DIRS)
     if leaked:
-        print("Tracked files under a gitignored data directory detected:", file=sys.stderr)
+        print("Tracked files under a forbidden data directory detected:", file=sys.stderr)
         for p in sorted(leaked, key=str):
             print(f"  {_sanitize_path(p, report_identifiers)}", file=sys.stderr)
         print(
-            "\nThese paths are gitignored by convention (samples/ holds real "
-            "identifier-bearing data — hostnames, service accounts, principal "
-            "handles). Remove them from the index: git rm --cached -r <path>.",
+            "\nThese paths are not source: samples/ holds real identifier-bearing "
+            "data, and anything under .venv/ is generated environment content. "
+            "Remove them from the index: git rm --cached -r <path>.",
             file=sys.stderr,
         )
         return 1
@@ -1372,8 +1621,14 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument(
         "--rev-range",
         metavar="RANGE",
-        help="Scan the commit messages in a git rev range (for the pre-push "
-        "hook), e.g. origin/main..HEAD.",
+        help="Scan every commit's metadata and complete tree in a git rev range "
+        "(for the pre-push hook), e.g. origin/main..HEAD.",
+    )
+    mode.add_argument(
+        "--ci-range",
+        action="store_true",
+        help="As --rev-range, deriving the range from a GitHub Actions push or "
+        "pull_request event; requires a full-history checkout.",
     )
     mode.add_argument(
         "--tree",
@@ -1387,6 +1642,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     _DECLARATION_FROM_INDEX[0] = bool(args.staged)
+    # Judge the objects git would PUBLISH, not local replacements: refs/replace
+    # can make every read here see a clean surrogate while a push sends the
+    # original (demonstrated end to end). Applies to every git subprocess.
+    os.environ["GIT_NO_REPLACE_OBJECTS"] = "1"
 
     try:
         return _run(args)

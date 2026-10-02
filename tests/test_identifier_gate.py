@@ -275,6 +275,7 @@ def test_commit_message_collection_is_control_character_safe(
         "_run_git_bytes",
         lambda args: b"tree " + b"c" * 40 + b"\n\n" + messages[args[-1]],
     )
+    monkeypatch.setattr(gate, "collect_tree_files", lambda _revision: [])
 
     collected = gate.collect_range_messages("base..head")
 
@@ -562,6 +563,7 @@ def test_raw_commit_messages_use_multi_encoding_scanner_and_redacted_logs(
         "_run_git_bytes",
         lambda _args: b"tree " + b"0" * 40 + b"\n\n" + message,
     )
+    monkeypatch.setattr(gate, "collect_tree_files", lambda _revision: [])
     monkeypatch.setenv("SWITCHBOARD_FORBIDDEN_IDENTIFIERS", "forbidden-token")
 
     assert gate._scan_rev_range("base..head") == 1
@@ -598,6 +600,7 @@ def test_unicode_casefold_commit_message_is_redacted(
         "_run_git_bytes",
         lambda _args: b"tree " + b"0" * 40 + b"\n\n" + message,
     )
+    monkeypatch.setattr(gate, "collect_tree_files", lambda _revision: [])
     monkeypatch.setenv("SWITCHBOARD_FORBIDDEN_IDENTIFIERS", '"café" strasse')
 
     assert gate._scan_rev_range("base..head") == 1
