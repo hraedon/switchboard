@@ -71,6 +71,7 @@ REPO_GATE_CAPABILITIES = frozenset(
 # guard matches the first path component so a legitimate nested code dir named
 # ``samples`` (e.g. ``tests/samples/``) is not a false positive.
 _GUARDED_DIRS = frozenset({"samples"})
+_VENV_DIR = ".venv"
 
 
 @dataclass(frozen=True)
@@ -651,12 +652,17 @@ def print_report(violations: list[Violation]) -> None:
 
 
 def leaked_tracked_files(paths: list[Path], guarded: frozenset[str]) -> list[Path]:
-    """Tracked files whose root component is a guarded (gitignored) data dir.
+    """Tracked paths refused by the always-on guard.
 
-    Matches only the first path component so a nested code directory that happens
-    to be named ``samples`` (e.g. ``tests/samples/``) is not a false positive.
+    Guarded data dirs match only the first component, so a nested code directory
+    named ``samples`` is legitimate. Anything under a ``.venv/`` directory at
+    any depth is refused; a file merely named ``.venv`` is scanned normally.
     """
-    return [p for p in paths if p.parts and p.parts[0] in guarded]
+    return [
+        p
+        for p in paths
+        if (p.parts and p.parts[0] in guarded) or _VENV_DIR in p.parts[:-1]
+    ]
 
 
 # Set by main() from --staged. In staged mode the publication verdict must come
@@ -1294,13 +1300,13 @@ def _run(args: argparse.Namespace) -> int:
     #    catches a ``git add -f samples/...`` leak regardless of secret config.
     leaked = leaked_tracked_files(paths, _GUARDED_DIRS)
     if leaked:
-        print("Tracked files under a gitignored data directory detected:", file=sys.stderr)
+        print("Tracked files under a forbidden data directory detected:", file=sys.stderr)
         for p in sorted(leaked, key=str):
             print(f"  {_sanitize_path(p, report_identifiers)}", file=sys.stderr)
         print(
-            "\nThese paths are gitignored by convention (samples/ holds real "
-            "identifier-bearing data — hostnames, service accounts, principal "
-            "handles). Remove them from the index: git rm --cached -r <path>.",
+            "\nThese paths are not source: samples/ holds real identifier-bearing "
+            "data, and anything under .venv/ is generated environment content. "
+            "Remove them from the index: git rm --cached -r <path>.",
             file=sys.stderr,
         )
         return 1
