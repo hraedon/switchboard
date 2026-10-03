@@ -207,6 +207,7 @@ async def test_disconnect_during_body_upload() -> None:
     assert ctx.gate.held == 0
     assert handler_started
     assert not handler_returned
+    assert app.metrics.forwarded_per_provider == {}
 
     await ctx.http_client.aclose()
 
@@ -240,6 +241,7 @@ async def test_disconnect_while_awaiting_headers() -> None:
     assert ctx.gate.held == 0
     assert handler_started
     assert not handler_returned
+    assert app.metrics.forwarded_per_provider == {}
 
     await ctx.http_client.aclose()
 
@@ -273,6 +275,7 @@ async def test_disconnect_during_response_streaming() -> None:
     body_msgs = [m for m in messages if m["type"] == "http.response.body"]
     assert len(body_msgs) >= 1
     assert all(m.get("more_body") is True for m in body_msgs)
+    assert app.metrics.forwarded_per_provider == {}
 
     await ctx.http_client.aclose()
 
@@ -300,6 +303,7 @@ async def test_body_size_limit_enforcement() -> None:
     assert ctx.gate.held == 0
     statuses = [m["status"] for m in messages if m["type"] == "http.response.start"]
     assert statuses == [413]
+    assert app.metrics.forwarded_per_provider == {}
 
     await ctx.http_client.aclose()
 
@@ -330,4 +334,5 @@ async def test_upstream_idle_timeout() -> None:
     body_msgs = [m for m in messages if m["type"] == "http.response.body"]
     assert len(body_msgs) >= 1
 
+    assert app.metrics.forwarded_per_provider == {}
     await ctx.http_client.aclose()

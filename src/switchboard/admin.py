@@ -552,7 +552,7 @@ async def send_prometheus(
 
     lines.append(
         "# HELP switchboard_forwarded_per_provider "
-        "Total requests forwarded per provider"
+        "Fully delivered 2xx upstream responses per provider"
     )
     lines.append("# TYPE switchboard_forwarded_per_provider counter")
     for name, count in sorted(routing_metrics.forwarded_per_provider.items()):

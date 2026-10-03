@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 import pytest
 
+from switchboard.admin import _build_status_payload, send_prometheus
 from switchboard.control import (
     DEFAULT_REROUTE_STATUSES,
     RoutingConfig,
@@ -311,6 +312,132 @@ class TestRerouteThroughProxy:
         # estate leaks capacity every time a provider runs dry.
         assert a.gate.held == 0
         assert b.gate.held == 0
+
+
+@pytest.mark.asyncio
+class TestSuccessfulForwardAccounting:
+    @pytest.mark.parametrize(
+        "status", [200, 201, 204, 299, 301, 304, 400, 401, 403, 404, 429, 500, 502, 503, 529]
+    )
+    async def test_completed_response_counts_only_2xx(self, status: int) -> None:
+        upstream_body = b"" if status in (204, 304) else b'{"result":"unchanged"}'
+        provider = _ctx("a", _responder(status, body=upstream_body))
+        await _ready(provider)
+        app = _app({"a": provider}, attempts=0)
+        msgs: list[dict[str, Any]] = []
+
+        async def send(msg: dict[str, Any]) -> None:
+            # Even a 2xx must not count while its final send is still pending.
+            assert app.metrics.forwarded_per_provider == {}
+            msgs.append(msg)
+
+        try:
+            await app(_scope(), _receive_body(), send)
+
+            assert _statuses(msgs) == [status]
+            assert b"".join(m.get("body", b"") for m in msgs) == upstream_body
+            expected = {"a": 1} if 200 <= status < 300 else {}
+            assert app.metrics.forwarded_per_provider == expected
+            assert provider.reconcile.total_requests_forwarded == 1
+            assert provider.gate.held == 0
+
+            payload = _build_status_payload({"a": provider}, app._route_table, app.metrics)
+            assert payload["routing_metrics"]["forwarded_per_provider"] == expected
+            metric_msgs, metric_send = _sender()
+            await send_prometheus(metric_send, {"a": provider}, app.metrics)
+            metric_body = b"".join(m.get("body", b"") for m in metric_msgs).decode()
+            sample = 'switchboard_forwarded_per_provider{provider="a"} 1'
+            assert (sample in metric_body) == bool(expected)
+        finally:
+            await provider.http_client.aclose()
+
+    @pytest.mark.parametrize("status", [200, 403, 500, 429])
+    async def test_reroute_counts_only_successful_destination(self, status: int) -> None:
+        a = _ctx("a", _responder(429))
+        b = _ctx("b", _responder(status))
+        await _ready(a, b)
+        app = _app({"a": a, "b": b})
+        msgs, send = _sender()
+        try:
+            await app(_scope(), _receive_body(), send)
+
+            assert _statuses(msgs) == [status]
+            assert app.metrics.forwarded_per_provider == ({"b": 1} if status == 200 else {})
+            assert app.metrics.usage_reroutes_total == 1
+            assert a.reconcile.total_requests_forwarded == 1
+            assert b.reconcile.total_requests_forwarded == 1
+            assert a.gate.held == b.gate.held == 0
+        finally:
+            await a.http_client.aclose()
+            await b.http_client.aclose()
+
+    async def test_transport_failure_does_not_count(self) -> None:
+        def connection_reset(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection reset", request=request)
+
+        provider = _ctx("a", connection_reset)
+        await _ready(provider)
+        app = _app({"a": provider})
+        msgs, send = _sender()
+        try:
+            await app(_scope(), _receive_body(), send)
+
+            assert _statuses(msgs) == [502]
+            assert app.metrics.forwarded_per_provider == {}
+            assert provider.gate.held == 0
+        finally:
+            await provider.http_client.aclose()
+
+    async def test_transport_failure_after_2xx_headers_does_not_count(self) -> None:
+        class BrokenStream(httpx.AsyncByteStream):
+            async def __aiter__(self) -> AsyncIterator[bytes]:
+                yield b"first chunk"
+                raise httpx.ReadError("stream interrupted")
+
+            async def aclose(self) -> None:
+                pass
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=BrokenStream())
+
+        provider = _ctx("a", handler)
+        await _ready(provider)
+        app = _app({"a": provider})
+        msgs, send = _sender()
+        try:
+            await app(_scope(), _receive_body(), send)
+
+            assert _statuses(msgs) == [200]
+            assert b"".join(m.get("body", b"") for m in msgs) == b"first chunk"
+            assert app.metrics.forwarded_per_provider == {}
+            assert provider.gate.held == 0
+        finally:
+            await provider.http_client.aclose()
+
+    @pytest.mark.parametrize("failed_message", ["start", "chunk", "end"])
+    async def test_failed_downstream_send_does_not_count(self, failed_message: str) -> None:
+        provider = _ctx("a", _responder(200))
+        await _ready(provider)
+        app = _app({"a": provider})
+        failed = False
+
+        async def send(msg: dict[str, Any]) -> None:
+            nonlocal failed
+            kind = "start" if msg["type"] == "http.response.start" else (
+                "chunk" if msg.get("more_body") else "end"
+            )
+            if kind == failed_message:
+                failed = True
+                raise OSError("client closed connection")
+
+        try:
+            await app(_scope(), _receive_body(), send)
+
+            assert failed
+            assert app.metrics.forwarded_per_provider == {}
+            assert provider.gate.held == 0
+        finally:
+            await provider.http_client.aclose()
 
 
 @pytest.mark.asyncio

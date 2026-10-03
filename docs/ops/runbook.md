@@ -102,7 +102,7 @@ When a `[token_budget.<p>]` is configured there are `token_utilization` and
 
 | Field | Meaning |
 |---|---|
-| `forwarded_per_provider` | Successful forwards per provider. |
+| `forwarded_per_provider` | Fully delivered 2xx upstream responses per provider. Errors, redirects, disconnected streams and idle timeouts do not count. |
 | `failovers` | Times a non-primary provider was selected. |
 | `routing_decisions` | Total routing decisions made. |
 | `recent_decisions` | Bounded ring of recent decisions (key hash, selected, primary). |
@@ -113,6 +113,12 @@ When a `[token_budget.<p>]` is configured there are `token_utilization` and
 | `usage_reroutes_total` | Requests moved off a provider that returned a usage error. |
 | `usage_reroutes_from` | Same, counted by the exhausted origin provider. |
 | `usage_giveups_total` | **The estate-is-exhausted counter** — requests that got a usage error with no eligible provider left (§4). |
+
+The provider-level `total_requests_forwarded` counts upstream attempts,
+including failed attempts and each leg of a reroute. Use
+`routing_metrics.forwarded_per_provider` for completed HTTP successes. It does
+not inspect response content: an application error inside a completed 2xx
+response still counts.
 
 ## 3. Throttle states
 
