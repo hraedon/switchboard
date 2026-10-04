@@ -1,5 +1,15 @@
 # switchboard
 
+> **Retired 2026-10-04.** Not maintained, and the repository is archived.
+> switchboard existed to route around per-provider concurrency and usage limits
+> on subscription LLM plans. Once those plans went to pay-as-you-go with no
+> concurrency ceiling, there was nothing left to route around (the same reason
+> its predecessor, sluice, was retired on 2026-08-07). The last deployment served
+> no client traffic in its final six days and was scaled to zero. The design
+> notes in `docs/` and `plans/` stay as a record. In particular, the usage-aware
+> failover and the 429 breaker in `src/switchboard/overload.py` are the parts
+> worth reading.
+
 A multi-provider routing proxy for LLM APIs. switchboard sits in the live
 request path and routes incoming requests to the best available upstream based
 on real-time pressure signals — failing over from a saturated provider to a
